@@ -536,7 +536,7 @@ services:
             - acme
 
     netfilter-mailcow:
-      image: ghcr.io/mailcow/netfilter:1.65
+      image: ghcr.io/mailcow/netfilter:1.64
       stop_grace_period: 30s
       restart: always
       privileged: true
@@ -551,7 +551,6 @@ services:
         - REDISPASS=${REDISPASS}
         - MAILCOW_REPLICA_IP=${MAILCOW_REPLICA_IP:-}
         - DISABLE_NETFILTER_ISOLATION_RULE=${DISABLE_NETFILTER_ISOLATION_RULE:-n}
-        - NETFILTER_REDISHOST=${NETFILTER_REDISHOST:-}
       network_mode: "host"
       volumes:
         - /lib/modules:/lib/modules:ro
