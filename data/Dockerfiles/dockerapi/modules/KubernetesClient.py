@@ -9,6 +9,7 @@ import socket
 import struct
 import asyncio
 import hashlib
+import logging
 import http.client
 from decimal import Decimal
 from datetime import datetime, timezone
@@ -27,6 +28,8 @@ NULL_TIME = '0001-01-01T00:00:00Z'
 CONNECT_TIMEOUT = 10
 REQUEST_TIMEOUT = 30
 EXEC_MAX_SECONDS = 300
+RESTART_WAIT_SECONDS = 50
+RESTART_POLL_SECONDS = 2
 WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 WS_PROTOCOLS = 'v5.channel.k8s.io, v4.channel.k8s.io'
 
@@ -241,9 +244,12 @@ class KubernetesApi:
       accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode('ascii')).digest()).decode('ascii')
       if headers.get('sec-websocket-accept') != accept:
         raise KubernetesError(101, 'exec: invalid Sec-WebSocket-Accept')
+      protocol = headers.get('sec-websocket-protocol', '')
+      if protocol not in ('v5.channel.k8s.io', 'v4.channel.k8s.io'):
+        raise KubernetesError(101, 'exec: server did not negotiate v5.channel.k8s.io or v4.channel.k8s.io (got %r)' % protocol)
       ws = WebSocket(sock, buf)
       if stdin is not None:
-        if headers.get('sec-websocket-protocol') == 'v5.channel.k8s.io':
+        if protocol == 'v5.channel.k8s.io':
           ws.send(b'\x00' + stdin)
           ws.send(b'\xff\x00')
         else:
@@ -373,28 +379,47 @@ class KubernetesContainer:
   def _exec(self, command, stdin=None, eof=b''):
     return self.kube.api.exec(self.kube.namespace, self.name, self.container, command, stdin=stdin, eof=eof)
 
+  def _exec_script(self, shell, script, user):
+    # shell scripts go through stdin: the exec request URI (audit log) only carries the shell.
+    # The script must not end in a backslash, it would swallow the closing brace of the wrapper.
+    script = '{\n' + script + '\n} </dev/null\n'
+    return self._exec(_user_cmd([shell, '-s'], user), stdin=script.encode('utf-8'), eof=b'exit\n')
+
   def exec_run(self, cmd, user='', **kwargs):
     if isinstance(cmd, str):
       cmd = shlex.split(cmd)
     if len(cmd) == 3 and cmd[1] == '-c':
-      # shell scripts go through stdin: the exec request URI (audit log) only carries the shell
-      script = '{\n' + cmd[2] + '\n} </dev/null\n'
-      out, err = self._exec(_user_cmd([cmd[0], '-s'], user), stdin=script.encode('utf-8'), eof=b'exit\n')
+      out, err = self._exec_script(cmd[0], cmd[2], user)
     else:
       out, err = self._exec(_user_cmd(cmd, user))
     exit_code, msg = _exit_status(err)
     return ExecResult(exit_code, out + msg)
 
   def exec_stdin(self, cmd, user, timeout=2, shell_cmd="/bin/bash"):
-    if not cmd.endswith("\n"):
-      cmd = cmd + "\n"
-    out, err = self._exec(_user_cmd([shell_cmd, '-s'], user), stdin=cmd.encode('utf-8'), eof=b'exit\n')
+    out, err = self._exec_script(shell_cmd, cmd, user)
     return out.decode('utf-8', 'replace')
 
   def restart(self, **kwargs):
-    # the pod's controller recreates it; the uid precondition protects a recreated StatefulSet pod
-    self.kube.api.request('DELETE', '/api/v1/namespaces/%s/pods/%s' % (quote(self.kube.namespace, safe=''), quote(self.name, safe='')),
-      { 'apiVersion': 'v1', 'kind': 'DeleteOptions', 'preconditions': { 'uid': self.uid } })
+    # the pod's controller recreates it; the uid precondition protects a recreated StatefulSet pod.
+    # Like docker restart, block until the replacement runs (bounded).
+    before = set(c.uid for c in self.kube.containers.candidates() if c.component == self.component)
+    try:
+      self.kube.api.request('DELETE', '/api/v1/namespaces/%s/pods/%s' % (quote(self.kube.namespace, safe=''), quote(self.name, safe='')),
+        { 'apiVersion': 'v1', 'kind': 'DeleteOptions', 'preconditions': { 'uid': self.uid } })
+    except KubernetesError as e:
+      if e.status in (404, 409):
+        # already gone or replaced
+        return
+      raise
+    deadline = time.monotonic() + RESTART_WAIT_SECONDS
+    while time.monotonic() < deadline:
+      time.sleep(RESTART_POLL_SECONDS)
+      try:
+        if any(c.running and c.uid not in before for c in self.kube.containers.candidates() if c.component == self.component):
+          return
+      except Exception as e:
+        self.kube.logger.warning("restart %s: polling for replacement pod failed: %s" % (self.name, e))
+    self.kube.logger.warning("restart %s: no running replacement pod for component %s after %ss" % (self.name, self.component, RESTART_WAIT_SECONDS))
 
   def start(self, **kwargs):
     raise RuntimeError('start is not supported by the kubernetes backend, use restart')
@@ -456,16 +481,25 @@ class KubernetesContainers:
   def __init__(self, kube):
     self.kube = kube
 
-  def list(self, all=False, filters=None, **kwargs):
-    filters = filters or {}
+  def candidates(self):
+    # every mailcow pod, newest first; Job pods (CronJob runners, hooks) are not services
     path = '/api/v1/namespaces/%s/pods?%s' % (quote(self.kube.namespace, safe=''), urlencode({ 'labelSelector': self.kube.selector }))
     pods = self.kube.api.request('GET', path).get('items') or []
     pods.sort(key=lambda p: p['metadata'].get('creationTimestamp') or '', reverse=True)
     containers = []
     for pod in pods:
-      if not (pod['metadata'].get('labels') or {}).get(COMPONENT_LABEL) or not (pod.get('spec') or {}).get('containers'):
+      meta = pod['metadata']
+      if not (meta.get('labels') or {}).get(COMPONENT_LABEL) or not (pod.get('spec') or {}).get('containers'):
         continue
-      container = KubernetesContainer(self.kube, pod)
+      if any(o.get('kind') == 'Job' for o in meta.get('ownerReferences') or []):
+        continue
+      containers.append(KubernetesContainer(self.kube, pod))
+    return containers
+
+  def list(self, all=False, filters=None, **kwargs):
+    filters = filters or {}
+    containers = []
+    for container in self.candidates():
       if not all and not container.running:
         continue
       if 'id' in filters and not container.id.startswith(str(filters['id'])):
@@ -473,6 +507,20 @@ class KubernetesContainers:
       if 'name' in filters and not container.matches_name(str(filters['name'])):
         continue
       containers.append(container)
+    if all and 'id' not in filters:
+      # callers key by service name: per component keep the running pods, else only the newest one,
+      # so an evicted, failed or terminating pod never shadows the live one
+      running = set(c.component for c in containers if c.running)
+      seen = set()
+      deduped = []
+      for c in containers:
+        if c.component in running:
+          if c.running:
+            deduped.append(c)
+        elif c.component not in seen:
+          deduped.append(c)
+        seen.add(c.component)
+      containers = deduped
     return containers
 
 
@@ -483,6 +531,7 @@ class KubernetesClient:
     self.selector = os.environ.get('K8S_POD_SELECTOR') or 'app.kubernetes.io/name=mailcow'
     self.project = (os.environ.get('COMPOSE_PROJECT_NAME') or 'mailcowdockerized').lower()
     self.containers = KubernetesContainers(self)
+    self.logger = logger or logging.getLogger('dockerapi')
     if logger:
       logger.info("kubernetes backend: namespace %s, pod selector %s, project %s" % (self.namespace, self.selector, self.project))
       if 'app.kubernetes.io/instance=' not in self.selector:
