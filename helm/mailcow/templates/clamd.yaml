@@ -9,8 +9,7 @@ metadata:
     {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
 spec:
   replicas: 1
-  strategy:
-    type: Recreate
+  {{- include "mailcow.strategy" (dict "root" . "component" $c) | nindent 2 }}
   selector:
     matchLabels:
       {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}

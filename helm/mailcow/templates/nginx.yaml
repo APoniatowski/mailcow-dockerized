@@ -15,6 +15,7 @@ spec:
   {{- with include "mailcow.replicas" (dict "v" $v "key" "nginx") }}
   {{- . | nindent 2 }}
   {{- end }}
+  {{- include "mailcow.strategy" (dict "root" . "component" $c) | nindent 2 }}
   selector:
     matchLabels:
       {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}

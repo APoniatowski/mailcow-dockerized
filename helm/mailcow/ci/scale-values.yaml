@@ -21,6 +21,8 @@ postfix:
   replicas: 2
   spoolPerPod: true
 
+# watchdog with replicated components needs the matching watchdog image fix (data/Dockerfiles/watchdog)
+# from the same branch; with an older watchdog image leave it off.
 watchdog:
   enabled: true
 

@@ -704,6 +704,67 @@ spec:
             {{- end }}
 {{- end -}}
 
+{{/* ---------- Deployment update strategies ----------
+component -> spec.strategy.type of every rendered Deployment (JSON). Single source for the templates
+and the strategy-fix pre-upgrade hook. include "mailcow.deploymentStrategies" . | fromJson */}}
+{{- define "mailcow.deploymentStrategies" -}}
+{{- $s := dict "dockerapi" "RollingUpdate" "memcached" "RollingUpdate" "nginx" "RollingUpdate" "unbound" "RollingUpdate"
+  "php-fpm" (toString .Values.phpFpm.updateStrategy) "postfix-tlspol" "Recreate" "rspamd" "Recreate" -}}
+{{- if .Values.acme.enabled }}{{ $_ := set $s "acme" "Recreate" }}{{ end -}}
+{{- if not .Values.skip.clamd }}{{ $_ := set $s "clamd" "Recreate" }}{{ end -}}
+{{- if not .Values.skip.olefy }}{{ $_ := set $s "olefy" "RollingUpdate" }}{{ end -}}
+{{- if not .Values.skip.sogo }}{{ $_ := set $s "sogo" "RollingUpdate" }}{{ end -}}
+{{- if .Values.watchdog.enabled }}{{ $_ := set $s "watchdog" "Recreate" }}{{ end -}}
+{{- toJson $s -}}
+{{- end -}}
+
+{{/* desired spec.strategy object for a type (JSON). RollingUpdate always carries rollingUpdate (the API
+server defaults), so Helm owns it: server-side apply only removes fields it owns, and a later switch to
+Recreate must drop it. include "mailcow.strategySpec" "Recreate" | fromJson */}}
+{{- define "mailcow.strategySpec" -}}
+{{- if eq . "Recreate" -}}
+{{- toJson (dict "type" "Recreate") -}}
+{{- else -}}
+{{- toJson (dict "type" "RollingUpdate" "rollingUpdate" (dict "maxSurge" "25%" "maxUnavailable" "25%")) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* spec.strategy of a Deployment. include "mailcow.strategy" (dict "root" . "component" "nginx") */}}
+{{- define "mailcow.strategy" -}}
+{{- $type := index (include "mailcow.deploymentStrategies" .root | fromJson) .component -}}
+strategy:
+  {{- include "mailcow.strategySpec" $type | fromJson | toYaml | nindent 2 }}
+{{- end -}}
+
+{{/* strategic merge patch that sets a live Deployment's strategy to the rendered one; $retainKeys drops
+every other strategy field (a defaulted rollingUpdate). Idempotent, no rollout (pod template unchanged).
+include "mailcow.strategyPatch" "Recreate" */}}
+{{- define "mailcow.strategyPatch" -}}
+{{- $want := include "mailcow.strategySpec" . | fromJson -}}
+{{- toJson (dict "spec" (dict "strategy" (merge (dict "$retainKeys" (keys $want | sortAlpha)) $want))) -}}
+{{- end -}}
+
+{{/* NetworkPolicy egress rule to the Kubernetes API server (networkPolicy.egress) */}}
+{{- define "mailcow.apiServerEgress" -}}
+- to:
+    {{- range .apiServerCIDRs }}
+    - ipBlock:
+        cidr: {{ ternary . (printf "%s/%s" . (ternary "128" "32" (contains ":" .))) (contains "/" .) }}
+    {{- end }}
+  ports:
+    {{- range .apiServerPorts }}
+    - port: {{ int . }}
+      protocol: TCP
+    {{- end }}
+{{- end -}}
+
+{{/* postfix StatefulSet name: <fullname>-postfix (single queue PVC) or <fullname>-postfix-spool
+(postfix.spoolPerPod, volumeClaimTemplates). One name per mode: switching creates a new StatefulSet and
+Helm deletes the old one, instead of changing the immutable volume spec in place. */}}
+{{- define "mailcow.postfixName" -}}
+{{- printf "%s-postfix%s" (include "mailcow.fullname" .) (ternary "-spool" "" (eq (toString .Values.postfix.spoolPerPod) "true")) -}}
+{{- end -}}
+
 {{/* ---------- scaling ----------
 v = the component's values (replicas, optional autoscaling). "true" when the workload may run more
 than one pod: replicas > 1 or an HPA. include "mailcow.multi" $v */}}

@@ -7,15 +7,16 @@
 {{- $perPod := $v.spoolPerPod }}
 {{- if lt (int $v.replicas) 0 }}{{ fail "postfix.replicas must be >= 0" }}{{ end }}
 {{- if and (gt (int $v.replicas) 1) (not $perPod) }}
-{{- fail "postfix.replicas > 1 needs postfix.spoolPerPod: true (one queue PVC per pod). On an existing release this replaces the single queue PVC: drain the queue first and follow README \"Scaling\" (kubectl delete statefulset --cascade=orphan, then helm upgrade)." }}
+{{- fail "postfix.replicas > 1 needs postfix.spoolPerPod: true (one queue PVC per pod). On an existing release this replaces the StatefulSet and its single queue PVC: drain the queue first, README \"Scaling\"." }}
 {{- end }}
 {{- if and $perPod .Values.persistence.postfix.existingClaim }}
 {{- fail "postfix.spoolPerPod creates one PVC per pod (volumeClaimTemplates) and cannot use persistence.postfix.existingClaim" }}
 {{- end }}
+{{- /* <fullname>-postfix, or <fullname>-postfix-spool with spoolPerPod (mailcow.postfixName) */}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "mailcow.fullname" . }}-{{ $c }}
+  name: {{ include "mailcow.postfixName" . }}
   labels:
     {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
 spec:
@@ -108,7 +109,7 @@ spec:
         {{- end }}
   {{- if $perPod }}
   {{- $p := .Values.persistence.postfix }}
-  # one queue per pod: spool-<fullname>-postfix-<n> (kept when scaling down or uninstalling)
+  # one queue per pod: spool-<fullname>-postfix-spool-<n> (kept when scaling down or uninstalling)
   volumeClaimTemplates:
     - apiVersion: v1
       kind: PersistentVolumeClaim

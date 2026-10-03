@@ -192,7 +192,9 @@ spec:
         {{- toYaml . | nindent 8 }}
     {{- end }}
 ---
-{{- /* Kubernetes API server: dockerapi (pods, exec, metrics), CronJob runner (exec), TLS bootstrap hook Job */}}
+{{- /* Kubernetes API server: dockerapi (pods, exec, metrics), CronJob runner (exec), TLS bootstrap and
+strategy-fix hook Jobs (strategy-fix also brings its own hook NetworkPolicy: on an upgrade the live policy
+is still the previous release's) */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -207,18 +209,9 @@ spec:
     matchExpressions:
       - key: app.kubernetes.io/component
         operator: In
-        values: ["dockerapi", "cron", "tls-bootstrap"]
+        values: ["dockerapi", "cron", "tls-bootstrap", "strategy-fix"]
   policyTypes: ["Egress"]
   egress:
-    - to:
-        {{- range .apiServerCIDRs }}
-        - ipBlock:
-            cidr: {{ ternary . (printf "%s/%s" . (ternary "128" "32" (contains ":" .))) (contains "/" .) }}
-        {{- end }}
-      ports:
-        {{- range .apiServerPorts }}
-        - port: {{ int . }}
-          protocol: TCP
-        {{- end }}
+    {{- include "mailcow.apiServerEgress" . | nindent 4 }}
 {{- end }}
 {{- end }}

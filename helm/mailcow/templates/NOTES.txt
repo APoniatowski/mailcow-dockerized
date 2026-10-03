@@ -33,9 +33,9 @@ Checks:
   - shared PVC is ReadWriteOnce: php-fpm, dovecot and rspamd{{ if .Values.acme.enabled }} (+ acme, nginx, postfix, watchdog){{ end }} are pinned to one node.
 {{- end }}
 {{- if .Values.postfix.spoolPerPod }}
-  - postfix: {{ int .Values.postfix.replicas }} pod(s), one queue PVC each (spool-{{ include "mailcow.fullname" . }}-postfix-<n>, kept on scale-down). The admin UI
-    queue view and flush act on one pod only{{ if .Values.watchdog.enabled }}, watchdog's queue check counts nothing{{ end }}. A pre-existing single queue PVC
-    {{ include "mailcow.fullname" . }}-postfix is no longer used: delete it once its queue is drained. README "Scaling".
+  - postfix: StatefulSet {{ include "mailcow.postfixName" . }}, {{ int .Values.postfix.replicas }} pod(s), one queue PVC each (spool-{{ include "mailcow.postfixName" . }}-<n>,
+    kept on scale-down). The admin UI queue view and flush act on one pod only{{ if .Values.watchdog.enabled }}, watchdog's queue check counts nothing{{ end }}.
+    A pre-existing single queue PVC {{ include "mailcow.fullname" . }}-postfix is no longer used: delete it once its queue is drained. README "Scaling".
 {{- end }}
   - rspamd's controller socket reaches php-fpm, dovecot, postfix{{ if .Values.watchdog.enabled }}, watchdog{{ end }} over TCP 11335 (socat relays,
     native sidecars: Kubernetes >= 1.29). Its NetworkPolicy is always on; it only protects with an enforcing CNI.

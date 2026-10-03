@@ -10,8 +10,7 @@ spec:
   # single instance: /var/lib/rspamd (controller socket) and the UI password file live on its own RWO PVC,
   # worker-proxy binds the pod hostname `rspamd`; README "Scaling"
   replicas: 1
-  strategy:
-    type: Recreate
+  {{- include "mailcow.strategy" (dict "root" . "component" $c) | nindent 2 }}
   selector:
     matchLabels:
       {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}

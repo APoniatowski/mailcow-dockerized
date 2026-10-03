@@ -43,7 +43,7 @@ Login: `admin` / `moohoo`. API key: `kubectl -n mailcow get secret mailcow-secre
 | unbound | Deployment + Service `unbound` with fixed ClusterIP; repo `unbound.conf` + appended `forward-zone` for `clusterDomain` → `clusterDNS` (`domain-insecure`, DNSSEC stays on for the rest), plus `forward-zone "."` → `unbound.forwarders` when set |
 | mysql, redis | StatefulSet (1 replica, PVC), or an external server (`externalDatabase` / `externalRedis`, [External database / Redis](#external-database--redis)). Clients use TCP (`DBHOST=mysql`) |
 | dovecot | StatefulSet (1 replica) |
-| postfix | StatefulSet, `postfix.replicas` (default 1; > 1 with a queue PVC per pod, [Scaling](#scaling)) |
+| postfix | StatefulSet `<fullname>-postfix`, `postfix.replicas` (default 1; > 1 with a queue PVC per pod in StatefulSet `<fullname>-postfix-spool`, [Scaling](#scaling)) |
 | rspamd | Deployment (1 replica), `hostname: rspamd` (worker-proxy binds `rspamd:9900`), own PVC; controller socket relayed over TCP 11335 ([Storage](#storage)) |
 | php-fpm, sogo, nginx | Deployment, `replicas` or an HPA ([Scaling](#scaling)) |
 | clamd, olefy, memcached, postfix-tlspol | Deployment |
@@ -87,7 +87,7 @@ They are copied over the base slice on every pod start (also into the shared dir
 | `vmail`, `vmail-index`, `crypt` | dovecot (**back up `crypt`**, without it mail is unreadable) |
 | `mysql`, `redis`, `postfix-tlspol`, `sogo-backup`, `clamd-db` | their component (`mysql`/`redis` not created with `externalDatabase`/`externalRedis`) |
 | `rspamd` | rspamd: `data/` = `/var/lib/rspamd` (controller socket, non-critical state; bayes and fuzzy hashes live in Redis), `override/worker-controller-password.inc` (UI password) |
-| `postfix` | postfix (+ watchdog, same node). With `postfix.spoolPerPod`: one claim `spool-<fullname>-postfix-<n>` per pod instead, not mounted by watchdog ([Scaling](#scaling)) |
+| `postfix` | postfix (+ watchdog, same node). With `postfix.spoolPerPod`: one claim `spool-<fullname>-postfix-spool-<n>` per pod instead, not mounted by watchdog ([Scaling](#scaling)) |
 | `shared` (subPaths) | see below |
 
 Only directories that one pod writes and another reads at runtime remain on `shared`:
@@ -351,52 +351,90 @@ migrates whenever the stored schema version differs from the one in its own code
 
 #### postfix: one queue per pod
 
-`postfix.replicas > 1` requires `postfix.spoolPerPod: true`: the StatefulSet then gets
-`volumeClaimTemplates` (`spool-<fullname>-postfix-<n>`, size/class/access mode from
-`persistence.postfix`) instead of the single `<fullname>-postfix` PVC. Kubernetes keeps those claims
-on scale-down and uninstall. With `spoolPerPod: false` (default) nothing changes for existing
+`postfix.replicas > 1` requires `postfix.spoolPerPod: true`: postfix then runs as StatefulSet
+`<fullname>-postfix-spool` (pods `<fullname>-postfix-spool-<n>`) with `volumeClaimTemplates`
+(`spool-<fullname>-postfix-spool-<n>`, size/class/access mode from `persistence.postfix`) instead of
+StatefulSet `<fullname>-postfix` with the single `<fullname>-postfix` PVC. Kubernetes keeps those
+claims on scale-down and uninstall. With `spoolPerPod: false` (default) nothing changes for existing
 releases. Trade-offs:
 
 - Queued mail lives in the pod that accepted it. Scaling down leaves the removed pods' claims with
   their queue: flush them first (`postqueue -f` in the highest-numbered pods) or scale up again to
   deliver it.
 - Admin UI queue view, flush and delete act on one pod (see above). Per pod:
-  `kubectl -n <ns> exec <fullname>-postfix-<n> -c postfix-mailcow -- mailq`.
+  `kubectl -n <ns> exec <fullname>-postfix-spool-<n> -c postfix-mailcow -- mailq`.
 - watchdog no longer mounts a queue: its mail queue check always counts 0.
 - postfix rate limits (`bruteForce`, anvil) count per pod: a client spread over N pods gets up to N
   times the limits.
 
-Switching an existing release to `spoolPerPod` changes the StatefulSet's volume spec, which
-Kubernetes does not allow in place. Procedure (release and namespace `mailcow`, chart defaults for
-the names):
+The two modes use different StatefulSet names because a StatefulSet's volumes cannot change in
+place. Switching `spoolPerPod` on an existing release is a plain `helm upgrade`: Helm creates the
+new StatefulSet and then deletes the old one with its pod, in the same upgrade and without waiting
+for the new pods. Services, NetworkPolicies and the PodDisruptionBudget select postfix by label and
+follow. New SMTP connections fail from the old pod's shutdown until the new pod 0 is ready (sending
+servers retry). Mail still queued in the old pod is not moved: drain it first. Procedure (release
+and namespace `mailcow`, chart defaults for the names):
 
 ```bash
 # 1. drain the queue: repeat until mailq says "Mail queue is empty" (mail to dead destinations may stay)
 kubectl -n mailcow exec mailcow-postfix-0 -c postfix-mailcow -- postqueue -f
 kubectl -n mailcow exec mailcow-postfix-0 -c postfix-mailcow -- mailq
-# optional, keeps what is left: clone the old volume as pod 0's new claim (CSI volume cloning, same
-# storage class); a point-in-time copy, mail accepted after it stays on the old volume only
+# optional, keeps what is left: clone the old volume as the new pod 0's claim (CSI volume cloning,
+# same storage class); a point-in-time copy, mail accepted after it stays on the old volume only
 kubectl -n mailcow apply -f - <<'EOF'
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: spool-mailcow-postfix-0
+  name: spool-mailcow-postfix-spool-0
 spec:
   accessModes: [ReadWriteOnce]
   resources: {requests: {storage: 2Gi}}
   dataSource: {kind: PersistentVolumeClaim, name: mailcow-postfix}
 EOF
-# 2. delete only the StatefulSet object; the running pod keeps serving
-kubectl -n mailcow delete statefulset mailcow-postfix --cascade=orphan
-# 3. the new StatefulSet adopts the orphaned pod and replaces it (new pods first, pod 0 last)
+# 2. creates StatefulSet mailcow-postfix-spool, deletes mailcow-postfix and its pod
 helm upgrade mailcow helm/mailcow -n mailcow --reuse-values \
   --set postfix.spoolPerPod=true --set postfix.replicas=2
-# 4. the old claim is kept (persistence.keep); delete it once its queue is empty or cloned
+# 3. the old claim is kept (persistence.keep) for manual recovery; delete it once empty or cloned
 kubectl -n mailcow delete pvc mailcow-postfix
 ```
 
-With `persistence.keep: false` Helm deletes `mailcow-postfix` in step 3: drain first. Going back
-to `spoolPerPod: false` needs the same steps the other way round.
+With `persistence.keep: false` Helm deletes the `mailcow-postfix` claim in step 2 (once the old pod
+is gone): drain or clone first. Going back (`spoolPerPod: false`, `replicas: 1`) works the same way
+round: drain every `mailcow-postfix-spool-<n>` pod, upgrade; Helm creates `mailcow-postfix` (claim
+`mailcow-postfix`: a new one, or the kept one with whatever was left on it) and deletes
+`mailcow-postfix-spool`. The `spool-mailcow-postfix-spool-<n>` claims stay until you delete them.
+
+### Upgrading from chart < 0.7.0
+
+0.7.0 switched php-fpm to `Recreate` (`phpFpm.updateStrategy`; chart < 0.7.0 rendered no strategy
+for it). Helm 4 applies server-side and only removes fields it owns. A Deployment
+created without a strategy holds the API server's defaulted `rollingUpdate` (owned by no field
+manager), so the upgrade fails with `spec.strategy.rollingUpdate: Forbidden: may not be specified
+when strategy type is 'Recreate'`.
+
+Since 0.7.1 the `strategy-fix` pre-upgrade hook handles it. It looks up the live Deployments and,
+for each one whose strategy differs from the rendered one (type, or a leftover `rollingUpdate` next
+to `Recreate`), runs a Job (own ServiceAccount and Role limited to `get`/`patch` on exactly those
+Deployments, `cronjobs.image`, field manager `mailcow-strategy-fix`) with one container per
+Deployment sending a strategic merge patch with `$retainKeys`. The patch is idempotent and leaves
+the pod template alone, so nothing rolls out. Nothing is rendered on install, on releases that are
+already consistent, or for Deployments that do not exist yet. With `networkPolicy.egress.enabled`
+the hook brings its own NetworkPolicy to the API server (the live policies are still the previous
+release's). Every `RollingUpdate` Deployment now renders `rollingUpdate` (`maxSurge` and
+`maxUnavailable` 25%, the API server defaults), so Helm owns it and a later switch to `Recreate`
+drops it.
+
+The hook needs `lookup`, i.e. a real `helm upgrade` (`helm template` and tools that render with it,
+such as Argo CD, never run it). Without it, or with `--no-hooks`, patch php-fpm once by hand and
+upgrade again; it is the only Deployment that changed to `Recreate` (repeat for any other Deployment
+the error names):
+
+```bash
+kubectl -n mailcow patch deployment mailcow-php-fpm --type=strategic \
+  -p '{"spec":{"strategy":{"$retainKeys":["type"],"type":"Recreate"}}}'
+```
+
+Also new in 0.7.0: the `cert-reload` CronJob is gone ([TLS](#tls)).
 
 ## Environment contract
 
@@ -515,7 +553,7 @@ every pod of the release may reach:
 | `0.0.0.0/0` and `::/0` except `networkPolicy.egress.clusterCIDRs` (empty = the `mailcow.networks` entries + `networkPolicy.egress.serviceCIDR`, default `10.96.0.0/12`) | the internet: postfix outbound 25, unbound recursion / `unbound.forwarders`, clamd freshclam, rspamd fuzzy and DNS lists, `sa-rules` download, Keycloak/LDAP sync, imapsync, SOGo remote calendars, acme |
 | `networkPolicy.egress.extraTo` (raw peers, all ports) | in-cluster targets you need |
 
-plus, for dockerapi, the CronJob runner and the TLS bootstrap Job only, the Kubernetes API server:
+plus, for dockerapi, the CronJob runner and the TLS bootstrap and strategy-fix hook Jobs only, the Kubernetes API server:
 `networkPolicy.egress.apiServerCIDRs` on `apiServerPorts` (443, 6443). `apiServerCIDRs` is required
 when egress is on (the chart fails without it): use the **endpoint** addresses from
 `kubectl get endpoints kubernetes -n default` (e.g. `172.18.0.2` on kind), not the `kubernetes`

@@ -16,8 +16,7 @@ spec:
   {{- end }}
   # bootstrap-sogo.sh kills sogod while `nc -z sogo-mailcow 20000` succeeds. `sogo-mailcow` is the pod's
   # own hostname (/etc/hosts -> own pod IP, not the Service), so old pods do not block a new one.
-  strategy:
-    type: RollingUpdate
+  {{- include "mailcow.strategy" (dict "root" . "component" $c) | nindent 2 }}
   selector:
     matchLabels:
       {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}

@@ -208,7 +208,7 @@ persistence:
     accessMode: ReadWriteOnce
     existingClaim: ""
   # -- postfix-vol-1 (queue). Also mounted by watchdog (same node). With postfix.spoolPerPod: size, accessMode
-  # and storageClass of every per-pod claim `spool-<fullname>-postfix-<n>` (no single PVC then).
+  # and storageClass of every per-pod claim `spool-<fullname>-postfix-spool-<n>` (no single PVC then).
   postfix:
     size: 2Gi
     accessMode: ReadWriteOnce
@@ -505,8 +505,9 @@ postfix:
   # and watchdog's queue check see one pod only, rate limits count per pod. README "Scaling".
   replicas: 1
   # -- Queue on a PVC per pod (volumeClaimTemplates `spool`, sized by persistence.postfix) instead of the single
-  # persistence.postfix PVC. Changing it on an existing release needs the procedure in README "Scaling"
-  # (the StatefulSet's volume spec is immutable). Not combinable with persistence.postfix.existingClaim.
+  # persistence.postfix PVC. The StatefulSet is then named <fullname>-postfix-spool: switching replaces
+  # <fullname>-postfix (Helm deletes the old one), drain the queue first, README "Scaling".
+  # Not combinable with persistence.postfix.existingClaim.
   spoolPerPod: false
 
 postfixTlspol:

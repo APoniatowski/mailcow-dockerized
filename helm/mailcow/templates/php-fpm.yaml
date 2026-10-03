@@ -17,8 +17,7 @@ spec:
   # Every pod runs with MASTER=y (MASTER=n shows "[ slave ]" and reads quota2replica). Recreate: init_db
   # migrates the schema whenever the stored version differs from its own, so an old pod beside a new one
   # would migrate it back on its next request.
-  strategy:
-    type: {{ $v.updateStrategy }}
+  {{- include "mailcow.strategy" (dict "root" . "component" $c) | nindent 2 }}
   selector:
     matchLabels:
       {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
