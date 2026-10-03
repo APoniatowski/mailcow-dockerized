@@ -199,8 +199,8 @@ function fail2ban($_action, $_data = null, $_extra = null) {
               if (valid_network($network) && !in_array($network, array(
                 '0.0.0.0',
                 '0.0.0.0/0',
-                getenv('IPV4_NETWORK') . '0/24',
-                getenv('IPV4_NETWORK') . '0',
+                getenv('IPV4_NETWORK') . '.0/24',
+                getenv('IPV4_NETWORK') . '.0',
                 getenv('IPV6_NETWORK')
               ))) {
                 try {
@@ -300,8 +300,8 @@ function fail2ban($_action, $_data = null, $_extra = null) {
               if (valid_network($bl_item) && !in_array($bl_item, array(
                 '0.0.0.0',
                 '0.0.0.0/0',
-                getenv('IPV4_NETWORK') . '0/24',
-                getenv('IPV4_NETWORK') . '0',
+                getenv('IPV4_NETWORK') . '.0/24',
+                getenv('IPV4_NETWORK') . '.0',
                 getenv('IPV6_NETWORK')
               ))) {
                 $redis->hSet('F2B_BLACKLIST', $bl_item, 1);
