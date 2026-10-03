@@ -37,7 +37,11 @@ if [[ "${MASTER}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
 fi
 
 # cat /dev/urandom seems to hang here occasionally and is not recommended anyway, better use openssl
-RAND_PASS=$(openssl rand -base64 16 | tr -dc _A-Z-a-z-0-9)
+if [[ -n "${SOGO_ENCRYPTION_KEY}" ]]; then
+  RAND_PASS=${SOGO_ENCRYPTION_KEY}
+else
+  RAND_PASS=$(openssl rand -base64 16 | tr -dc _A-Z-a-z-0-9)
+fi
 
 # Generate plist header with timezone data
 mkdir -p /var/lib/sogo/GNUstep/Defaults/
