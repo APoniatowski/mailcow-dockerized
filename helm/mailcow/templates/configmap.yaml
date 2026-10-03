@@ -27,6 +27,13 @@ data:
 
     # --- added by the mailcow Helm chart ---
     haproxy_trusted_networks = {{ .Values.mail.proxyTrustedNetworks }}
+  # Appended to data/conf/postfix/extra.cf (after extraFiles). The lmtp client's own DNS
+  # lookups skip resolv.conf search domains, so the bare "dovecot" transport host
+  # (main.cf virtual_transport) only resolves through getaddrinfo.
+  postfix-k8s.cf: |
+
+    # --- added by the mailcow Helm chart ---
+    lmtp_host_lookup = native
 {{- if .Values.extraFiles }}
 ---
 apiVersion: v1

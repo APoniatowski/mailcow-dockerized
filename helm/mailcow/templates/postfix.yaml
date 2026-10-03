@@ -26,7 +26,7 @@ spec:
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
       {{- include "mailcow.podCommon" (dict "root" . "shared" true) | nindent 6 }}
       initContainers:
-        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/postfix" "conf/postfix") "shared" (list (dict "dir" "rspamd-vol")) "ssl" true) | nindent 8 }}
+        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/postfix" "conf/postfix") "shared" (list (dict "dir" "rspamd-vol")) "appends" (list (dict "key" "postfix-k8s.cf" "dst" "conf/postfix/extra.cf")) "ssl" true) | nindent 8 }}
       containers:
         - name: postfix-mailcow
           image: {{ include "mailcow.image" $v.image }}

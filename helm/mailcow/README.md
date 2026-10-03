@@ -226,6 +226,6 @@ pod too.
 ## Development
 
 - `helm/mailcow/scripts/check-tags.sh [--fix]`: chart image tags must equal `docker-compose.yml`.
-- `ci/*-values.yaml`: kind (NodePorts 30080/30443/30025/30465/30587/30143/30993/34190, RWO shared,
+- `ci/*-values.yaml`: kind (NodePorts 30080/30443/30025/30465/30587/30143/30993/32190, RWO shared,
   self-signed TLS, clamd skipped), cert-manager + Ingress, HA (RWX, LB + PROXY, netfilter,
   watchdog, NetworkPolicy), acme + extraFiles, NetworkPolicy without PROXY protocol.
