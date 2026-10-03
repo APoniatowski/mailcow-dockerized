@@ -104,8 +104,18 @@ the generated Secret are kept on `helm uninstall` (`persistence.keep`).
 
 For 2–4 the Secret is mounted as a whole volume at `/etc/ssl/mail-tls` (`cert.pem`/`key.pem`)
 and `/etc/ssl/mail` holds `dhparams.pem` (files image) plus symlinks, so renewed certificates appear
-in the pods without a restart. The daemons still need a reload to use them (e.g. with
-Reloader); until then restart postfix, dovecot and nginx after a renewal.
+in the pods without a restart (kubelet syncs Secret volumes within a minute or two). The daemons
+only read certificates when they (re)load, so the CronJob `cert-reload` (`tls.reload.enabled`,
+default on; schedule `tls.reload.schedule`, default `17 3 * * *`) runs `postfix reload`,
+`doveadm reload` and `nginx -s reload` in the three pods through the CronJob runner. The three steps
+run independently; the Job fails if any of them fails. All three reloads are graceful: open
+connections finish on the old processes, new ones get the new certificate.
+
+cert-manager renews at 2/3 of the certificate lifetime by default (30 days before expiry for
+90-day Let's Encrypt certificates; `tls.certManager.renewBefore` overrides it), so a daily reload
+means the new certificate is in use at most about a day after renewal, long before the old one
+expires. With `acme.enabled` the job is not rendered: the acme container reloads/restarts the
+daemons through dockerapi itself.
 
 ### Client IPs and exposure
 
@@ -130,7 +140,9 @@ Reloader); until then restart postfix, dovecot and nginx after a renewal.
 | dovecot-sarules (`@every 24h`) | `0 3 * * *` | dovecot |
 
 All `concurrencyPolicy: Forbid`, time zone `mailcow.tz`; the `MASTER` guards run unchanged inside
-the target container. Override with `cronjobs.jobs.<name>.{enabled,schedule}`.
+the target container. Override with `cronjobs.jobs.<name>.{enabled,schedule}`. The chart's own
+`cert-reload` job ([TLS](#tls)) uses the same runner and ServiceAccount, and renders even with
+`cronjobs.enabled: false`.
 
 ## Environment contract
 
@@ -203,11 +215,30 @@ objects are ignored silently.
 
 - Always: dockerapi :443 only from php-fpm, watchdog, acme and dovecot pods. dockerapi is an
   unauthenticated API that runs commands in every mailcow container.
-- `networkPolicy.enabled` (default: on when `mail.proxyProtocol` is true): every port of mysql, redis,
-  memcached, clamd, olefy, rspamd, php-fpm, sogo, postfix-tlspol, unbound, postfix and dovecot only
-  from pods of this release; postfix/dovecot client ports (PROXY listeners, or the plain ports without
-  PROXY protocol) from `networkPolicy.publicMailFrom` (empty = anywhere); nginx http/https from anywhere.
-  Without it, any pod in the cluster can relay through postfix, since it connects from the pod CIDR.
+- `networkPolicy.enabled` (default `true`, in both mail modes; only `false` turns it off, the old
+  `""` auto mode now counts as on): every port of mysql, redis, memcached, clamd, olefy, rspamd,
+  php-fpm, sogo, postfix-tlspol, unbound, postfix and dovecot only from pods of this release;
+  postfix/dovecot client ports (PROXY listeners, or the plain ports without PROXY protocol) from
+  `networkPolicy.publicMailFrom`; nginx http/https from anywhere. Without it, any pod in the cluster
+  can relay through postfix, since it connects from the pod CIDR.
+- `networkPolicy.publicMailFrom` empty (default): the client ports allow `0.0.0.0/0` except every
+  IPv4 entry of `mailcow.networks`, and `::/0` except every IPv6 entry (bare addresses become /32 or
+  /128). Pods of this release still reach every port through the pod selector. Every other source
+  inside the pod CIDR is one mailcow trusts (relay without auth), so it must not reach the client
+  ports:
+  - Calico applies `ipBlock` to pod addresses, so `except` blocks other pods;
+  - Cilium never matches pods with CIDR rules, so other pods are blocked either way;
+  - ingress traffic SNAT'd into the pod CIDR (e.g. flannel's `cni0`/`flannel.1` address with
+    `externalTrafficPolicy: Cluster`) is blocked too. Without PROXY protocol that traffic would
+    otherwise be an open relay, so blocking is the safe outcome. With PROXY protocol on such a CNI,
+    clients that reach the pod through another node are blocked: set
+    `mail.service.externalTrafficPolicy: Local`, or set `publicMailFrom` to the source range you
+    accept.
+
+  Set `publicMailFrom` to your load balancer / node ranges where you can, to narrow it further.
+- Ingress only: DNS to unbound, unbound's queries to kube-dns and the forwarders, and the CronJob
+  runner's API server calls are egress and unaffected. Kubelet probes come from the node, which
+  NetworkPolicy does not block.
 
 ### Namespace
 
@@ -299,5 +330,7 @@ drop traffic meet. Options:
 - `helm/mailcow/scripts/check-tags.sh [--fix]`: chart image tags must equal `docker-compose.yml`.
 - `ci/*-values.yaml`: kind (NodePorts 30080/30443/30025/30465/30587/30143/30993/32190, RWO shared,
   self-signed TLS, clamd skipped), cert-manager + Ingress, HA (RWX, LB + PROXY,
-  watchdog, NetworkPolicy), acme + extraFiles (postfix limits off), NetworkPolicy without PROXY protocol.
+  watchdog, NetworkPolicy), acme + extraFiles (postfix limits off, NetworkPolicy off), NetworkPolicy without PROXY protocol.
+  kind and cert-manager: NetworkPolicy on with the default `publicMailFrom`; cert-manager renders
+  `cert-reload` with the ofelia CronJobs off.
   `check-tags.sh` skips the compose services the chart does not ship (ofelia, netfilter).

@@ -321,6 +321,13 @@ tls:
     days: 365
     # -- RSA key size (generate_config.sh uses 4096).
     keySize: 4096
+  # Renewed Secret contents appear in the pods within about a minute, but postfix, dovecot and nginx
+  # only read certificates on (re)load. Not rendered with acme.enabled (acme reloads them itself).
+  reload:
+    # -- CronJob `cert-reload` (cronjobs.image runner): graceful `postfix reload`, `doveadm reload`, `nginx -s reload`.
+    enabled: true
+    # -- Schedule (5-field cron, mailcow.tz). Daily: at most ~1 day between renewal and use.
+    schedule: "17 3 * * *"
 
 # Images default to docker-compose.yml tags (scripts/check-tags.sh keeps them in sync).
 unbound:
@@ -560,11 +567,11 @@ cronjobs:
 # Ingress NetworkPolicies (need a CNI that enforces them). dockerapi :443 is always limited to
 # php-fpm, watchdog, acme and dovecot, whatever `enabled` says (it is an unauthenticated exec API).
 networkPolicy:
-  # -- true: every mailcow port only from pods of this release, except client mail ports
-  # (publicMailFrom) and nginx http/https (anywhere). "" = on when mail.proxyProtocol is true.
-  enabled: ""
+  # -- Every mailcow port only from pods of this release, except client mail ports (publicMailFrom)
+  # and nginx http/https (anywhere). false = off (anything else, including "", counts as on).
+  enabled: true
   # -- NetworkPolicy peers allowed on the client mail ports (PROXY listeners with mail.proxyProtocol,
-  # plain 25/465/587/143/993/110/995/4190 otherwise). Empty = anywhere. Set it to the load balancer /
-  # node ranges so other pods of the cluster cannot send forged PROXY headers, e.g.
-  # [{ipBlock: {cidr: 10.0.0.0/16}}]
+  # plain 25/465/587/143/993/110/995/4190 otherwise). Empty = 0.0.0.0/0 and ::/0 except the
+  # mailcow.networks entries (in-cluster pods would be trusted as internal). Narrow it to the load
+  # balancer / node ranges where you can, e.g. [{ipBlock: {cidr: 10.0.0.0/16}}]
   publicMailFrom: []

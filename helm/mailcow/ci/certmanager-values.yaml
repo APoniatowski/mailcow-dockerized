@@ -1,4 +1,5 @@
-# cert-manager issued certificate for postfix/dovecot/nginx + Ingress for the web UI.
+# cert-manager issued certificate for postfix/dovecot/nginx + Ingress for the web UI;
+# ofelia CronJobs off, so only cert-reload (and its runner RBAC) renders.
 mailcow:
   hostname: mail.example.org
   httpRedirect: "n"
@@ -25,3 +26,6 @@ http:
       nginx.ingress.kubernetes.io/proxy-body-size: 100m
     tls:
       enabled: true
+
+cronjobs:
+  enabled: false

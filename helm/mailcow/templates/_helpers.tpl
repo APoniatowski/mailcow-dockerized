@@ -135,9 +135,36 @@ app.kubernetes.io/part-of: mailcow
 
 {{/* "true" when the NetworkPolicies are rendered (networkPolicy.enabled; empty = mail.proxyProtocol) */}}
 {{- define "mailcow.networkPolicy" -}}
-{{- $e := toString .Values.networkPolicy.enabled -}}
-{{- if eq $e "true" -}}true
-{{- else if and (ne $e "false") .Values.mail.proxyProtocol -}}true
+{{- if ne (toString .Values.networkPolicy.enabled) "false" -}}true{{- end -}}
+{{- end -}}
+
+{{/* NetworkPolicy peers for the public mail ports: networkPolicy.publicMailFrom, or everything
+except mailcow.networks (in-cluster pods from the pod CIDR would be trusted as internal) */}}
+{{- define "mailcow.publicMailPeers" -}}
+{{- if .Values.networkPolicy.publicMailFrom -}}
+{{- toYaml .Values.networkPolicy.publicMailFrom -}}
+{{- else -}}
+{{- $v4 := list -}}{{- $v6 := list -}}
+{{- range splitList "," .Values.mailcow.networks -}}
+{{- $n := trim . -}}
+{{- if $n -}}
+{{- if contains ":" $n -}}{{- $v6 = append $v6 (ternary $n (printf "%s/128" $n) (contains "/" $n)) -}}
+{{- else -}}{{- $v4 = append $v4 (ternary $n (printf "%s/32" $n) (contains "/" $n)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+- ipBlock:
+    cidr: 0.0.0.0/0
+    {{- with $v4 }}
+    except:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+- ipBlock:
+    cidr: ::/0
+    {{- with $v6 }}
+    except:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
 {{- end -}}
 {{- end -}}
 
@@ -428,4 +455,68 @@ livenessProbe:
 {{/* include "mailcow.tcpProbes" (dict "port" 143 "startup" 60) */}}
 {{- define "mailcow.tcpProbes" -}}
 {{- include "mailcow.probes" (dict "handler" (dict "tcpSocket" (dict "port" .port)) "startup" .startup) -}}
+{{- end -}}
+
+{{/* ---------- exec CronJobs ---------- */}}
+{{/* include "mailcow.execCronJob" (dict "root" $ "job" "name" "schedule" "* * * * *" "target" "dovecot"
+  "steps" (list (dict "name" "kubectl" "kind" "statefulset" "comp" "dovecot" "command" (list ...))))
+One CronJob; every step is a container running `kubectl exec <kind>/<fullname>-<comp> -c <comp>-mailcow -- <command>`.
+Containers run side by side and independently; the pod (and Job) fails if any of them fails. */}}
+{{- define "mailcow.execCronJob" -}}
+{{- $root := .root -}}
+{{- $fullname := include "mailcow.fullname" $root -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $fullname }}-{{ .job }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" $root "component" "cron") | nindent 4 }}
+    mailcow.email/cron-target: {{ .target }}
+spec:
+  schedule: {{ .schedule | quote }}
+  timeZone: {{ $root.Values.mailcow.tz | quote }}
+  # ofelia no-overlap
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: {{ $root.Values.cronjobs.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ $root.Values.cronjobs.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: {{ $root.Values.cronjobs.ttlSecondsAfterFinished }}
+      template:
+        metadata:
+          labels:
+            {{- include "mailcow.selectorLabels" (dict "root" $root "component" "cron") | nindent 12 }}
+            mailcow.email/cron-job: {{ .job }}
+        spec:
+          serviceAccountName: {{ $fullname }}-cron
+          automountServiceAccountToken: true
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+          {{- include "mailcow.podCommon" (dict "root" $root) | nindent 10 }}
+          containers:
+            {{- range .steps }}
+            - name: {{ .name }}
+              image: {{ include "mailcow.image" $root.Values.cronjobs.image }}
+              imagePullPolicy: {{ $root.Values.cronjobs.image.pullPolicy }}
+              args:
+                - exec
+                - {{ printf "%s/%s-%s" .kind $fullname .comp }}
+                - -c
+                - {{ printf "%s-mailcow" .comp }}
+                - --
+                {{- range .command }}
+                - {{ . | quote }}
+                {{- end }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+            {{- end }}
 {{- end -}}

@@ -68,3 +68,8 @@ cronjobs:
   # delete a Job before the CronJob controller records it finished -> "MissingJob" warnings
   successfulJobsHistoryLimit: 1
   ttlSecondsAfterFinished: 120
+
+networkPolicy:
+  # kindnet (kind >= 0.24) enforces NetworkPolicy. The smoke test reaches the mail NodePorts from the
+  # host (docker bridge gateway, outside 10.244.0.0/16), so the publicMailFrom default admits it.
+  enabled: true

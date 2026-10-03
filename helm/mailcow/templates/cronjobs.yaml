@@ -1,4 +1,5 @@
-{{- if .Values.cronjobs.enabled }}
+{{- $reload := and .Values.tls.reload.enabled (not .Values.acme.enabled) }}
+{{- if or .Values.cronjobs.enabled $reload }}
 {{- /*
 ofelia job-exec labels from docker-compose.yml -> CronJobs running `kubectl exec` into the
 component's main container (the exec'd process gets the container env, like `docker exec`, so
@@ -65,60 +66,23 @@ subjects:
 {{- range $jobs }}
 {{- $job := index . 0 }}{{ $kind := index . 1 }}{{ $comp := index . 2 }}{{ $cmd := index . 3 }}
 {{- $cfg := index $root.Values.cronjobs.jobs $job | default dict }}
-{{- if and (ne (toString $cfg.enabled) "false") (not (and (eq $comp "sogo") $root.Values.skip.sogo)) }}
+{{- if and $root.Values.cronjobs.enabled (ne (toString $cfg.enabled) "false") (not (and (eq $comp "sogo") $root.Values.skip.sogo)) }}
 ---
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: {{ $fullname }}-{{ $job }}
-  labels:
-    {{- include "mailcow.labels" (dict "root" $root "component" "cron") | nindent 4 }}
-    mailcow.email/cron-target: {{ $comp }}
-spec:
-  schedule: {{ $cfg.schedule | quote }}
-  timeZone: {{ $root.Values.mailcow.tz | quote }}
-  # ofelia no-overlap
-  concurrencyPolicy: Forbid
-  startingDeadlineSeconds: 120
-  successfulJobsHistoryLimit: {{ $root.Values.cronjobs.successfulJobsHistoryLimit }}
-  failedJobsHistoryLimit: {{ $root.Values.cronjobs.failedJobsHistoryLimit }}
-  jobTemplate:
-    spec:
-      backoffLimit: 0
-      ttlSecondsAfterFinished: {{ $root.Values.cronjobs.ttlSecondsAfterFinished }}
-      template:
-        metadata:
-          labels:
-            {{- include "mailcow.selectorLabels" (dict "root" $root "component" "cron") | nindent 12 }}
-            mailcow.email/cron-job: {{ $job }}
-        spec:
-          serviceAccountName: {{ $name }}
-          automountServiceAccountToken: true
-          restartPolicy: Never
-          securityContext:
-            runAsNonRoot: true
-            runAsUser: 65532
-            runAsGroup: 65532
-          {{- include "mailcow.podCommon" (dict "root" $root) | nindent 10 }}
-          containers:
-            - name: kubectl
-              image: {{ include "mailcow.image" $root.Values.cronjobs.image }}
-              imagePullPolicy: {{ $root.Values.cronjobs.image.pullPolicy }}
-              args:
-                - exec
-                - {{ printf "%s/%s-%s" $kind $fullname $comp }}
-                - -c
-                - {{ printf "%s-mailcow" $comp }}
-                - --
-                - /bin/bash
-                - -c
-                - {{ $cmd | quote }}
-              securityContext:
-                allowPrivilegeEscalation: false
-                capabilities:
-                  drop: ["ALL"]
-              resources:
-                requests: {cpu: 10m, memory: 32Mi}
+{{ include "mailcow.execCronJob" (dict "root" $root "job" $job "schedule" $cfg.schedule "target" $comp
+  "steps" (list (dict "name" "kubectl" "kind" $kind "comp" $comp "command" (list "/bin/bash" "-c" $cmd)))) }}
 {{- end }}
+{{- end }}
+{{- if $reload }}
+{{- /*
+TLS from a Secret (cert-manager / existingSecret / self-signed): the projected files change in
+place, the daemons only pick them up on reload (graceful). With acme, the acme container reloads
+them through dockerapi instead.
+*/}}
+---
+{{ include "mailcow.execCronJob" (dict "root" $root "job" "cert-reload" "schedule" $root.Values.tls.reload.schedule "target" "tls"
+  "steps" (list
+    (dict "name" "postfix" "kind" "statefulset" "comp" "postfix" "command" (list "postfix" "-c" "/opt/postfix/conf" "reload"))
+    (dict "name" "dovecot" "kind" "statefulset" "comp" "dovecot" "command" (list "doveadm" "reload"))
+    (dict "name" "nginx" "kind" "deployment" "comp" "nginx" "command" (list "nginx" "-s" "reload")))) }}
 {{- end }}
 {{- end }}

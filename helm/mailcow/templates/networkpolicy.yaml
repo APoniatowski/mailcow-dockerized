@@ -1,9 +1,9 @@
 {{- /*
 Ingress NetworkPolicies. Only effective with a CNI that enforces NetworkPolicy.
 dockerapi (unauthenticated exec API on :443) is always restricted to the pods that call it.
-With networkPolicy on: every mailcow port only from pods of this release, except
+With networkPolicy on (default): every mailcow port only from pods of this release, except
   - the client-facing mail ports (PROXY listeners with mail.proxyProtocol, plain ports otherwise),
-    from networkPolicy.publicMailFrom (empty = anywhere),
+    from networkPolicy.publicMailFrom (empty = anywhere outside mailcow.networks),
   - nginx http/https, from anywhere.
 Pods of this release sit in mailcow.networks (MAILCOW_NETWORKS): anything else in the cluster
 that could reach postfix/dovecot from the pod CIDR would be trusted as internal.
@@ -83,10 +83,8 @@ spec:
         - port: {{ . }}
           protocol: TCP
         {{- end }}
-      {{- with $root.Values.networkPolicy.publicMailFrom }}
       from:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- include "mailcow.publicMailPeers" $root | nindent 8 }}
 {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
