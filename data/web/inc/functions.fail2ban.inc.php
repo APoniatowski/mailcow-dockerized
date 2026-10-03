@@ -202,7 +202,7 @@ function fail2ban($_action, $_data = null, $_extra = null) {
                 getenv('IPV4_NETWORK') . '.0/24',
                 getenv('IPV4_NETWORK') . '.0',
                 getenv('IPV6_NETWORK')
-              ), env_list('MAILCOW_NETWORKS')))) {
+              ), env_networks('MAILCOW_NETWORKS')))) {
                 try {
                   $redis->hSet('F2B_BLACKLIST', $network, 1);
                   $redis->hDel('F2B_WHITELIST', $network, 1);
@@ -303,7 +303,7 @@ function fail2ban($_action, $_data = null, $_extra = null) {
                 getenv('IPV4_NETWORK') . '.0/24',
                 getenv('IPV4_NETWORK') . '.0',
                 getenv('IPV6_NETWORK')
-              ), env_list('MAILCOW_NETWORKS')))) {
+              ), env_networks('MAILCOW_NETWORKS')))) {
                 $redis->hSet('F2B_BLACKLIST', $bl_item, 1);
               }
               else {

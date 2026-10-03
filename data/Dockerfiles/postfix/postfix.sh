@@ -487,15 +487,35 @@ fi
 # Reset main.cf
 sed -i '/Overrides/q' /opt/postfix/conf/main.cf
 echo >> /opt/postfix/conf/main.cf
-if [[ -n "${MAILCOW_NETWORKS}" ]]; then
-  MYNETWORKS="127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128"
-  for net in ${MAILCOW_NETWORKS//,/ }; do
-    if [[ ${net} == *:* && ${net} != \[* ]]; then
-      [[ ${net} == */* ]] && net="[${net%/*}]/${net#*/}" || net="[${net}]"
+parse_nets() {
+  local net nets bad=() ok=()
+  IFS=$', \t\n' read -r -d '' -a nets <<< "${!1}" || true
+  for net in "${nets[@]}"; do
+    [[ -z ${net} ]] && continue
+    [[ ${net} =~ ^\[([^]]+)\](/.*)?$ ]] && net=${BASH_REMATCH[1]}${BASH_REMATCH[2]}
+    if [[ ${net} =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ && ${net} == *[.:]* ]]; then
+      if [[ ${net} == *:* ]]; then
+        [[ ${net} == */* ]] && net="[${net%/*}]/${net#*/}" || net="[${net}]"
+      fi
+      ok+=("${net}")
+    elif [[ ${net} =~ ^[a-z]+: ]]; then
+      ok+=("${net}")
+    else
+      bad+=("${net}")
     fi
-    MYNETWORKS="${MYNETWORKS} ${net}"
   done
-  echo "mynetworks = ${MYNETWORKS}" >> /opt/postfix/conf/main.cf
+  if [[ -n ${!1} && ${#ok[@]} -eq 0 ]]; then
+    echo "WARNING: ${1} contains no valid networks, ignoring it" >&2
+  elif [[ ${#bad[@]} -gt 0 ]]; then
+    echo "WARNING: ${1}: ignoring invalid entries: ${bad[*]}" >&2
+  fi
+  if [[ ${#ok[@]} -gt 0 ]]; then
+    printf '%s\n' "${ok[@]}"
+  fi
+}
+mapfile -t NETS < <(parse_nets MAILCOW_NETWORKS)
+if [[ ${#NETS[@]} -gt 0 ]]; then
+  echo "mynetworks = 127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128 ${NETS[*]}" >> /opt/postfix/conf/main.cf
 fi
 # Append postscreen dnsbl sites to main.cf
 if [ ! -z "$DNSBL_CONFIG" ]; then
