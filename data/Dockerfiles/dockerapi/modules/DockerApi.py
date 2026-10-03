@@ -604,6 +604,9 @@ class DockerApi:
       return ''.join(total_data)
 
     try :
+      exec_stdin = getattr(container, 'exec_stdin', None)
+      if exec_stdin:
+        return exec_stdin(cmd, user, timeout, shell_cmd)
       socket = container.exec_run([shell_cmd], stdin=True, socket=True, user=user).output._sock
       if not cmd.endswith("\n"):
         cmd = cmd + "\n"

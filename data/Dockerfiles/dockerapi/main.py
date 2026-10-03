@@ -39,8 +39,14 @@ async def lifespan(app: FastAPI):
     redis_client = redis = await aioredis.from_url("redis://redis-mailcow:6379/0", password=os.environ['REDISPASS'])
 
   # Init docker clients
-  sync_docker_client = docker.DockerClient(base_url='unix://var/run/docker.sock', version='auto')
-  async_docker_client = aiodocker.Docker(url='unix:///var/run/docker.sock')
+  if os.environ.get('DOCKERAPI_BACKEND', '') == 'kubernetes':
+    from modules.KubernetesClient import KubernetesClient, AsyncKubernetesClient
+    logger.info("Using kubernetes backend")
+    sync_docker_client = KubernetesClient(logger)
+    async_docker_client = AsyncKubernetesClient(sync_docker_client)
+  else:
+    sync_docker_client = docker.DockerClient(base_url='unix://var/run/docker.sock', version='auto')
+    async_docker_client = aiodocker.Docker(url='unix:///var/run/docker.sock')
 
   dockerapi = DockerApi(redis_client, sync_docker_client, async_docker_client, logger)
 
