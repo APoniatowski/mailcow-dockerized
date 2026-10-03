@@ -77,6 +77,9 @@ spec:
               value: {{ include "mailcow.yn" .Values.skip.olefy | quote }}
             - name: SKIP_SOGO
               value: {{ include "mailcow.yn" .Values.skip.sogo | quote }}
+            # mysql_upgrade / tzinfo import run through dockerapi in the mysql pod, which externalDatabase lacks
+            - name: SKIP_MYSQL_UPGRADE
+              value: {{ include "mailcow.yn" .Values.externalDatabase.enabled | quote }}
             - name: ALLOW_ADMIN_EMAIL_LOGIN
               value: {{ $m.allowAdminEmailLogin | quote }}
             - name: MASTER

@@ -41,7 +41,7 @@ Login: `admin` / `moohoo`. API key: `kubectl -n mailcow get secret mailcow-secre
 | compose service | Kubernetes |
 |---|---|
 | unbound | Deployment + Service `unbound` with fixed ClusterIP; repo `unbound.conf` + appended `forward-zone` for `clusterDomain` → `clusterDNS` (`domain-insecure`, DNSSEC stays on for the rest), plus `forward-zone "."` → `unbound.forwarders` when set |
-| mysql, redis | StatefulSet (1 replica, PVC). Clients use TCP (`DBHOST=mysql`) |
+| mysql, redis | StatefulSet (1 replica, PVC), or an external server (`externalDatabase` / `externalRedis`, [External database / Redis](#external-database--redis)). Clients use TCP (`DBHOST=mysql`) |
 | dovecot, postfix | StatefulSet (1 replica) |
 | rspamd | Deployment, `hostname: rspamd` (worker-proxy binds `rspamd:9900`), own PVC; controller socket relayed over TCP 11335 ([Storage](#storage)) |
 | php-fpm, sogo, nginx, clamd, olefy, memcached, postfix-tlspol | Deployment |
@@ -83,7 +83,7 @@ They are copied over the base slice on every pod start (also into the shared dir
 | PVC | mounted by |
 |---|---|
 | `vmail`, `vmail-index`, `crypt` | dovecot (**back up `crypt`**, without it mail is unreadable) |
-| `mysql`, `redis`, `postfix-tlspol`, `sogo-backup`, `clamd-db` | their component |
+| `mysql`, `redis`, `postfix-tlspol`, `sogo-backup`, `clamd-db` | their component (`mysql`/`redis` not created with `externalDatabase`/`externalRedis`) |
 | `rspamd` | rspamd: `data/` = `/var/lib/rspamd` (controller socket, non-critical state; bayes and fuzzy hashes live in Redis), `override/worker-controller-password.inc` (UI password) |
 | `postfix` | postfix (+ watchdog, same node) |
 | `shared` (subPaths) | see below |
@@ -124,6 +124,10 @@ Not shared (compose shares them through bind mounts or named volumes):
   `/var/lib/rspamd/rspamd.sock` (mode 0666, like rspamd's own) and connects to
   `rspamd-mailcow.<ns>.svc.<clusterDomain>:11335` per connection. Clients and rspamd config are
   unchanged; rspamd still sees unix-socket clients. `rspamd.socketRelay.resources` sizes the sidecars.
+  The relay listens dual-stack (`TCP6-LISTEN`, `ipv6only=0`) when the pod has IPv6 (non-empty
+  `/proc/net/if_inet6`) and IPv4-only otherwise, decided at container start, so it works on IPv4,
+  IPv6 and dual-stack clusters. The client relays connect by name; socat (1.8) tries every A/AAAA
+  address of the Service in turn.
 
 #### Upgrading from chart < 0.5.0
 
@@ -136,6 +140,71 @@ Not shared (compose shares them through bind mounts or named volumes):
   `extraFiles` (`conf/sogo/...`) for SOGo customisation, as before.
 - postfix, sogo and nginx (without acme) lose the shared-volume podAffinity and may be rescheduled
   to other nodes.
+
+### External database / Redis
+
+`externalDatabase.enabled` / `externalRedis.enabled` replace the in-cluster StatefulSets with a server
+you run (managed service, operator, VM). The chart then renders no mysql / redis StatefulSet, PVC or
+NetworkPolicy, and the Services `mysql` + `mysql-mailcow` / `redis` + `redis-mailcow` alias the
+external `host`, so every component keeps using the names it uses today (`DBHOST=mysql`, `redis:6379`):
+
+| `host` | Services | ports |
+|---|---|---|
+| DNS name (lower-cased, RFC 1123) | `type: ExternalName` (a CNAME to `host`) | no port mapping: clients connect to `host:port` |
+| IPv4 or IPv6 literal (`192.0.2.10`, `2001:db8::10`, brackets allowed) | selector-less ClusterIP Service (single stack, the address's family) + EndpointSlice `<service>-external` | Service port → `host:port` |
+
+Notes on the aliases:
+
+- ExternalName is a plain DNS CNAME. The usual ExternalName caveats (TLS certificate names, HTTP
+  `Host`/SNI) do not apply: MySQL and Redis carry no host name in the protocol.
+- Most mailcow pods resolve through unbound, which forwards `clusterDomain` to kube-dns and resolves
+  the CNAME target itself: by full recursion, or through `unbound.forwarders`. A name that only a
+  private resolver knows (e.g. a private cloud DNS zone) needs `unbound.forwarders` pointing at a
+  resolver that knows it, or use the IP address.
+- An IPv6 address needs an IPv6-capable (single- or dual-stack) cluster, and vice versa: the Service
+  family must match the address.
+- Switching an existing release between the in-cluster server and an external one (or between DNS
+  and IP hosts) changes the Service type; if Helm reports an immutable field, delete the four
+  Services and upgrade again. Data does not move by itself: dump the in-cluster database
+  (`mariadb-dump`) and restore it into the external one before switching.
+
+#### Database (`externalDatabase`)
+
+`DBPORT` becomes `externalDatabase.port` on every client; `DBHOST` stays `mysql`. Before installing,
+the DBA prepares:
+
+- the database `mailcow.dbName` (`utf8mb4`) and the user `mailcow.dbUser` with the password `DBPASS`
+  from the release Secret (`existingSecret`, or read it from the generated one), with
+  `GRANT ALL PRIVILEGES ON <dbName>.* TO <dbUser>`: mailcow creates and alters its tables and views
+  on every php-fpm start, drops a SOGo trigger, and php-fpm (re)creates the scheduled events
+  `clean_spamalias`, `clean_oauth2` and `clean_sasl_log` (needs `EVENT`);
+- `event_scheduler=ON` on the server (compose's `data/conf/mysql/my.cnf` sets it). Without it the
+  events exist but never run: expired spam aliases, OAuth2 tokens and old SASL log rows pile up;
+- the time zone tables (`mysql_tzinfo_to_sql /usr/share/zoneinfo | mariadb -u root mysql`, or the
+  managed service's equivalent). With the bundled MariaDB php-fpm imports them through dockerapi;
+  its start-up check (`CONVERT_TZ('…','Europe/Berlin','UTC')`) returns NULL while they are missing;
+- a `max_allowed_packet` large enough for big sieve scripts and quarantine items (compose: 192M).
+
+php-fpm gets `SKIP_MYSQL_UPGRADE=y`: it skips the `mysql_upgrade` and time zone import it would
+otherwise run through dockerapi inside the mysql pod (there is none), and only warns in its log if
+`CONVERT_TZ` returns NULL. `DBROOT` (Secret) is then unused, except by watchdog's MySQL replication
+checks (`WATCHDOG_MYSQL_REPLICATION_CHECKS`, off by default). Backups, upgrades, replication and
+high availability of the database are yours.
+
+#### Redis (`externalRedis`)
+
+- Its password must equal `REDISPASS` from the release Secret (`requirepass`, or the default user's
+  password). No TLS: mailcow's Redis clients (PHP, Python, Lua, `redis-cli`) speak plain TCP.
+- mailcow components hard-code port 6379. With a DNS `host` the port must therefore be 6379 (the chart
+  fails otherwise, ExternalName cannot remap ports); with an IP `host` the Services listen on 6379 and
+  the EndpointSlice maps it to `externalRedis.port`.
+- rspamd sends `SLAVEOF NO ONE` on every start (compose behaviour): point `host` at a primary, never
+  at a replica. Managed services that reject the command just log an error.
+- Give mailcow a Redis of its own: its keys are unprefixed, in the default database. mailcow keeps
+  settings, rspamd's Bayes/fuzzy data and logs there, so the server needs persistence (RDB/AOF) and
+  backups.
+- watchdog (off by default) checks Redis with `check_tcp -4`: with an IPv6 Redis its Redis check
+  fails. Its restart action for mysql/redis finds no pod with either external server.
 
 ### TLS
 
@@ -195,7 +264,8 @@ The chart sets them; images at the tags pinned in `docker-compose.yml` support a
 
 | variable | set on | value |
 |---|---|---|
-| `DBHOST`, `DBPORT` | php-fpm, sogo, dovecot, postfix, acme, watchdog | `mysql`, `3306` (TCP instead of the unix socket) |
+| `DBHOST`, `DBPORT` | php-fpm, sogo, dovecot, postfix, acme, watchdog | `mysql`, `3306` or `externalDatabase.port` (TCP instead of the unix socket) |
+| `SKIP_MYSQL_UPGRADE` | php-fpm | `y` with `externalDatabase.enabled` (no `mysql_upgrade` / tzinfo import through dockerapi), `n` otherwise |
 | `DOVECOTHOST`, `POSTFIXHOST` | sogo | `dovecot`, `postfix` (IMAP/Sieve/SMTP endpoints in sogo.conf) |
 | `POSTFIXHOST` | rspamd | `postfix.<ns>.svc.<clusterDomain>` (rspamd's resolver ignores search domains) |
 | `DOCKERAPIHOST` | php-fpm, dovecot, acme, watchdog | `dockerapi` (the UI uses that literal name, so the Service is called exactly `dockerapi`) |
@@ -267,7 +337,7 @@ objects are ignored silently.
   mentions 11335. Without an enforcing CNI every pod in the cluster can reach 11335; so can traffic
   from the node itself (kubelet, hostNetwork pods), which most CNIs never filter.
 - `networkPolicy.enabled` (default `true`, in both mail modes; only `false` turns it off, the old
-  `""` auto mode now counts as on): every port of mysql, redis, memcached, clamd, olefy,
+  `""` auto mode now counts as on): every port of mysql, redis (unless external), memcached, clamd, olefy,
   php-fpm, sogo, postfix-tlspol, unbound, postfix and dovecot (rspamd: every port but 11335) only from pods of this release;
   postfix/dovecot client ports (PROXY listeners, or the plain ports without PROXY protocol) from
   `networkPolicy.publicMailFrom`; nginx http/https from anywhere. Without it, any pod in the cluster
@@ -287,9 +357,45 @@ objects are ignored silently.
     accept.
 
   Set `publicMailFrom` to your load balancer / node ranges where you can, to narrow it further.
-- Ingress only: DNS to unbound, unbound's queries to kube-dns and the forwarders, and the CronJob
-  runner's API server calls are egress and unaffected. Kubelet probes come from the node, which
-  NetworkPolicy does not block.
+- The policies above are ingress only. Kubelet probes come from the node, which NetworkPolicy does
+  not block. Egress is unrestricted unless `networkPolicy.egress.enabled` (below).
+
+#### Egress (optional)
+
+`networkPolicy.egress.enabled` (default `false`) adds egress policies. Off by default because a mail
+server legitimately talks to the whole internet (outbound SMTP to any MX, DNS recursion, blocklists),
+so the policy can only fence off the cluster, and the addresses it needs differ per cluster. When on,
+every pod of the release may reach:
+
+| rule | why |
+|---|---|
+| pods of this release, all ports | mailcow components talk to each other |
+| cluster DNS pods: namespace `networkPolicy.egress.dns.namespace` (`kube-system`), labels `dns.podLabels` (`k8s-app: kube-dns`), port `dns.port` (53) UDP+TCP | unbound's `clusterDomain` forward-zone; pods without unbound DNS |
+| `0.0.0.0/0` and `::/0` except `networkPolicy.egress.clusterCIDRs` (empty = the `mailcow.networks` entries + `networkPolicy.egress.serviceCIDR`, default `10.96.0.0/12`) | the internet: postfix outbound 25, unbound recursion / `unbound.forwarders`, clamd freshclam, rspamd fuzzy and DNS lists, `sa-rules` download, Keycloak/LDAP sync, imapsync, SOGo remote calendars, acme |
+| `networkPolicy.egress.extraTo` (raw peers, all ports) | in-cluster targets you need |
+
+plus, for dockerapi, the CronJob runner and the TLS bootstrap Job only, the Kubernetes API server:
+`networkPolicy.egress.apiServerCIDRs` on `apiServerPorts` (443, 6443). `apiServerCIDRs` is required
+when egress is on (the chart fails without it): use the **endpoint** addresses from
+`kubectl get endpoints kubernetes -n default` (e.g. `172.18.0.2` on kind), not the `kubernetes`
+Service ClusterIP (NetworkPolicy sees the address after the Service translation).
+
+Everything else in the cluster is blocked: other workloads' pods (pod CIDR) and ClusterIPs. Rules
+are additive, so `apiServerCIDRs` and `extraTo` get through even inside `clusterCIDRs`. Notes:
+
+- External database / Redis: a host outside `clusterCIDRs` is covered by the internet rule. One inside
+  (an operator-managed database, a Redis in another namespace) must be added to `extraTo`, e.g.
+  `[{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: db}}, podSelector: {matchLabels: {app.kubernetes.io/name: mariadb}}}]`.
+  An ExternalName pointing at an in-cluster Service name resolves to a ClusterIP in the service CIDR
+  and then to that Service's pods: blocked unless they are in `extraTo`.
+- Node and VPC/LAN addresses are not in the default `clusterCIDRs`, so they stay reachable (kind's
+  API server on the node address is reachable through the internet rule anyway). Add those ranges
+  to `clusterCIDRs` to block them too; then list the API server in `apiServerCIDRs` and anything
+  else you need (e.g. a database VM) in `extraTo`.
+- Cilium does not match the API server or cluster nodes with CIDR rules by default; allow the API
+  server with a CiliumNetworkPolicy (`toEntities: [kube-apiserver]`) or Cilium's
+  `policy-cidr-match-mode: nodes`. NodeLocal DNSCache (`169.254.20.10`) is outside the cluster CIDRs
+  and therefore reachable.
 
 ### Namespace
 
@@ -376,15 +482,23 @@ drop traffic meet. Options:
 - No fail2ban (netfilter); see [Brute-force protection](#brute-force-protection-no-fail2ban).
 - `redis` `net.core.somaxconn` is an unsafe sysctl (`redis.sysctls`, off by default); compose
   ulimits for dovecot have no pod equivalent (runtime defaults are higher).
-- NetworkPolicy covers ingress only; egress is unrestricted.
-- No external database support yet (php-fpm waits for the mysql pod via dockerapi).
+- Egress NetworkPolicies are optional and off by default (`networkPolicy.egress`): they fence off the
+  cluster, not the internet.
+- External database / Redis: supported (`externalDatabase`, `externalRedis`), but the database must
+  be prepared by hand (user, grants, `event_scheduler`, time zone tables); Redis is plain TCP only
+  and must listen on 6379 when given by DNS name ([External database / Redis](#external-database--redis)).
+- The rspamd socket relay listens dual-stack when the pod has IPv6, IPv4-only otherwise; IPv6-only
+  and dual-stack clusters work. Other IPv6 caveats (nginx `mailcow.enableIpv6`, watchdog's IPv4-only
+  checks) are unchanged.
 
 ## Development
 
 - `helm/mailcow/scripts/check-tags.sh [--fix]`: chart image tags must equal `docker-compose.yml`.
 - `ci/*-values.yaml`: kind (NodePorts 30080/30443/30025/30465/30587/30143/30993/32190, RWO shared,
   self-signed TLS, clamd skipped), cert-manager + Ingress, HA (RWX, LB + PROXY,
-  watchdog, NetworkPolicy), acme + extraFiles + watchdog (postfix limits off, NetworkPolicy off), NetworkPolicy without PROXY protocol.
+  watchdog, NetworkPolicy), acme + extraFiles + watchdog (postfix limits off, NetworkPolicy off), NetworkPolicy without PROXY protocol,
+  external MySQL/Redis by DNS name (ExternalName, DBPORT 3307) and by IPv4/IPv6 address (EndpointSlices, Redis 6379 → 6380),
+  egress policies on a dual-stack cluster with an in-cluster external database in `extraTo`.
   kind and cert-manager: NetworkPolicy on with the default `publicMailFrom`; cert-manager renders
   `cert-reload` with the ofelia CronJobs off.
   `check-tags.sh` skips the compose services the chart does not ship (ofelia, netfilter).

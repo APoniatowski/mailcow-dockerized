@@ -356,6 +356,19 @@ unbound:
   resources:
     requests: {cpu: 10m, memory: 32Mi}
 
+# MySQL/MariaDB outside the chart (managed service, operator, VM) instead of the mysql StatefulSet.
+# The database DBNAME, the user DBUSER with password DBPASS (release Secret) and ALL PRIVILEGES on
+# DBNAME.* must exist; the server needs event_scheduler=ON and loaded time zone tables. README
+# "External database / Redis".
+externalDatabase:
+  # -- true: no mysql StatefulSet, PVC or NetworkPolicy; the Services `mysql` and `mysql-mailcow` alias
+  # `host`, so DBHOST stays `mysql` everywhere. php-fpm gets SKIP_MYSQL_UPGRADE=y.
+  enabled: false
+  # -- DNS name (ExternalName Services) or IPv4/IPv6 address (selector-less Services + EndpointSlice).
+  host: ""
+  # -- TCP port of the external server; becomes DBPORT on every client.
+  port: 3306
+
 mysql:
   image:
     repository: mariadb
@@ -365,6 +378,17 @@ mysql:
     requests: {cpu: 50m, memory: 256Mi}
   # -- terminationGracePeriodSeconds (compose stop_grace_period 45s).
   terminationGracePeriodSeconds: 45
+
+# Redis outside the chart instead of the redis StatefulSet. Its password must equal REDISPASS from the
+# release Secret; plain TCP only (mailcow's clients speak no TLS). README "External database / Redis".
+externalRedis:
+  # -- true: no redis StatefulSet, PVC or NetworkPolicy; the Services `redis` and `redis-mailcow` alias `host`.
+  enabled: false
+  # -- DNS name (ExternalName Services) or IPv4/IPv6 address (selector-less Services + EndpointSlice).
+  host: ""
+  # -- TCP port of the external server. mailcow components connect to 6379: a DNS host must use 6379
+  # (ExternalName cannot remap ports); with an IP host the EndpointSlice maps Service port 6379 to it.
+  port: 6379
 
 redis:
   image:
@@ -591,3 +615,34 @@ networkPolicy:
   # mailcow.networks entries (in-cluster pods would be trusted as internal). Narrow it to the load
   # balancer / node ranges where you can, e.g. [{ipBlock: {cidr: 10.0.0.0/16}}]
   publicMailFrom: []
+  # Egress NetworkPolicies (off by default: a mail server legitimately talks to the whole internet, and
+  # the cluster-specific addresses below have no portable defaults). When on, every release pod may
+  # reach: release pods, kube-dns (dns), everything outside clusterCIDRs, extraTo; dockerapi, the
+  # CronJob runner and the TLS bootstrap Job also the API server. Other in-cluster workloads are blocked.
+  egress:
+    # -- Render the egress policies. Independent of networkPolicy.enabled.
+    enabled: false
+    # -- Required when enabled: API server endpoint addresses (CIDRs or bare IPs), the ENDPOINTS of
+    # `kubectl get endpoints kubernetes -n default`, not the `kubernetes` Service ClusterIP.
+    apiServerCIDRs: []
+    # -- API server endpoint ports (kubeadm/kind 6443, most managed clusters 443).
+    apiServerPorts: [443, 6443]
+    # cluster DNS pods (unbound forwards clusterDomain there; pods without unbound use it directly)
+    dns:
+      # -- Namespace of the cluster DNS pods.
+      namespace: kube-system
+      # -- Labels of the cluster DNS pods.
+      podLabels:
+        k8s-app: kube-dns
+      # -- Port the DNS pods listen on (UDP and TCP).
+      port: 53
+    # -- CIDRs excluded from the internet rule (0.0.0.0/0, ::/0). Empty = mailcow.networks + serviceCIDR.
+    # Add node / VPC ranges to block those too, e.g. [10.244.0.0/16, 10.96.0.0/12, 10.0.0.0/16].
+    clusterCIDRs: []
+    # -- Service CIDR(s), comma separated, used when clusterCIDRs is empty (kubeadm 10.96.0.0/12).
+    serviceCIDR: 10.96.0.0/12
+    # -- Extra NetworkPolicy peers reachable on every port, for in-cluster targets: an operator-managed
+    # database, an external Redis inside the cluster (an ExternalName to an in-cluster Service resolves
+    # to a ClusterIP), anything whose address lies inside clusterCIDRs. e.g.
+    # [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: db}}, podSelector: {matchLabels: {app: mariadb}}}]
+    extraTo: []

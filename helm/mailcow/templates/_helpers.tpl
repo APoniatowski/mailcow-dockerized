@@ -107,7 +107,7 @@ app.kubernetes.io/part-of: mailcow
 - name: DBHOST
   value: mysql
 - name: DBPORT
-  value: "3306"
+  value: {{ include "mailcow.dbPort" . | quote }}
 {{- end -}}
 
 {{- define "mailcow.networks" -}}
@@ -138,14 +138,11 @@ app.kubernetes.io/part-of: mailcow
 {{- if ne (toString .Values.networkPolicy.enabled) "false" -}}true{{- end -}}
 {{- end -}}
 
-{{/* NetworkPolicy peers for the public mail ports: networkPolicy.publicMailFrom, or everything
-except mailcow.networks (in-cluster pods from the pod CIDR would be trusted as internal) */}}
-{{- define "mailcow.publicMailPeers" -}}
-{{- if .Values.networkPolicy.publicMailFrom -}}
-{{- toYaml .Values.networkPolicy.publicMailFrom -}}
-{{- else -}}
+{{/* ipBlock peers 0.0.0.0/0 and ::/0, each except the given CIDRs of its family (bare addresses
+become /32 or /128). include "mailcow.allExcept" (list "10.244.0.0/16" "fd00::/56") */}}
+{{- define "mailcow.allExcept" -}}
 {{- $v4 := list -}}{{- $v6 := list -}}
-{{- range splitList "," .Values.mailcow.networks -}}
+{{- range . -}}
 {{- $n := trim . -}}
 {{- if $n -}}
 {{- if contains ":" $n -}}{{- $v6 = append $v6 (ternary $n (printf "%s/128" $n) (contains "/" $n)) -}}
@@ -166,6 +163,111 @@ except mailcow.networks (in-cluster pods from the pod CIDR would be trusted as i
       {{- toYaml . | nindent 6 }}
     {{- end }}
 {{- end -}}
+
+{{/* NetworkPolicy peers for the public mail ports: networkPolicy.publicMailFrom, or everything
+except mailcow.networks (in-cluster pods from the pod CIDR would be trusted as internal) */}}
+{{- define "mailcow.publicMailPeers" -}}
+{{- if .Values.networkPolicy.publicMailFrom -}}
+{{- toYaml .Values.networkPolicy.publicMailFrom -}}
+{{- else -}}
+{{- include "mailcow.allExcept" (splitList "," .Values.mailcow.networks) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* egress "internet" exceptions: networkPolicy.egress.clusterCIDRs, or mailcow.networks + serviceCIDR */}}
+{{- define "mailcow.egressClusterCIDRs" -}}
+{{- $e := .Values.networkPolicy.egress -}}
+{{- $in := $e.clusterCIDRs | default (concat (splitList "," .Values.mailcow.networks) (splitList "," (toString $e.serviceCIDR))) -}}
+{{- $out := list -}}
+{{- range $in -}}{{- if trim (toString .) -}}{{- $out = append $out (trim (toString .)) -}}{{- end -}}{{- end -}}
+{{- toJson $out -}}
+{{- end -}}
+
+{{/* ---------- external database / Redis ----------
+"IPv4" / "IPv6" for an address literal (brackets stripped), "" for a DNS name */}}
+{{- define "mailcow.ipFamily" -}}
+{{- $h := . | trimPrefix "[" | trimSuffix "]" -}}
+{{- if regexMatch `^[0-9]{1,3}(\.[0-9]{1,3}){3}$` $h -}}IPv4
+{{- else if and (contains ":" $h) (regexMatch `^[0-9A-Fa-f:.]+$` $h) -}}IPv6
+{{- end -}}
+{{- end -}}
+
+{{/* DBPORT */}}
+{{- define "mailcow.dbPort" -}}
+{{- if .Values.externalDatabase.enabled -}}{{- int .Values.externalDatabase.port -}}{{- else -}}3306{{- end -}}
+{{- end -}}
+
+{{/* Services `<alias>` and `<component>-mailcow` for an external endpoint, instead of the selector Services.
+DNS name: ExternalName (CNAME, no port mapping: clients connect to `port`).
+IP literal: selector-less Service on `svcPort` + EndpointSlice -> host:`port`.
+include "mailcow.externalServices" (dict "root" $ "component" "mysql" "alias" "mysql" "what" "externalDatabase"
+  "host" "db.example.org" "port" 3306 "svcPort" 3306 "portName" "mysql") */}}
+{{- define "mailcow.externalServices" -}}
+{{- $root := .root -}}
+{{- $what := .what -}}
+{{- $host := trim (toString .host) -}}
+{{- if not $host -}}{{- fail (printf "%s.enabled needs %s.host (DNS name or IP address)" $what $what) -}}{{- end -}}
+{{- $port := int .port -}}
+{{- if or (lt $port 1) (gt $port 65535) -}}{{- fail (printf "%s.port must be 1-65535" $what) -}}{{- end -}}
+{{- $family := include "mailcow.ipFamily" $host -}}
+{{- $ip := $host | trimPrefix "[" | trimSuffix "]" -}}
+{{- $dns := lower $host -}}
+{{- if and (not $family) (not (regexMatch `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*\.?$` $dns)) -}}
+{{- fail (printf "%s.host %q is neither an IP address nor a valid DNS name" $what $host) -}}
+{{- end -}}
+{{- if and (not $family) (ne $port (int .svcPort)) -}}
+{{- fail (printf "%s.port %d: with a DNS host the Services are ExternalName aliases, which cannot remap ports, and mailcow components connect to %d. Use %d, or an IP address as host (the EndpointSlice then maps %d to %d)" $what $port (int .svcPort) (int .svcPort) (int .svcPort) $port) -}}
+{{- end -}}
+{{- range $name := list .alias (printf "%s-mailcow" .component) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" $root "component" $.component) | nindent 4 }}
+    mailcow.email/external: "true"
+spec:
+  {{- if $family }}
+  type: ClusterIP
+  ipFamilyPolicy: SingleStack
+  ipFamilies: [{{ $family }}]
+  ports:
+    - name: {{ $.portName }}
+      port: {{ int $.svcPort }}
+      targetPort: {{ $port }}
+      protocol: TCP
+  {{- else }}
+  type: ExternalName
+  externalName: {{ $dns }}
+  ports:
+    - name: {{ $.portName }}
+      port: {{ $port }}
+      protocol: TCP
+  {{- end }}
+{{- if $family }}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: {{ $name }}-external
+  labels:
+    {{- include "mailcow.labels" (dict "root" $root "component" $.component) | nindent 4 }}
+    mailcow.email/external: "true"
+    kubernetes.io/service-name: {{ $name }}
+    endpointslice.kubernetes.io/managed-by: {{ $root.Release.Service | lower }}
+addressType: {{ $family }}
+endpoints:
+  - addresses:
+      - {{ $ip | quote }}
+    conditions:
+      ready: true
+ports:
+  - name: {{ $.portName }}
+    port: {{ $port }}
+    protocol: TCP
+{{- end }}
+{{- end }}
 {{- end -}}
 
 {{/* NetworkPolicy peer: every pod of this release (same namespace) */}}
@@ -484,7 +586,7 @@ securityContext:
   command: ["socat"]
   args:
     - UNIX-LISTEN:/var/lib/rspamd/rspamd.sock,fork,mode=0666,unlink-early
-    # resolved per connection; FQDN works with unbound-only pod DNS too
+    # resolved per connection (A and AAAA, tried in order); FQDN works with unbound-only pod DNS too
     - TCP:{{ include "mailcow.svcFqdn" (list . "rspamd-mailcow") }}:11335
   {{- include "mailcow.relaySecurityContext" . | nindent 2 }}
   startupProbe:

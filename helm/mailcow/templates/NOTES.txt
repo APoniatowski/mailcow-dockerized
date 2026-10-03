@@ -34,6 +34,19 @@ Checks:
 {{- end }}
   - rspamd's controller socket reaches php-fpm, dovecot, postfix{{ if .Values.watchdog.enabled }}, watchdog{{ end }} over TCP 11335 (socat relays,
     native sidecars: Kubernetes >= 1.29). Its NetworkPolicy is always on; it only protects with an enforcing CNI.
+{{- with .Values.externalDatabase }}{{ if .enabled }}
+  - External database {{ .host }}:{{ .port }} (Services mysql, mysql-mailcow): database {{ $.Values.mailcow.dbName }}, user
+    {{ $.Values.mailcow.dbUser }} (DBPASS from the Secret) must exist with ALL PRIVILEGES on {{ $.Values.mailcow.dbName }}.*, event_scheduler=ON,
+    time zone tables loaded. php-fpm skips mysql_upgrade (SKIP_MYSQL_UPGRADE=y); backups and upgrades are yours.
+{{- end }}{{ end }}
+{{- with .Values.externalRedis }}{{ if .enabled }}
+  - External Redis {{ .host }}:{{ .port }} (Services redis, redis-mailcow): its password must equal REDISPASS from the
+    Secret; plain TCP, no TLS. rspamd sends SLAVEOF NO ONE on start: point it at a primary.
+{{- end }}{{ end }}
+{{- if .Values.networkPolicy.egress.enabled }}
+  - Egress NetworkPolicies: release pods, kube-dns, the API server ({{ join ", " .Values.networkPolicy.egress.apiServerCIDRs }}) and
+    everything outside {{ include "mailcow.egressClusterCIDRs" . | fromJsonArray | join "," }}. Other in-cluster targets need networkPolicy.egress.extraTo.
+{{- end }}
   - dockerapi can exec into and delete every pod in namespace {{ .Release.Namespace }}: keep mailcow alone in it.
 {{- if include "mailcow.networkPolicy" . }}
   - NetworkPolicies are rendered; they only protect anything if your CNI enforces them.

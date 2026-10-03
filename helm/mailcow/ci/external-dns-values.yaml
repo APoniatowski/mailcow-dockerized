@@ -1,0 +1,11 @@
+# External MySQL and Redis by DNS name: ExternalName Services, no mysql/redis StatefulSets, PVCs or
+# NetworkPolicies; DBPORT 3307, php-fpm SKIP_MYSQL_UPGRADE=y.
+externalDatabase:
+  enabled: true
+  host: mariadb.db.example.org
+  port: 3307
+
+externalRedis:
+  enabled: true
+  host: redis.cache.example.org
+  port: 6379

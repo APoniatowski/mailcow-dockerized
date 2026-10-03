@@ -1,0 +1,11 @@
+# External MySQL by IPv4 and Redis by IPv6 address: selector-less Services + EndpointSlices; the redis
+# Services keep port 6379 and map it to the external 6380.
+externalDatabase:
+  enabled: true
+  host: 192.0.2.10
+  port: 3306
+
+externalRedis:
+  enabled: true
+  host: "2001:db8::10"
+  port: 6380

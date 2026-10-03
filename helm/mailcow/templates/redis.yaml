@@ -1,3 +1,4 @@
+{{- if not .Values.externalRedis.enabled }}
 {{- $c := "redis" }}
 {{- $v := .Values.redis }}
 apiVersion: apps/v1
@@ -55,3 +56,4 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "mailcow.claimName" (list . "redis" "redis") }}
+{{- end }}

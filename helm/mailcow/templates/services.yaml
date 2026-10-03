@@ -1,7 +1,8 @@
 {{- /*
 In-cluster Services: every compose alias and every container name (*-mailcow) gets a ClusterIP
 Service, because mailcow code addresses both. Services of skipped components stay so the names
-resolve and connections fail fast.
+resolve and connections fail fast. externalDatabase / externalRedis: `mysql`/`mysql-mailcow` and
+`redis`/`redis-mailcow` alias the external host instead (mailcow.externalServices).
 [component, alias, ports [name port protocol]]
 */ -}}
 {{- $root := . }}
@@ -20,8 +21,10 @@ resolve and connections fail fast.
   (list "nginx" "nginx" (list (list "http" (int .Values.mailcow.httpPort) "TCP") (list "https" (int .Values.mailcow.httpsPort) "TCP") (list "http-8081" 8081 "TCP") (list "http-9081" 9081 "TCP") (list "https-9082" 9082 "TCP")))
   (list "dockerapi" "dockerapi" (list (list "https" 443 "TCP")))
   (list "olefy" "olefy" (list (list "olefy" 10055 "TCP"))) }}
+{{- $external := dict "mysql" .Values.externalDatabase.enabled "redis" .Values.externalRedis.enabled }}
 {{- range $svcs }}
 {{- $component := index . 0 }}{{ $alias := index . 1 }}{{ $ports := index . 2 }}
+{{- if not (get $external $component) }}
 {{- range $name := list $alias (printf "%s-mailcow" $component) }}
 ---
 apiVersion: v1
@@ -44,5 +47,16 @@ spec:
       targetPort: {{ index . 1 }}
       protocol: {{ index . 2 }}
     {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- with .Values.externalDatabase }}
+{{- if .enabled }}
+{{- include "mailcow.externalServices" (dict "root" $root "component" "mysql" "alias" "mysql" "what" "externalDatabase" "host" .host "port" .port "svcPort" .port "portName" "mysql") }}
+{{- end }}
+{{- end }}
+{{- with .Values.externalRedis }}
+{{- if .enabled }}
+{{- include "mailcow.externalServices" (dict "root" $root "component" "redis" "alias" "redis" "what" "externalRedis" "host" .host "port" .port "svcPort" 6379 "portName" "redis") }}
 {{- end }}
 {{- end }}

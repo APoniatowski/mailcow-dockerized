@@ -1,3 +1,4 @@
+{{- if not .Values.externalDatabase.enabled }}
 {{- $c := "mysql" }}
 {{- $v := .Values.mysql }}
 apiVersion: apps/v1
@@ -61,3 +62,4 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "mailcow.claimName" (list . "mysql" "mysql") }}
+{{- end }}

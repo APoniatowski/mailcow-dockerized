@@ -46,13 +46,20 @@ touch /rspamd/override/worker-controller-password.inc` }}
         {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "script" $script "extraMounts" (list (dict "name" "rspamd" "mountPath" "/rspamd"))) | nindent 8 }}
         # controller unix socket -> TCP 11335 for the rspamd-sock sidecars of php-fpm, dovecot, postfix
         # (and watchdog). Probe without connecting: every connection reaches the controller, which logs
-        # an EOF error for a bare connect.
+        # an EOF error for a bare connect. Dual-stack listener (IPv4-mapped) when the pod has IPv6,
+        # IPv4 only when IPv6 is disabled (if_inet6 empty) or absent (ipv6.disable=1).
         - name: rspamd-sock-relay
           image: {{ include "mailcow.filesImage" . }}
           imagePullPolicy: {{ .Values.files.image.pullPolicy }}
           restartPolicy: Always
-          command: ["socat"]
-          args: ["TCP-LISTEN:11335,fork,reuseaddr", "UNIX-CONNECT:/var/lib/rspamd/rspamd.sock"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              if grep -qs . /proc/net/if_inet6; then
+                exec socat TCP6-LISTEN:11335,ipv6only=0,fork,reuseaddr UNIX-CONNECT:/var/lib/rspamd/rspamd.sock
+              else
+                exec socat TCP4-LISTEN:11335,fork,reuseaddr UNIX-CONNECT:/var/lib/rspamd/rspamd.sock
+              fi
           {{- include "mailcow.relaySecurityContext" . | nindent 10 }}
           ports:
             - name: ctrl-relay

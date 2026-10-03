@@ -1,0 +1,21 @@
+# Egress NetworkPolicies on a dual-stack cluster, with an in-cluster database operator as external DB.
+mailcow:
+  networks: 10.244.0.0/16,fd00:10:244::/56
+
+externalDatabase:
+  enabled: true
+  host: mariadb.db.svc.cluster.local
+
+networkPolicy:
+  egress:
+    enabled: true
+    apiServerCIDRs: [172.18.0.2, "fd00:10::2/128"]
+    apiServerPorts: [6443]
+    serviceCIDR: 10.96.0.0/16,fd00:10:96::/112
+    extraTo:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: db
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: mariadb
