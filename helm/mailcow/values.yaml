@@ -207,7 +207,8 @@ persistence:
     size: 512Mi
     accessMode: ReadWriteOnce
     existingClaim: ""
-  # -- postfix-vol-1 (queue). Also mounted by watchdog (same node).
+  # -- postfix-vol-1 (queue). Also mounted by watchdog (same node). With postfix.spoolPerPod: size, accessMode
+  # and storageClass of every per-pod claim `spool-<fullname>-postfix-<n>` (no single PVC then).
   postfix:
     size: 2Gi
     accessMode: ReadWriteOnce
@@ -227,7 +228,7 @@ persistence:
     size: 2Gi
     accessMode: ReadWriteOnce
     existingClaim: ""
-  # -- sogo-userdata-backup-vol-1
+  # -- sogo-userdata-backup-vol-1. ReadWriteOnce: sogo pods (replicas, rolling updates) stay on one node.
   sogoBackup:
     size: 1Gi
     accessMode: ReadWriteOnce
@@ -329,13 +330,19 @@ tls:
     days: 365
     # -- RSA key size (generate_config.sh uses 4096).
     keySize: 4096
-  # Renewed Secret contents appear in the pods within about a minute, but postfix, dovecot and nginx
+  # Renewed Secret contents appear in the pods within a minute or two, but postfix, dovecot and nginx
   # only read certificates on (re)load. Not rendered with acme.enabled (acme reloads them itself).
   reload:
-    # -- CronJob `cert-reload` (cronjobs.image runner): graceful `postfix reload`, `doveadm reload`, `nginx -s reload`.
+    # -- Sidecar `tls-reload` (files image) in every nginx, postfix and dovecot pod: hashes cert.pem + key.pem
+    # and sends SIGHUP (graceful reload, = nginx -s reload / postfix reload / doveadm reload) to its own pod's
+    # master process when they change. Sets shareProcessNamespace on those pods. README "TLS".
     enabled: true
-    # -- Schedule (5-field cron, mailcow.tz). Daily: at most ~1 day between renewal and use.
-    schedule: "17 3 * * *"
+    # -- Seconds between checks (>= 10).
+    interval: 300
+    # -- Resources of each tls-reload sidecar.
+    resources:
+      requests: {cpu: 5m, memory: 8Mi}
+      limits: {memory: 32Mi}
 
 # Images default to docker-compose.yml tags (scripts/check-tags.sh keeps them in sync).
 unbound:
@@ -419,6 +426,8 @@ rspamd:
     requests: {cpu: 50m, memory: 256Mi}
   # -- terminationGracePeriodSeconds (compose stop_grace_period 30s).
   terminationGracePeriodSeconds: 30
+  # Always one replica: the controller socket relay, /var/lib/rspamd and the UI password file live on its
+  # own RWO PVC, worker-proxy binds the pod hostname `rspamd`. README "Scaling".
   # socat sidecars (files image) carrying the controller socket: `rspamd-sock-relay` in the rspamd pod
   # (unix socket -> TCP 11335), `rspamd-sock` in php-fpm, dovecot, postfix, watchdog (TCP -> local socket).
   socketRelay:
@@ -434,6 +443,23 @@ phpFpm:
     pullPolicy: IfNotPresent
   resources:
     requests: {cpu: 50m, memory: 128Mi}
+  # -- Pods (all MASTER=y; sessions in Redis). With an RWO shared PVC they all run on its node. README "Scaling".
+  replicas: 1
+  # -- Deployment strategy type. Recreate (default): no two mailcow versions run against one database; an
+  # older php-fpm re-runs its own schema migration (init_db) on the next request and reverts a newer one.
+  # The UI, SOGo and password logins (mailcowauth) are down while php-fpm restarts, like a compose update.
+  # RollingUpdate: no downtime, only for upgrades that keep the files image and php-fpm image.
+  updateStrategy: Recreate
+  # HorizontalPodAutoscaler on CPU (needs metrics-server). Replaces replicas: keep replicas at 1 when enabled.
+  autoscaling:
+    # -- Create an HPA (spec.replicas is then left to it).
+    enabled: false
+    # -- minReplicas
+    minReplicas: 2
+    # -- maxReplicas
+    maxReplicas: 4
+    # -- Target average CPU utilisation (% of the pod's CPU requests).
+    targetCPUUtilizationPercentage: 80
 
 sogo:
   image:
@@ -442,6 +468,19 @@ sogo:
     pullPolicy: IfNotPresent
   resources:
     requests: {cpu: 50m, memory: 128Mi}
+  # -- Pods (sessions in memcached and MySQL, stable SOGO_ENCRYPTION_KEY). With an RWO sogoBackup volume
+  # they all run on its node. README "Scaling".
+  replicas: 1
+  # HorizontalPodAutoscaler on CPU (needs metrics-server). Replaces replicas: keep replicas at 1 when enabled.
+  autoscaling:
+    # -- Create an HPA (spec.replicas is then left to it).
+    enabled: false
+    # -- minReplicas
+    minReplicas: 2
+    # -- maxReplicas
+    maxReplicas: 4
+    # -- Target average CPU utilisation (% of the pod's CPU requests).
+    targetCPUUtilizationPercentage: 80
 
 dovecot:
   image:
@@ -450,6 +489,8 @@ dovecot:
     pullPolicy: IfNotPresent
   # Note: compose ulimits (nproc 65535, nofile 20000/40000) have no pod-level equivalent; containerd's
   # default RLIMIT_NOFILE (usually 1048576) is above them. Lower limits must be set on the node runtime.
+  # Always one replica: several dovecot instances need shared maildir storage with locking or dsync
+  # replication (removed in Dovecot 2.4). README "Scaling".
   resources:
     requests: {cpu: 50m, memory: 256Mi}
 
@@ -460,6 +501,13 @@ postfix:
     pullPolicy: IfNotPresent
   resources:
     requests: {cpu: 50m, memory: 128Mi}
+  # -- StatefulSet replicas. > 1 needs spoolPerPod: true. Each pod has its own queue: the admin UI queue view
+  # and watchdog's queue check see one pod only, rate limits count per pod. README "Scaling".
+  replicas: 1
+  # -- Queue on a PVC per pod (volumeClaimTemplates `spool`, sized by persistence.postfix) instead of the single
+  # persistence.postfix PVC. Changing it on an existing release needs the procedure in README "Scaling"
+  # (the StatefulSet's volume spec is immutable). Not combinable with persistence.postfix.existingClaim.
+  spoolPerPod: false
 
 postfixTlspol:
   image:
@@ -484,6 +532,18 @@ nginx:
     pullPolicy: IfNotPresent
   resources:
     requests: {cpu: 20m, memory: 64Mi}
+  # -- Pods. Each copies the SOGo web assets itself (initContainer). README "Scaling".
+  replicas: 1
+  # HorizontalPodAutoscaler on CPU (needs metrics-server). Replaces replicas: keep replicas at 1 when enabled.
+  autoscaling:
+    # -- Create an HPA (spec.replicas is then left to it).
+    enabled: false
+    # -- minReplicas
+    minReplicas: 2
+    # -- maxReplicas
+    maxReplicas: 4
+    # -- Target average CPU utilisation (% of the pod's CPU requests).
+    targetCPUUtilizationPercentage: 80
 
 olefy:
   image:

@@ -7,6 +7,8 @@ metadata:
   labels:
     {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
 spec:
+  # single instance: /var/lib/rspamd (controller socket) and the UI password file live on its own RWO PVC,
+  # worker-proxy binds the pod hostname `rspamd`; README "Scaling"
   replicas: 1
   strategy:
     type: Recreate

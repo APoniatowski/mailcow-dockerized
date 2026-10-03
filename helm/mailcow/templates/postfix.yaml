@@ -3,6 +3,15 @@
 {{- $m := .Values.mailcow }}
 {{- /* the shared PVC only carries /etc/ssl/mail with acme */}}
 {{- $acme := .Values.acme.enabled }}
+{{- $reload := include "mailcow.tlsReload" . }}
+{{- $perPod := $v.spoolPerPod }}
+{{- if lt (int $v.replicas) 0 }}{{ fail "postfix.replicas must be >= 0" }}{{ end }}
+{{- if and (gt (int $v.replicas) 1) (not $perPod) }}
+{{- fail "postfix.replicas > 1 needs postfix.spoolPerPod: true (one queue PVC per pod). On an existing release this replaces the single queue PVC: drain the queue first and follow README \"Scaling\" (kubectl delete statefulset --cascade=orphan, then helm upgrade)." }}
+{{- end }}
+{{- if and $perPod .Values.persistence.postfix.existingClaim }}
+{{- fail "postfix.spoolPerPod creates one PVC per pod (volumeClaimTemplates) and cannot use persistence.postfix.existingClaim" }}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -10,7 +19,7 @@ metadata:
   labels:
     {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
 spec:
-  replicas: 1
+  replicas: {{ int $v.replicas }}
   serviceName: postfix-mailcow
   selector:
     matchLabels:
@@ -27,11 +36,22 @@ spec:
         {{- include "mailcow.podAnnotations" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
+      {{- if $reload }}
+      # tls-reload signals postfix's master process
+      shareProcessNamespace: true
+      {{- end }}
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
       {{- include "mailcow.podCommon" (dict "root" . "shared" $acme) | nindent 6 }}
+      {{- if and (gt (int $v.replicas) 1) (not (and $acme (include "mailcow.sharedColocate" .))) }}
+      {{- include "mailcow.spread" (dict "root" . "component" $c) | nindent 6 }}
+      {{- end }}
       initContainers:
         {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/postfix" "conf/postfix") "appends" (list (dict "key" "postfix-k8s.cf" "dst" "conf/postfix/extra.cf")) "ssl" true) | nindent 8 }}
         {{- include "mailcow.rspamdSockSidecar" . | nindent 8 }}
+        {{- if $reload }}
+        {{- /* `postfix start` runs /usr/lib/postfix/sbin/master -w (comm "master"); HUP = postfix reload */}}
+        {{- include "mailcow.tlsReloadSidecar" (dict "root" . "comm" "master" "cmdline" "/usr/lib/postfix/sbin/master*") | nindent 8 }}
+        {{- end }}
       containers:
         - name: postfix-mailcow
           image: {{ include "mailcow.image" $v.image }}
@@ -81,6 +101,34 @@ spec:
         {{- include "mailcow.seedVolumes" (dict "root" . "shared" $acme) | nindent 8 }}
         {{- include "mailcow.tlsVolumes" . | nindent 8 }}
         {{- include "mailcow.rspamdSockVolume" . | nindent 8 }}
+        {{- if not $perPod }}
         - name: spool
           persistentVolumeClaim:
             claimName: {{ include "mailcow.claimName" (list . "postfix" "postfix") }}
+        {{- end }}
+  {{- if $perPod }}
+  {{- $p := .Values.persistence.postfix }}
+  # one queue per pod: spool-<fullname>-postfix-<n> (kept when scaling down or uninstalling)
+  volumeClaimTemplates:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: spool
+        # immutable (StatefulSet volumeClaimTemplates): no chart/version labels
+        labels:
+          app.kubernetes.io/name: {{ include "mailcow.name" . }}
+          app.kubernetes.io/instance: {{ .Release.Name }}
+          app.kubernetes.io/part-of: mailcow
+          mailcow.email/volume: postfix-spool
+      spec:
+        accessModes:
+          - {{ $p.accessMode }}
+        {{- $sc := default .Values.persistence.storageClass $p.storageClass }}
+        {{- if $sc }}
+        storageClassName: {{ if eq $sc "-" }}""{{ else }}{{ $sc }}{{ end }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $p.size }}
+  {{- end }}
+{{- include "mailcow.pdb" (dict "root" . "v" (dict "replicas" $v.replicas) "component" $c) }}

@@ -3,6 +3,8 @@
 {{- $v := .Values.watchdog }}
 {{- $m := .Values.mailcow }}
 {{- $acme := .Values.acme.enabled }}
+{{- /* postfix.spoolPerPod: no single queue volume to mount; watchdog's mailq check then counts nothing */}}
+{{- $spool := not .Values.postfix.spoolPerPod }}
 {{- $defaults := dict
   "USE_WATCHDOG" "y" "WATCHDOG_NOTIFY_EMAIL" "" "WATCHDOG_NOTIFY_BAN" "y" "WATCHDOG_NOTIFY_START" "y"
   "WATCHDOG_SUBJECT" "Watchdog ALERT" "WATCHDOG_NOTIFY_WEBHOOK" "" "WATCHDOG_NOTIFY_WEBHOOK_BODY" ""
@@ -39,6 +41,7 @@ spec:
     spec:
       automountServiceAccountToken: false
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
+      {{- if $spool }}
       {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
       # mounts postfix's RWO queue volume: must run on postfix's node (with acme and an RWO shared
       # PVC, postfix sits on the shared node too)
@@ -49,6 +52,9 @@ spec:
               labelSelector:
                 matchLabels:
                   {{- include "mailcow.selectorLabels" (dict "root" . "component" "postfix") | nindent 18 }}
+      {{- else }}
+      {{- include "mailcow.podCommon" (dict "root" . "shared" $acme) | nindent 6 }}
+      {{- end }}
       initContainers:
         {{- include "mailcow.seedInit" (dict "root" . "ssl" true) | nindent 8 }}
         {{- include "mailcow.rspamdSockSidecar" . | nindent 8 }}
@@ -95,8 +101,10 @@ spec:
             # rspamd.sock from the rspamd-sock sidecar (rspamd scan check)
             - name: rspamd-sock
               mountPath: /var/lib/rspamd
+            {{- if $spool }}
             - name: postfix-spool
               mountPath: /var/spool/postfix
+            {{- end }}
             {{- include "mailcow.tlsMounts" . | nindent 12 }}
           resources:
             {{- toYaml $v.resources | nindent 12 }}
@@ -107,7 +115,9 @@ spec:
         - name: tmp
           emptyDir:
             medium: Memory
+        {{- if $spool }}
         - name: postfix-spool
           persistentVolumeClaim:
             claimName: {{ include "mailcow.claimName" (list . "postfix" "postfix") }}
+        {{- end }}
 {{- end }}

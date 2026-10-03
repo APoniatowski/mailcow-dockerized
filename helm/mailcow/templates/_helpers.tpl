@@ -703,3 +703,156 @@ spec:
                 requests: {cpu: 10m, memory: 32Mi}
             {{- end }}
 {{- end -}}
+
+{{/* ---------- scaling ----------
+v = the component's values (replicas, optional autoscaling). "true" when the workload may run more
+than one pod: replicas > 1 or an HPA. include "mailcow.multi" $v */}}
+{{- define "mailcow.multi" -}}
+{{- $a := .autoscaling | default dict -}}
+{{- if or $a.enabled (gt (int .replicas) 1) -}}true{{- end -}}
+{{- end -}}
+
+{{/* spec.replicas, omitted when an HPA owns it. include "mailcow.replicas" (dict "v" $v "key" "nginx") */}}
+{{- define "mailcow.replicas" -}}
+{{- $a := .v.autoscaling | default dict -}}
+{{- if lt (int .v.replicas) 0 -}}{{- fail (printf "%s.replicas must be >= 0" .key) -}}{{- end -}}
+{{- if $a.enabled -}}
+{{- if ne (int .v.replicas) 1 -}}
+{{- fail (printf "%s: set either %s.replicas or %s.autoscaling.enabled (the HPA owns the replica count), not both" .key .key .key) -}}
+{{- end -}}
+{{- if or (lt (int $a.minReplicas) 1) (lt (int $a.maxReplicas) (int $a.minReplicas)) -}}
+{{- fail (printf "%s.autoscaling: need 1 <= minReplicas <= maxReplicas" .key) -}}
+{{- end -}}
+{{- else -}}
+replicas: {{ int .v.replicas }}
+{{- end -}}
+{{- end -}}
+
+{{/* topologySpreadConstraints over nodes (soft). Only for replicated pods without a volume that pins
+them to one node (RWO shared PVC affinity, sogo's RWO backup volume). include "mailcow.spread" (dict "root" . "component" "nginx") */}}
+{{- define "mailcow.spread" -}}
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        {{- include "mailcow.selectorLabels" (dict "root" .root "component" .component) | nindent 8 }}
+{{- end -}}
+
+{{/* PodDisruptionBudget (maxUnavailable 1) when the workload is replicated; none for singletons.
+include "mailcow.pdb" (dict "root" . "v" $v "component" "nginx") */}}
+{{- define "mailcow.pdb" -}}
+{{- if include "mailcow.multi" .v }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "mailcow.fullname" .root }}-{{ .component }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" .root "component" .component) | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" .root "component" .component) | nindent 6 }}
+{{- end }}
+{{- end -}}
+
+{{/* HorizontalPodAutoscaler on CPU for a Deployment. include "mailcow.hpa" (dict "root" . "v" $v "component" "nginx") */}}
+{{- define "mailcow.hpa" -}}
+{{- $a := .v.autoscaling | default dict -}}
+{{- if $a.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "mailcow.fullname" .root }}-{{ .component }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" .root "component" .component) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "mailcow.fullname" .root }}-{{ .component }}
+  minReplicas: {{ int $a.minReplicas }}
+  maxReplicas: {{ int $a.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ int $a.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- end -}}
+
+{{/* ---------- TLS reload sidecar ----------
+"true" when nginx, postfix and dovecot get the `tls-reload` sidecar: certificate from a Secret
+(cert-manager / existingSecret / self-signed) and tls.reload.enabled. With acme, the acme container
+reloads the daemons through dockerapi. */}}
+{{- define "mailcow.tlsReload" -}}
+{{- if and .Values.tls.reload.enabled (not .Values.acme.enabled) -}}true{{- end -}}
+{{- end -}}
+
+{{/* Native sidecar (files image) that hashes the mounted TLS Secret every tls.reload.interval seconds and
+sends SIGHUP to its own pod's master process when cert or key changed (nginx/postfix/dovecot HUP = graceful
+reload, what `nginx -s reload`, `postfix reload` and `doveadm reload` send). Needs shareProcessNamespace.
+The masters run as root: the sidecar runs as uid 0 to be allowed to signal them (same uid, no capability),
+with every capability dropped and a read-only root filesystem.
+include "mailcow.tlsReloadSidecar" (dict "root" . "comm" "master" "cmdline" "/usr/lib/postfix/sbin/master*") */}}
+{{- define "mailcow.tlsReloadSidecar" -}}
+{{- $root := .root -}}
+{{- $r := $root.Values.tls.reload -}}
+{{- if lt (int $r.interval) 10 -}}{{- fail "tls.reload.interval must be >= 10 (seconds)" -}}{{- end -}}
+- name: tls-reload
+  image: {{ include "mailcow.filesImage" $root }}
+  imagePullPolicy: {{ $root.Values.files.image.pullPolicy }}
+  restartPolicy: Always
+  command: ["/bin/sh", "-c"]
+  args:
+    - |
+      trap 'exit 0' TERM INT
+      sum() { cat /etc/ssl/mail-tls/cert.pem /etc/ssl/mail-tls/key.pem 2>/dev/null | sha256sum | cut -d' ' -f1; }
+      master() {
+        for d in /proc/[0-9]*; do
+          [ "$(cat "$d/comm" 2>/dev/null)" = "${RELOAD_COMM}" ] || continue
+          case "$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)" in ${RELOAD_CMDLINE}) echo "${d#/proc/}"; return 0;; esac
+        done
+        return 1
+      }
+      last=$(sum)
+      echo "watching /etc/ssl/mail-tls every ${RELOAD_INTERVAL}s, SIGHUP to ${RELOAD_COMM} on change"
+      while :; do
+        sleep "${RELOAD_INTERVAL}" & wait $!
+        now=$(sum)
+        [ "${now}" = "${last}" ] && continue
+        if pid=$(master) && kill -HUP "${pid}"; then
+          echo "certificate changed: SIGHUP to ${RELOAD_COMM} (pid ${pid})"
+          last=${now}
+        else
+          echo "certificate changed but no ${RELOAD_COMM} master process found, retrying"
+        fi
+      done
+  env:
+    - name: RELOAD_INTERVAL
+      value: {{ int $r.interval | quote }}
+    - name: RELOAD_COMM
+      value: {{ .comm | quote }}
+    - name: RELOAD_CMDLINE
+      value: {{ .cmdline | quote }}
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    runAsNonRoot: false
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+  volumeMounts:
+    - name: tls-secret
+      mountPath: /etc/ssl/mail-tls
+      readOnly: true
+  resources:
+    {{- toYaml $r.resources | nindent 4 }}
+{{- end -}}

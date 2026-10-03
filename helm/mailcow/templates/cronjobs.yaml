@@ -1,9 +1,9 @@
-{{- $reload := and .Values.tls.reload.enabled (not .Values.acme.enabled) }}
-{{- if or .Values.cronjobs.enabled $reload }}
+{{- if .Values.cronjobs.enabled }}
 {{- /*
 ofelia job-exec labels from docker-compose.yml -> CronJobs running `kubectl exec` into the
 component's main container (the exec'd process gets the container env, like `docker exec`, so
 the [[ $MASTER == y ]] guards keep working). Seconds field dropped; "@every 24h" -> daily.
+`kubectl exec <kind>/<name>` picks one pod of a replicated workload (sogo, php-fpm): each job runs once.
 [job name, workload kind/name suffix, container, command]
 */ -}}
 {{- $root := . }}
@@ -66,23 +66,10 @@ subjects:
 {{- range $jobs }}
 {{- $job := index . 0 }}{{ $kind := index . 1 }}{{ $comp := index . 2 }}{{ $cmd := index . 3 }}
 {{- $cfg := index $root.Values.cronjobs.jobs $job | default dict }}
-{{- if and $root.Values.cronjobs.enabled (ne (toString $cfg.enabled) "false") (not (and (eq $comp "sogo") $root.Values.skip.sogo)) }}
+{{- if and (ne (toString $cfg.enabled) "false") (not (and (eq $comp "sogo") $root.Values.skip.sogo)) }}
 ---
 {{ include "mailcow.execCronJob" (dict "root" $root "job" $job "schedule" $cfg.schedule "target" $comp
   "steps" (list (dict "name" "kubectl" "kind" $kind "comp" $comp "command" (list "/bin/bash" "-c" $cmd)))) }}
 {{- end }}
-{{- end }}
-{{- if $reload }}
-{{- /*
-TLS from a Secret (cert-manager / existingSecret / self-signed): the projected files change in
-place, the daemons only pick them up on reload (graceful). With acme, the acme container reloads
-them through dockerapi instead.
-*/}}
----
-{{ include "mailcow.execCronJob" (dict "root" $root "job" "cert-reload" "schedule" $root.Values.tls.reload.schedule "target" "tls"
-  "steps" (list
-    (dict "name" "postfix" "kind" "statefulset" "comp" "postfix" "command" (list "postfix" "-c" "/opt/postfix/conf" "reload"))
-    (dict "name" "dovecot" "kind" "statefulset" "comp" "dovecot" "command" (list "doveadm" "reload"))
-    (dict "name" "nginx" "kind" "deployment" "comp" "nginx" "command" (list "nginx" "-s" "reload")))) }}
 {{- end }}
 {{- end }}

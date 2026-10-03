@@ -42,9 +42,11 @@ Login: `admin` / `moohoo`. API key: `kubectl -n mailcow get secret mailcow-secre
 |---|---|
 | unbound | Deployment + Service `unbound` with fixed ClusterIP; repo `unbound.conf` + appended `forward-zone` for `clusterDomain` → `clusterDNS` (`domain-insecure`, DNSSEC stays on for the rest), plus `forward-zone "."` → `unbound.forwarders` when set |
 | mysql, redis | StatefulSet (1 replica, PVC), or an external server (`externalDatabase` / `externalRedis`, [External database / Redis](#external-database--redis)). Clients use TCP (`DBHOST=mysql`) |
-| dovecot, postfix | StatefulSet (1 replica) |
-| rspamd | Deployment, `hostname: rspamd` (worker-proxy binds `rspamd:9900`), own PVC; controller socket relayed over TCP 11335 ([Storage](#storage)) |
-| php-fpm, sogo, nginx, clamd, olefy, memcached, postfix-tlspol | Deployment |
+| dovecot | StatefulSet (1 replica) |
+| postfix | StatefulSet, `postfix.replicas` (default 1; > 1 with a queue PVC per pod, [Scaling](#scaling)) |
+| rspamd | Deployment (1 replica), `hostname: rspamd` (worker-proxy binds `rspamd:9900`), own PVC; controller socket relayed over TCP 11335 ([Storage](#storage)) |
+| php-fpm, sogo, nginx | Deployment, `replicas` or an HPA ([Scaling](#scaling)) |
+| clamd, olefy, memcached, postfix-tlspol | Deployment |
 | dockerapi | Deployment + ServiceAccount/Role (pods get/list/delete, pods/exec, metrics.k8s.io pods get), `DOCKERAPI_BACKEND=kubernetes`; Services `dockerapi`/`dockerapi-mailcow`, NetworkPolicy always on |
 | acme | optional (`acme.enabled`), default off → cert-manager / Secret / self-signed |
 | watchdog | optional (`watchdog.enabled`); probes do the self-healing |
@@ -85,7 +87,7 @@ They are copied over the base slice on every pod start (also into the shared dir
 | `vmail`, `vmail-index`, `crypt` | dovecot (**back up `crypt`**, without it mail is unreadable) |
 | `mysql`, `redis`, `postfix-tlspol`, `sogo-backup`, `clamd-db` | their component (`mysql`/`redis` not created with `externalDatabase`/`externalRedis`) |
 | `rspamd` | rspamd: `data/` = `/var/lib/rspamd` (controller socket, non-critical state; bayes and fuzzy hashes live in Redis), `override/worker-controller-password.inc` (UI password) |
-| `postfix` | postfix (+ watchdog, same node) |
+| `postfix` | postfix (+ watchdog, same node). With `postfix.spoolPerPod`: one claim `spool-<fullname>-postfix-<n>` per pod instead, not mounted by watchdog ([Scaling](#scaling)) |
 | `shared` (subPaths) | see below |
 
 Only directories that one pod writes and another reads at runtime remain on `shared`:
@@ -218,17 +220,41 @@ high availability of the database are yours.
 For 2–4 the Secret is mounted as a whole volume at `/etc/ssl/mail-tls` (`cert.pem`/`key.pem`)
 and `/etc/ssl/mail` holds `dhparams.pem` (files image) plus symlinks, so renewed certificates appear
 in the pods without a restart (kubelet syncs Secret volumes within a minute or two). The daemons
-only read certificates when they (re)load, so the CronJob `cert-reload` (`tls.reload.enabled`,
-default on; schedule `tls.reload.schedule`, default `17 3 * * *`) runs `postfix reload`,
-`doveadm reload` and `nginx -s reload` in the three pods through the CronJob runner. The three steps
-run independently; the Job fails if any of them fails. All three reloads are graceful: open
-connections finish on the old processes, new ones get the new certificate.
+only read certificates when they (re)load, so every nginx, postfix and dovecot pod runs a native
+sidecar `tls-reload` (`tls.reload.enabled`, default on). It hashes `cert.pem` + `key.pem` every
+`tls.reload.interval` seconds (default 300) and, when the hash changes, sends SIGHUP to the master
+process of its own pod, found by name in the shared process namespace:
+
+| pod | master process (`comm`, command line) | SIGHUP |
+|---|---|---|
+| nginx | `nginx`, `nginx: master process ...` | reload: new workers with the new certificate, old ones finish their connections (= `nginx -s reload`) |
+| postfix | `master`, `/usr/lib/postfix/sbin/master -w` (started by `postfix start`) | re-reads its configuration, running daemons exit when idle (= `postfix reload`, which sends exactly this signal) |
+| dovecot | `dovecot`, `/usr/sbin/dovecot -F` (supervisord) | reload (= `doveadm reload`) |
+
+All three are graceful: open connections finish, new ones get the new certificate. Each pod reloads
+itself, so every replica is covered, and the new certificate is in use within `interval` plus the
+kubelet sync delay after a renewal. If no master process is found (container restarting) the sidecar
+retries on the next check; a restarted daemon has read the new files anyway.
+
+The sidecar runs the files image's busybox shell as uid 0 (the masters run as root, and a process
+may signal another of the same uid without any capability) with every capability dropped,
+`allowPrivilegeEscalation: false` and a read-only root filesystem; it mounts only the TLS Secret.
+`shareProcessNamespace: true` is set on those three pods only when the sidecar is rendered. It
+makes the containers of the pod see each other's processes: the main container, the `rspamd-sock`
+relay (uid 65534) and `tls-reload`. Reading another process's environment, memory or root
+filesystem still needs ptrace rights (same uid and no extra capabilities on the target, or
+`CAP_SYS_PTRACE`, which no container has), so the relay and the sidecar cannot look into the
+daemons; the main container (root) can signal the sidecars, which it could disrupt anyway. The
+`seed` initContainer has exited before the main container starts. Side effect: the pause container
+is PID 1 and reaps orphans (postfix's daemonised master is re-parented to it instead of supervisord;
+nothing in the images depends on that).
 
 cert-manager renews at 2/3 of the certificate lifetime by default (30 days before expiry for
-90-day Let's Encrypt certificates; `tls.certManager.renewBefore` overrides it), so a daily reload
-means the new certificate is in use at most about a day after renewal, long before the old one
-expires. With `acme.enabled` the job is not rendered: the acme container reloads/restarts the
-daemons through dockerapi itself.
+90-day Let's Encrypt certificates; `tls.certManager.renewBefore` overrides it). With `acme.enabled`
+no sidecar is rendered: the acme container reloads/restarts the daemons through dockerapi itself.
+
+Upgrading from chart < 0.7.0: the `cert-reload` CronJob is gone (Helm deletes it) and
+`tls.reload.schedule` is ignored.
 
 ### Client IPs and exposure
 
@@ -253,9 +279,124 @@ daemons through dockerapi itself.
 | dovecot-sarules (`@every 24h`) | `0 3 * * *` | dovecot |
 
 All `concurrencyPolicy: Forbid`, time zone `mailcow.tz`; the `MASTER` guards run unchanged inside
-the target container. Override with `cronjobs.jobs.<name>.{enabled,schedule}`. The chart's own
-`cert-reload` job ([TLS](#tls)) uses the same runner and ServiceAccount, and renders even with
-`cronjobs.enabled: false`.
+the target container. Override with `cronjobs.jobs.<name>.{enabled,schedule}`. With replicas,
+`kubectl exec deployment/<name>` picks one pod, so each job still runs once per schedule (the
+`MASTER`-guarded SOGo jobs must run once, not per replica). `cronjobs.enabled: false` removes the
+runner's ServiceAccount and Role too.
+
+### Scaling
+
+| component | scales | how |
+|---|---|---|
+| nginx | yes | `nginx.replicas` or `nginx.autoscaling`. Stateless; each pod copies the SOGo web assets from the sogo image (initContainer) |
+| sogo | yes | `sogo.replicas` or `sogo.autoscaling`. Sessions live in memcached and MySQL, `SOGO_ENCRYPTION_KEY` is stable (Secret), any pod serves any request |
+| php-fpm | yes | `phpFpm.replicas` or `phpFpm.autoscaling`. PHP sessions in Redis; every pod is `MASTER=y` |
+| postfix | yes | `postfix.replicas` with `postfix.spoolPerPod: true` (queue per pod), no HPA |
+| dovecot | no | several instances need shared maildir storage with locking (NFS + director-style routing) or dsync replication, which Dovecot 2.4 removed |
+| rspamd | no | `/var/lib/rspamd` (controller socket, state) and the UI password file are on its own RWO PVC; worker-proxy binds the pod hostname `rspamd` |
+| mysql, redis, unbound, memcached, clamd, olefy, postfix-tlspol, dockerapi, watchdog, acme | no | single instance as in compose |
+
+For every component with more than one pod (replicas > 1 or an HPA) the chart adds a
+PodDisruptionBudget (`maxUnavailable: 1`); singletons get none, so node drains are never blocked.
+Replicated pods get a soft `topologySpreadConstraints` over `kubernetes.io/hostname`
+(`ScheduleAnyway`) unless a ReadWriteOnce volume pins them to one node anyway:
+
+- php-fpm mounts `shared`: with ReadWriteOnce all php-fpm pods run on its node (podAffinity), with
+  ReadWriteMany they spread. The same holds for nginx and postfix with `acme.enabled`.
+- sogo mounts `sogo-backup`: with ReadWriteOnce (default) sogo pods carry a required podAffinity to
+  each other, so replicas and the extra pod of a rolling update land on the volume's node. Set
+  `persistence.sogoBackup.accessMode: ReadWriteMany` to spread them.
+
+HPA (`<component>.autoscaling.enabled`, `minReplicas`, `maxReplicas`,
+`targetCPUUtilizationPercentage` of the pod's CPU requests) needs metrics-server; without it the
+HPA still keeps `minReplicas`. Keep `replicas` at 1 with an HPA (the chart fails otherwise): the
+Deployment is rendered without `spec.replicas`. Switching an existing release to the HPA drops the
+field, so the Deployment falls back to 1 pod until the HPA scales it to `minReplicas`.
+
+What the admin UI shows: dockerapi lists every pod, but the UI keys containers by compose service
+and picks the first match, so the container overview, restart buttons and the mail queue view each
+act on one pod per component.
+
+#### SOGo: rolling updates
+
+`bootstrap-sogo.sh` kills sogod and loops while `nc -z sogo-mailcow 20000` succeeds. The pod sets
+`hostname: sogo-mailcow`, which Kubernetes writes into the pod's `/etc/hosts` with the pod's own IP,
+and the image resolves `files` before `dns`; the check therefore only sees the pod itself, never
+the `sogo-mailcow` Service with older pods behind it. sogo uses `RollingUpdate` (chart < 0.7.0:
+`Recreate`). The `MASTER`-guarded bootstrap step (`DROP TRIGGER IF EXISTS`) is idempotent.
+
+#### php-fpm: start-up and upgrades
+
+The entrypoint runs, before php-fpm starts: `mysql_upgrade` through dockerapi (every pod, unless
+`SKIP_MYSQL_UPGRADE`), and with `MASTER=y` Redis defaults (set only when missing), `init_db`
+(schema migration), a `DOMAIN_MAP` rebuild, the API keys (`DELETE` + `INSERT`) and
+`DROP EVENT` / `CREATE EVENT`. `init_db` also runs on web requests (`prerequisites.inc.php`) and
+migrates whenever the stored schema version differs from the one in its own code, with no lock.
+
+- All pods are `MASTER=y`. `MASTER=n` is not a "worker" mode: the UI then shows `[ slave ]`, reads
+  mailbox quota from `quota2replica` and skips `init_db`.
+- Pods starting together (or an HPA scale-up) repeat those steps; they converge: Redis defaults
+  are idempotent, the last `DOMAIN_MAP` rebuild wins with the full map, a duplicate API key or event
+  makes the losing session stop while the winner completes, and an `init_db` run that fails on a
+  concurrent change is completed by the next request. `mysql_upgrade` is a no-op unless the MariaDB
+  version changed; then several pods may each apply it and restart mysql and postfix once.
+- Upgrades: two mailcow versions must not run side by side. A pod with the older files image sees
+  the newer schema version and migrates the schema back to its own definition on its next request
+  (dropping columns the new version added); the new pods migrate forward again. So php-fpm uses
+  `Recreate` (`phpFpm.updateStrategy`, chart < 0.7.0: `RollingUpdate`): all old pods stop before
+  new ones start, as with `docker compose up -d`. While php-fpm restarts, the UI, SOGo (nginx
+  authenticates SOGo requests through php-fpm) and password logins to dovecot/postfix (mailcowauth)
+  fail; dovecot's auth cache covers recently seen users. `RollingUpdate` avoids the gap but is only
+  safe for upgrades that keep the files image and the php-fpm image.
+
+#### postfix: one queue per pod
+
+`postfix.replicas > 1` requires `postfix.spoolPerPod: true`: the StatefulSet then gets
+`volumeClaimTemplates` (`spool-<fullname>-postfix-<n>`, size/class/access mode from
+`persistence.postfix`) instead of the single `<fullname>-postfix` PVC. Kubernetes keeps those claims
+on scale-down and uninstall. With `spoolPerPod: false` (default) nothing changes for existing
+releases. Trade-offs:
+
+- Queued mail lives in the pod that accepted it. Scaling down leaves the removed pods' claims with
+  their queue: flush them first (`postqueue -f` in the highest-numbered pods) or scale up again to
+  deliver it.
+- Admin UI queue view, flush and delete act on one pod (see above). Per pod:
+  `kubectl -n <ns> exec <fullname>-postfix-<n> -c postfix-mailcow -- mailq`.
+- watchdog no longer mounts a queue: its mail queue check always counts 0.
+- postfix rate limits (`bruteForce`, anvil) count per pod: a client spread over N pods gets up to N
+  times the limits.
+
+Switching an existing release to `spoolPerPod` changes the StatefulSet's volume spec, which
+Kubernetes does not allow in place. Procedure (release and namespace `mailcow`, chart defaults for
+the names):
+
+```bash
+# 1. drain the queue: repeat until mailq says "Mail queue is empty" (mail to dead destinations may stay)
+kubectl -n mailcow exec mailcow-postfix-0 -c postfix-mailcow -- postqueue -f
+kubectl -n mailcow exec mailcow-postfix-0 -c postfix-mailcow -- mailq
+# optional, keeps what is left: clone the old volume as pod 0's new claim (CSI volume cloning, same
+# storage class); a point-in-time copy, mail accepted after it stays on the old volume only
+kubectl -n mailcow apply -f - <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: spool-mailcow-postfix-0
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 2Gi}}
+  dataSource: {kind: PersistentVolumeClaim, name: mailcow-postfix}
+EOF
+# 2. delete only the StatefulSet object; the running pod keeps serving
+kubectl -n mailcow delete statefulset mailcow-postfix --cascade=orphan
+# 3. the new StatefulSet adopts the orphaned pod and replaces it (new pods first, pod 0 last)
+helm upgrade mailcow helm/mailcow -n mailcow --reuse-values \
+  --set postfix.spoolPerPod=true --set postfix.replicas=2
+# 4. the old claim is kept (persistence.keep); delete it once its queue is empty or cloned
+kubectl -n mailcow delete pvc mailcow-postfix
+```
+
+With `persistence.keep: false` Helm deletes `mailcow-postfix` in step 3: drain first. Going back
+to `spoolPerPod: false` needs the same steps the other way round.
 
 ## Environment contract
 
@@ -475,7 +616,9 @@ drop traffic meet. Options:
 
 ## Limitations (0.1)
 
-- dovecot/postfix single replica.
+- dovecot and rspamd run a single replica; postfix replicas each have their own queue (UI queue view
+  shows one pod), php-fpm restarts with `Recreate` (short UI/login gap on upgrades), see
+  [Scaling](#scaling).
 - `shared` needs RWX for php-fpm, dovecot and rspamd to spread over nodes; with RWO they share one
   node ([Storage](#storage)). rspamd.sock no longer ties pods to a node (TCP relay).
 - Kubernetes >= 1.29 (native sidecars for the rspamd socket relays).
@@ -498,7 +641,9 @@ drop traffic meet. Options:
   self-signed TLS, clamd skipped), cert-manager + Ingress, HA (RWX, LB + PROXY,
   watchdog, NetworkPolicy), acme + extraFiles + watchdog (postfix limits off, NetworkPolicy off), NetworkPolicy without PROXY protocol,
   external MySQL/Redis by DNS name (ExternalName, DBPORT 3307) and by IPv4/IPv6 address (EndpointSlices, Redis 6379 → 6380),
-  egress policies on a dual-stack cluster with an in-cluster external database in `extraTo`.
-  kind and cert-manager: NetworkPolicy on with the default `publicMailFrom`; cert-manager renders
-  `cert-reload` with the ofelia CronJobs off.
+  egress policies on a dual-stack cluster with an in-cluster external database in `extraTo`,
+  scaling (nginx HPA, sogo/php-fpm 2 replicas, postfix 2 with a queue per pod, watchdog without the
+  queue mount, 60 s TLS reload checks; layer it on kind-values.yaml for the local kind cluster).
+  kind and cert-manager: NetworkPolicy on with the default `publicMailFrom`; cert-manager has the
+  ofelia CronJobs off (no CronJob runner at all).
   `check-tags.sh` skips the compose services the chart does not ship (ofelia, netfilter).

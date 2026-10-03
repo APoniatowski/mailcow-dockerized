@@ -1,0 +1,29 @@
+# Horizontal scaling: nginx through an HPA (min 2), sogo and php-fpm 2 replicas, postfix 2 replicas with a
+# queue PVC per pod. Layer it on kind-values.yaml for the local kind cluster (single node: RWO volumes
+# keep php-fpm and sogo co-located, topology spread is best effort).
+mailcow:
+  hostname: mail.example.org
+
+nginx:
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 80
+
+sogo:
+  replicas: 2
+
+phpFpm:
+  replicas: 2
+
+postfix:
+  replicas: 2
+  spoolPerPod: true
+
+watchdog:
+  enabled: true
+
+tls:
+  reload:
+    interval: 60

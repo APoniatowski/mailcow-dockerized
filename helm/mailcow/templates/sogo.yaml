@@ -3,6 +3,7 @@
 {{- $v := .Values.sogo }}
 {{- $m := .Values.mailcow }}
 {{- $res := "/usr/local/lib/GNUstep/SOGo/WebServerResources" }}
+{{- $backupRwo := eq .Values.persistence.sogoBackup.accessMode "ReadWriteOnce" }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,11 +11,13 @@ metadata:
   labels:
     {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
 spec:
-  replicas: 1
-  # bootstrap-sogo.sh kills sogod while `nc -z sogo-mailcow 20000` succeeds: an old pod still
-  # behind the Service during a rolling update would make the new one loop forever.
+  {{- with include "mailcow.replicas" (dict "v" $v "key" "sogo") }}
+  {{- . | nindent 2 }}
+  {{- end }}
+  # bootstrap-sogo.sh kills sogod while `nc -z sogo-mailcow 20000` succeeds. `sogo-mailcow` is the pod's
+  # own hostname (/etc/hosts -> own pod IP, not the Service), so old pods do not block a new one.
   strategy:
-    type: Recreate
+    type: RollingUpdate
   selector:
     matchLabels:
       {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
@@ -30,6 +33,18 @@ spec:
       hostname: sogo-mailcow
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
       {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
+      {{- if $backupRwo }}
+      # RWO sogo-backup volume: replicas and the surge pod of a rolling update must share its node
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 18 }}
+      {{- else if include "mailcow.multi" $v }}
+      {{- include "mailcow.spread" (dict "root" . "component" $c) | nindent 6 }}
+      {{- end }}
       initContainers:
         {{- /* /etc/sogo: repo slice + sieve.creds/cron.creds derived from the Secret (dovecot writes the same
         bytes into its own pod-local copy); writable, bootstrap-sogo.sh renames a custom logo in it */}}
@@ -99,4 +114,6 @@ spec:
         - name: backup
           persistentVolumeClaim:
             claimName: {{ include "mailcow.claimName" (list . "sogoBackup" "sogo-backup") }}
+{{- include "mailcow.pdb" (dict "root" . "v" $v "component" $c) }}
+{{- include "mailcow.hpa" (dict "root" . "v" $v "component" $c) }}
 {{- end }}

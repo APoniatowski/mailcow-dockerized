@@ -1,5 +1,5 @@
 # cert-manager issued certificate for postfix/dovecot/nginx + Ingress for the web UI;
-# ofelia CronJobs off, so only cert-reload (and its runner RBAC) renders.
+# ofelia CronJobs off: no CronJob runner at all; certificate renewals are picked up by the tls-reload sidecars.
 mailcow:
   hostname: mail.example.org
   httpRedirect: "n"

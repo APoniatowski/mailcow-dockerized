@@ -3,6 +3,7 @@
 {{- $m := .Values.mailcow }}
 {{- $acme := .Values.acme.enabled }}
 {{- $sogo := not .Values.skip.sogo }}
+{{- $reload := include "mailcow.tlsReload" . }}
 {{- $logos := list (list "custom-favicon.ico" "img/sogo.ico") (list "custom-shortlogo.svg" "img/sogo-compact.svg") (list "custom-fulllogo.svg" "img/sogo-full.svg") (list "custom-fulllogo.png" "img/sogo-logo.png") (list "custom-theme.js" "js/theme.js") (list "custom-sogo.js" "js/custom-sogo.js") }}
 apiVersion: apps/v1
 kind: Deployment
@@ -11,7 +12,9 @@ metadata:
   labels:
     {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
 spec:
-  replicas: 1
+  {{- with include "mailcow.replicas" (dict "v" $v "key" "nginx") }}
+  {{- . | nindent 2 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
@@ -26,8 +29,15 @@ spec:
         {{- include "mailcow.podAnnotations" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
+      {{- if $reload }}
+      # tls-reload signals nginx's master process
+      shareProcessNamespace: true
+      {{- end }}
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
       {{- include "mailcow.podCommon" (dict "root" . "shared" $acme) | nindent 6 }}
+      {{- if and (include "mailcow.multi" $v) (not (and $acme (include "mailcow.sharedColocate" .))) }}
+      {{- include "mailcow.spread" (dict "root" . "component" $c) | nindent 6 }}
+      {{- end }}
       initContainers:
         {{- if $sogo }}
         # compose sogo-web-vol-1 (rsync'ed by bootstrap-sogo.sh): copy the SOGo web assets straight from
@@ -56,6 +66,9 @@ spec:
         {{- $shared := list }}
         {{- if $acme }}{{ $shared = list (dict "dir" "acme-challenge") }}{{ end }}
         {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "ssl" true "script" $script "extraMounts" $mounts) | nindent 8 }}
+        {{- if $reload }}
+        {{- include "mailcow.tlsReloadSidecar" (dict "root" . "comm" "nginx" "cmdline" "nginx: master process*") | nindent 8 }}
+        {{- end }}
       containers:
         - name: nginx-mailcow
           image: {{ include "mailcow.image" $v.image }}
@@ -148,3 +161,5 @@ spec:
         {{- include "mailcow.tlsVolumes" . | nindent 8 }}
         - name: sogo-web
           emptyDir: {}
+{{- include "mailcow.pdb" (dict "root" . "v" $v "component" $c) }}
+{{- include "mailcow.hpa" (dict "root" . "v" $v "component" $c) }}

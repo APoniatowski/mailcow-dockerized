@@ -1,6 +1,7 @@
 {{- $c := "dovecot" }}
 {{- $v := .Values.dovecot }}
 {{- $m := .Values.mailcow }}
+{{- $reload := include "mailcow.tlsReload" . }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -8,6 +9,8 @@ metadata:
   labels:
     {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
 spec:
+  # single instance: several dovecots need shared maildir storage with locking or dsync replication
+  # (removed in Dovecot 2.4), README "Scaling"
   replicas: 1
   serviceName: dovecot-mailcow
   selector:
@@ -23,6 +26,10 @@ spec:
         {{- include "mailcow.podAnnotations" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
+      {{- if $reload }}
+      # tls-reload signals dovecot's master process
+      shareProcessNamespace: true
+      {{- end }}
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
       {{- include "mailcow.podCommon" (dict "root" . "shared" true) | nindent 6 }}
       initContainers:
@@ -30,6 +37,10 @@ spec:
         {{- $appends := list (dict "key" "dovecot-k8s.conf" "dst" "conf/dovecot/extra.conf") }}
         {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/dovecot" "conf/dovecot" "assets/templates") "shared" $shared "files" (list (dict "src" "conf/dovecot/global_sieve_before" "dst" "global-sieve/before") (dict "src" "conf/dovecot/global_sieve_after" "dst" "global-sieve/after")) "appends" $appends "ssl" true) | nindent 8 }}
         {{- include "mailcow.rspamdSockSidecar" . | nindent 8 }}
+        {{- if $reload }}
+        {{- /* supervisord runs /usr/sbin/dovecot -F; HUP = doveadm reload */}}
+        {{- include "mailcow.tlsReloadSidecar" (dict "root" . "comm" "dovecot" "cmdline" "/usr/sbin/dovecot*") | nindent 8 }}
+        {{- end }}
       containers:
         - name: dovecot-mailcow
           image: {{ include "mailcow.image" $v.image }}

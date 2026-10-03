@@ -1,6 +1,9 @@
 {{- $c := "php-fpm" }}
 {{- $v := .Values.phpFpm }}
 {{- $m := .Values.mailcow }}
+{{- if not (has $v.updateStrategy (list "Recreate" "RollingUpdate")) }}
+{{- fail "phpFpm.updateStrategy must be Recreate or RollingUpdate" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,7 +11,14 @@ metadata:
   labels:
     {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
 spec:
-  replicas: 1
+  {{- with include "mailcow.replicas" (dict "v" $v "key" "phpFpm") }}
+  {{- . | nindent 2 }}
+  {{- end }}
+  # Every pod runs with MASTER=y (MASTER=n shows "[ slave ]" and reads quota2replica). Recreate: init_db
+  # migrates the schema whenever the stored version differs from its own, so an old pod beside a new one
+  # would migrate it back on its next request.
+  strategy:
+    type: {{ $v.updateStrategy }}
   selector:
     matchLabels:
       {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
@@ -23,6 +33,9 @@ spec:
       automountServiceAccountToken: false
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
       {{- include "mailcow.podCommon" (dict "root" . "shared" true) | nindent 6 }}
+      {{- if and (include "mailcow.multi" $v) (not (include "mailcow.sharedColocate" .)) }}
+      {{- include "mailcow.spread" (dict "root" . "component" $c) | nindent 6 }}
+      {{- end }}
       initContainers:
         {{- $slices := list "hooks/phpfpm" "web" "conf/rspamd/dynmaps" "conf/dovecot/auth/mailcowauth.php" "conf/rspamd/meta_exporter" "conf/phpfpm/crons" "conf/phpfpm/php-fpm.d/pools.conf" "conf/phpfpm/php-conf.d" "assets/templates" "conf/nginx" "conf/sogo" }}
         {{- $shared := list (dict "dir" "rspamd-custom" "src" "conf/rspamd/custom") }}
@@ -176,3 +189,5 @@ spec:
       volumes:
         {{- include "mailcow.seedVolumes" (dict "root" . "shared" true) | nindent 8 }}
         {{- include "mailcow.rspamdSockVolume" . | nindent 8 }}
+{{- include "mailcow.pdb" (dict "root" . "v" $v "component" $c) }}
+{{- include "mailcow.hpa" (dict "root" . "v" $v "component" $c) }}
