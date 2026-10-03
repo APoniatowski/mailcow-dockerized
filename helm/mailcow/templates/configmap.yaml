@@ -20,6 +20,17 @@ data:
       domain-insecure: "{{ .Values.clusterDomain }}"
       private-domain: "{{ .Values.clusterDomain }}"
       local-zone: "{{ .Values.clusterDomain }}." transparent
+    {{- /* Docker's embedded DNS answers bare service names; resolvers that ignore resolv.conf
+           search domains (rspamd's async resolver, postfix's DNS client, dig) rely on that.
+           Answer them here with a CNAME to the Service FQDN, which unbound then follows. */}}
+    {{- range (list "clamd" "dockerapi" "dovecot" "memcached" "mysql" "nginx" "olefy" "phpfpm" "php-fpm" "postfix" "postfix-tlspol" "redis" "rspamd" "sogo" "unbound" "acme" "watchdog") }}
+    {{- range $n := (list . (printf "%s-mailcow" .)) }}
+    {{- if ne $n "phpfpm-mailcow" }}
+      local-zone: "{{ $n }}." redirect
+      local-data: "{{ $n }}. 30 IN CNAME {{ $n }}.{{ $.Release.Namespace }}.svc.{{ $.Values.clusterDomain }}."
+    {{- end }}
+    {{- end }}
+    {{- end }}
     forward-zone:
       name: "{{ .Values.clusterDomain }}"
       forward-addr: {{ .Values.clusterDNS }}
