@@ -11,23 +11,24 @@ import re, sys, yaml
 compose = yaml.safe_load(open(sys.argv[1]))["services"]
 values = yaml.safe_load(open(sys.argv[2]))
 
-# compose service -> values key. ofelia is replaced by CronJobs (no image).
+# compose service -> values key. Not shipped by the chart: ofelia (replaced by CronJobs) and
+# netfilter (fail2ban; not supported on Kubernetes, see README).
 mapping = {
     "unbound-mailcow": "unbound", "mysql-mailcow": "mysql", "redis-mailcow": "redis",
     "clamd-mailcow": "clamd", "rspamd-mailcow": "rspamd", "php-fpm-mailcow": "phpFpm",
     "sogo-mailcow": "sogo", "dovecot-mailcow": "dovecot", "postfix-mailcow": "postfix",
     "postfix-tlspol-mailcow": "postfixTlspol", "memcached-mailcow": "memcached",
-    "nginx-mailcow": "nginx", "acme-mailcow": "acme", "netfilter-mailcow": "netfilter",
+    "nginx-mailcow": "nginx", "acme-mailcow": "acme",
     "watchdog-mailcow": "watchdog", "dockerapi-mailcow": "dockerapi", "olefy-mailcow": "olefy",
 }
-skip = {"ofelia-mailcow"}
+skip = {"ofelia-mailcow", "netfilter-mailcow"}
 
 fix = sys.argv[3] == "--fix"
 text = open(sys.argv[2]).read() if fix else None
 fail = 0
 for svc, spec in compose.items():
     if svc in skip:
-        continue
+        print(f"skip  {svc:24} not shipped by the chart"); continue
     if svc not in mapping:
         print(f"FAIL  {svc}: compose service has no chart mapping"); fail = 1; continue
     want = spec["image"]

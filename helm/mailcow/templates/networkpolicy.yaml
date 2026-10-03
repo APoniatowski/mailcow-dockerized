@@ -53,13 +53,6 @@ spec:
   ingress:
     - from:
         {{- include "mailcow.releasePeer" $root | nindent 8 }}
-        {{- if and (eq $c "redis") $root.Values.netfilter.enabled }}
-        {{- range $root.Values.networkPolicy.nodeCIDRs }}
-        # hostNetwork netfilter DaemonSet connects from node addresses
-        - ipBlock:
-            cidr: {{ . }}
-        {{- end }}
-        {{- end }}
 {{- end }}
 {{- /* postfix/dovecot: release pods on every port, clients on the exposed ones */}}
 {{- $pp := .Values.mail.proxyProtocol }}

@@ -53,3 +53,10 @@ WARNING: mailcow.sogoTrustedNets is empty, so SOGO_TRUSTED_NETS = mailcow.networ
   Every address in it may log in to dovecot with SOGo's plaintext/SSO privileges, bypassing protocol
   ACLs. Narrow it to the sogo pod's range if your CNI can pin one. See README "Security".
 {{- end }}
+{{- if or .Values.netfilter .Values.networkPolicy.nodeCIDRs }}
+
+WARNING: netfilter / networkPolicy.nodeCIDRs values are set but ignored: fail2ban (netfilter) is not
+  supported on Kubernetes and was removed in chart 0.3.0. Remove them from your values. Postfix rate
+  limits (bruteForce) and dovecot's auth penalty apply instead; put IP banning at the edge. See README
+  "Brute-force protection (no fail2ban)".
+{{- end }}

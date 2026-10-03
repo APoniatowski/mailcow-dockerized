@@ -47,7 +47,7 @@ Login: `admin` / `moohoo`. API key: `kubectl -n mailcow get secret mailcow-secre
 | dockerapi | Deployment + ServiceAccount/Role (pods get/list/delete, pods/exec, metrics.k8s.io pods get), `DOCKERAPI_BACKEND=kubernetes`; Services `dockerapi`/`dockerapi-mailcow`, NetworkPolicy always on |
 | acme | optional (`acme.enabled`), default off → cert-manager / Secret / self-signed |
 | watchdog | optional (`watchdog.enabled`); probes do the self-healing |
-| netfilter | optional hostNetwork DaemonSet (`netfilter.enabled`) |
+| netfilter | not shipped: fail2ban is not supported on Kubernetes, see [Brute-force protection](#brute-force-protection-no-fail2ban) |
 | ofelia | one CronJob per ofelia job, `kubectl exec` into the main container |
 
 Naming contract: pods carry `app.kubernetes.io/component=<svc>` (`<svc>` = compose service minus
@@ -147,7 +147,6 @@ The chart sets them; images at the tags pinned in `docker-compose.yml` support a
 | `NGINXHOST` | acme | `nginx` |
 | `WAIT_TCP=y` | nginx, acme, postfix-tlspol | wait for dependencies with TCP connects instead of `ping` |
 | `TLSPOL_DNS` | postfix-tlspol | `<unbound.clusterIP>:53` |
-| `NETFILTER_REDISHOST` | netfilter | `redis-mailcow.<ns>.svc.<clusterDomain>` (hostNetwork, `dnsPolicy: ClusterFirstWithHostNet`) |
 | `MAILCOW_NETWORKS` | rspamd, postfix, php-fpm | `mailcow.networks` |
 | `SOGO_TRUSTED_NETS` | dovecot, php-fpm | `mailcow.sogoTrustedNets` (empty = `mailcow.networks`) |
 | `DOVECOT_TRUSTED_NETS`, `RSPAMD_TRUSTED_NETS` | rspamd | `mailcow.dovecotTrustedNets` / `rspamdTrustedNets` (empty = `mailcow.networks`); unset, rspamd waits forever for `dig dovecot` |
@@ -166,7 +165,7 @@ address inside them gets compose's "inside the mailcow network" privileges:
 
 | list | trusted for |
 |---|---|
-| `MAILCOW_NETWORKS` | postfix `mynetworks`: relay to any destination without authentication (`permit_mynetworks`); rspamd `local_addrs`; never banned by fail2ban |
+| `MAILCOW_NETWORKS` | postfix `mynetworks`: relay to any destination without authentication (`permit_mynetworks`); rspamd `local_addrs`; exempt from the postfix client limits (`bruteForce.limitExceptions`) |
 | `DOVECOT_TRUSTED_NETS` | rspamd `SIEVE_HOST`: mail is DKIM-signed for mailcow domains (`sign_networks`) and exempt from `SPOOFED_UNAUTH` |
 | `RSPAMD_TRUSTED_NETS` | rspamd `RSPAMD_HOST`: exempt from `SPOOFED_UNAUTH` |
 | `SOGO_TRUSTED_NETS` | dovecot plaintext auth without TLS; mailcowauth skips the per-protocol access check (a user with IMAP disabled can still log in) and accepts the SOGo SSO password |
@@ -216,11 +215,80 @@ Install mailcow into a namespace of its own. RBAC cannot be scoped to labels: do
 exec into and deletion of **every** pod in the namespace, and the CronJob runner can exec into every
 pod too.
 
+## Brute-force protection (no fail2ban)
+
+compose's netfilter container (fail2ban-style bans written to the host's iptables/nftables) is not
+part of the chart, and chart 0.3.0 removed the opt-in DaemonSet:
+
+- it needs a privileged (or NET_ADMIN/NET_RAW) hostNetwork pod on every node that rewrites the
+  node's firewall, next to the rules kube-proxy and the CNI own;
+- eBPF dataplanes (Cilium, Calico eBPF) and IPVS forward Service traffic before or outside the
+  iptables chains it inserts into, so a ban may be bypassed;
+- behind PROXY protocol the TCP source on the node is the load balancer: banning the address mailcow
+  logs does nothing, banning the TCP source blocks all mail;
+- the load balancer, cloud firewall or ingress in front of the cluster can drop traffic before it
+  reaches any node.
+
+Values that still set `netfilter:` (or `networkPolicy.nodeCIDRs`) render nothing and print a NOTES
+warning.
+
+### What the chart does
+
+`bruteForce` (default on) appends postfix anvil limits to `main.cf` (after `extra.cf`, so it wins over
+an `extraFiles` `extra.cf`; set `bruteForce.enabled: false` to manage them there yourself):
+
+| value | postfix parameter | default | meaning |
+|---|---|---|---|
+| `rateTimeUnit` | `anvil_rate_time_unit` | `60s` | window of the rate limits |
+| `authRateLimit` | `smtpd_client_auth_rate_limit` | `10` | AUTH commands per client and window |
+| `connectionRateLimit` | `smtpd_client_connection_rate_limit` | `60` | connection attempts per client and window |
+| `connectionCountLimit` | `smtpd_client_connection_count_limit` | `20` | simultaneous connections per client |
+| `limitExceptions` | `smtpd_client_event_limit_exceptions` | `$mynetworks` | clients exempt from all limits (`MAILCOW_NETWORKS`: sogo, watchdog, quarantine/BCC and other internal traffic) |
+
+`0` disables a limit. Postfix's own defaults are 50 simultaneous connections and no rate limits.
+
+- The limits apply to every smtpd service in `master.cf` (none overrides them with `-o`): the smtpd
+  behind postscreen on 25 and 10025 (only connections that pass postscreen), smtps 465, submission
+  587, and the PROXY listeners 10465/10587. 25/10025 offer no AUTH, so `authRateLimit` matters on
+  465/587/10465/10587. The internal listeners 588-591 are only used from `$mynetworks` and therefore
+  exempt.
+- anvil counts per master.cf service and client address (IPv6 aggregated per /84,
+  `smtpd_client_ipv6_prefix_length`). A client over a limit gets a temporary (4xx) error; it is not
+  banned and gets through again once the window has passed.
+- With PROXY protocol the client address is the one from the PROXY header (smtpd's
+  `smtpd_upstream_proxy_protocol`, or postscreen passing it on), so the limits hit the real client,
+  not the load balancer. Without PROXY protocol they rely on `externalTrafficPolicy: Local`; with
+  SNAT every client would share the node's address and its limits.
+- Many users behind one NAT share a client address. Raise `authRateLimit` / `connectionCountLimit`
+  if such sites log in to SMTP at the same time.
+
+Unchanged and already active:
+
+- dovecot's auth penalty: after failed logins from an IP, dovecot delays further authentications
+  from it (doubling, up to 15 s). Behind the PROXY listeners the IP is the one from the PROXY header.
+- SOGo blocks a login name for 15 min after 10 failed logins within 15 min (`sogo.conf`).
+- The mailcow UI delays repeated failed logins per session.
+
+The admin UI's **Fail2ban** settings have no effect on Kubernetes: its settings
+are stored but nothing enforces them, and the list of active bans stays empty. Failed UI, API and
+autodiscover logins are still published to redis, but nothing consumes them.
+
+### At the edge
+
+IP-level banning belongs in front of the cluster, where the real client address and the ability to
+drop traffic meet. Options:
+
+- CrowdSec: its Kubernetes log acquisition reads the postfix/dovecot/nginx pod logs, and a bouncer
+  enforces decisions at the ingress controller, load balancer or cloud firewall.
+- A WAF or CDN in front of the HTTP Service/Ingress (e.g. Cloudflare) for the web UI, SOGo and
+  autodiscover/ActiveSync; mail ports cannot be proxied this way.
+- Cloud firewall or security group rules on the load balancer for static allow/deny lists (e.g.
+  limit submission/IMAP to known ranges where that is possible).
+
 ## Limitations (0.1)
 
 - dovecot/postfix single replica; rspamd/php-fpm/dovecot/postfix share a node through rspamd.sock.
-- fail2ban-style bans only with the netfilter DaemonSet, and only when client IPs reach the node
-  unmodified (no PROXY protocol, no SNAT).
+- No fail2ban (netfilter); see [Brute-force protection](#brute-force-protection-no-fail2ban).
 - `redis` `net.core.somaxconn` is an unsafe sysctl (`redis.sysctls`, off by default); compose
   ulimits for dovecot have no pod equivalent (runtime defaults are higher).
 - NetworkPolicy covers ingress only; egress is unrestricted.
@@ -230,5 +298,6 @@ pod too.
 
 - `helm/mailcow/scripts/check-tags.sh [--fix]`: chart image tags must equal `docker-compose.yml`.
 - `ci/*-values.yaml`: kind (NodePorts 30080/30443/30025/30465/30587/30143/30993/32190, RWO shared,
-  self-signed TLS, clamd skipped), cert-manager + Ingress, HA (RWX, LB + PROXY, netfilter,
-  watchdog, NetworkPolicy), acme + extraFiles, NetworkPolicy without PROXY protocol.
+  self-signed TLS, clamd skipped), cert-manager + Ingress, HA (RWX, LB + PROXY,
+  watchdog, NetworkPolicy), acme + extraFiles (postfix limits off), NetworkPolicy without PROXY protocol.
+  `check-tags.sh` skips the compose services the chart does not ship (ofelia, netfilter).

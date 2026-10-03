@@ -1,4 +1,4 @@
-# mailcow ACME client instead of cert-manager, plus extraFiles and skipped components.
+# mailcow ACME client instead of cert-manager, plus extraFiles, skipped components and no postfix rate limits.
 mailcow:
   hostname: mail.example.org
 
@@ -31,3 +31,6 @@ http:
 persistence:
   shared:
     accessMode: ReadWriteOnce
+
+bruteForce:
+  enabled: false

@@ -505,22 +505,23 @@ watchdog:
   # -- Extra env for watchdog (USE_WATCHDOG, WATCHDOG_NOTIFY_EMAIL, *_THRESHOLD, ...); compose defaults are set by the chart.
   env: {}
 
-netfilter:
-  # -- Fail2ban-style banning as a hostNetwork DaemonSet with NET_ADMIN/NET_RAW. Only useful when client IPs
-  # reach the node unmodified (externalTrafficPolicy Local, no PROXY protocol, no SNAT).
-  enabled: false
-  image:
-    repository: ghcr.io/mailcow/netfilter
-    tag: "1.65"
-    pullPolicy: IfNotPresent
-  # -- Run privileged like compose instead of NET_ADMIN/NET_RAW only.
-  privileged: false
-  # -- DISABLE_NETFILTER_ISOLATION_RULE (the br-mailcow isolation rule has no meaning in k8s).
-  disableIsolationRule: "y"
-  # -- terminationGracePeriodSeconds (compose stop_grace_period 30s).
-  terminationGracePeriodSeconds: 30
-  resources:
-    requests: {cpu: 10m, memory: 64Mi}
+# Application-layer brute-force protection; the chart ships no fail2ban (README "Brute-force protection").
+# Rendered into postfix main.cf after extra.cf, so these win over an extraFiles extra.cf; 0 = no limit.
+# Limits count per client IP and per master.cf service (behind PROXY protocol: the address from the
+# PROXY header) and never apply to clients in $mynetworks (MAILCOW_NETWORKS) by default.
+bruteForce:
+  # -- false: render nothing (postfix defaults: connection count 50, no rate limits).
+  enabled: true
+  # -- anvil_rate_time_unit: the window the rate limits below count in.
+  rateTimeUnit: 60s
+  # -- smtpd_client_auth_rate_limit: AUTH commands per client per rateTimeUnit (465/587 and their PROXY listeners).
+  authRateLimit: 10
+  # -- smtpd_client_connection_rate_limit: connection attempts per client per rateTimeUnit.
+  connectionRateLimit: 60
+  # -- smtpd_client_connection_count_limit: simultaneous connections per client.
+  connectionCountLimit: 20
+  # -- smtpd_client_event_limit_exceptions: clients exempt from all of the above.
+  limitExceptions: $mynetworks
 
 # ofelia replacement: one CronJob per ofelia job label, `kubectl exec` into the component's main container.
 cronjobs:
@@ -567,5 +568,3 @@ networkPolicy:
   # node ranges so other pods of the cluster cannot send forged PROXY headers, e.g.
   # [{ipBlock: {cidr: 10.0.0.0/16}}]
   publicMailFrom: []
-  # -- Extra CIDRs allowed to redis (node addresses of the hostNetwork netfilter DaemonSet).
-  nodeCIDRs: []

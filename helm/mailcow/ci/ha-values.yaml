@@ -30,11 +30,6 @@ tls:
   certManager:
     enabled: true
 
-# Note: with PROXY protocol the node only sees load balancer addresses, so netfilter bans have no
-# effect on mail ports; enabled here to exercise the DaemonSet + NetworkPolicy rendering.
-netfilter:
-  enabled: true
-
 watchdog:
   enabled: true
 
@@ -44,5 +39,3 @@ networkPolicy:
   publicMailFrom:
     - ipBlock:
         cidr: 10.0.0.0/16
-  nodeCIDRs:
-    - 10.0.0.0/16
