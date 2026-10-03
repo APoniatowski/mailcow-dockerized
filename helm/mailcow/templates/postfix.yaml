@@ -44,7 +44,6 @@ spec:
               value: {{ $m.hostname | quote }}
             - name: SPAMHAUS_DQS_KEY
               value: {{ $m.spamhausDqsKey | quote }}
-            # P1.3 (opt-in env, read once the postfix image change lands)
             - name: MAILCOW_NETWORKS
               value: {{ include "mailcow.networks" . | quote }}
           ports:

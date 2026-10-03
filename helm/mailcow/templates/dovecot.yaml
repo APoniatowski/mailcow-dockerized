@@ -74,11 +74,8 @@ spec:
             {{- include "mailcow.env.redis" . | nindent 12 }}
             - name: COMPOSE_PROJECT_NAME
               value: {{ $m.composeProjectName | quote }}
-            # P1.2 / P1.3 / P1.4 (opt-in env, read once the dovecot image change lands)
-            - name: DOCKERAPI_HOST
-              value: dockerapi-mailcow
-            - name: MAILCOW_NETWORKS
-              value: {{ include "mailcow.networks" . | quote }}
+            - name: DOCKERAPIHOST
+              value: dockerapi
             - name: SOGO_TRUSTED_NETS
               value: {{ include "mailcow.sogoTrustedNets" . | quote }}
             {{- include "mailcow.secretEnv" (list . "SOGO_SSO_PASS" "SOGO_SSO_PASS") | nindent 12 }}
@@ -128,6 +125,7 @@ spec:
             - name: seed
               subPath: assets/templates
               mountPath: /templates
+              readOnly: true
             - name: shared
               subPath: rspamd-vol
               mountPath: /var/lib/rspamd

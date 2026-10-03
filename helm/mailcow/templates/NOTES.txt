@@ -32,3 +32,24 @@ Checks:
 {{- if eq .Values.persistence.shared.accessMode "ReadWriteOnce" }}
   - shared PVC is ReadWriteOnce: all mailcow pods are pinned to one node.
 {{- end }}
+  - dockerapi can exec into and delete every pod in namespace {{ .Release.Namespace }}: keep mailcow alone in it.
+{{- if include "mailcow.networkPolicy" . }}
+  - NetworkPolicies are rendered; they only protect anything if your CNI enforces them.
+{{- else }}
+  - networkPolicy is off (only dockerapi is restricted): any pod in the cluster can reach postfix and
+    dovecot from the pod CIDR, which mailcow trusts (relay without auth). See README "Security".
+{{- end }}
+
+{{- $etp := .Values.mail.service.externalTrafficPolicy | default (ternary "Cluster" "Local" .Values.mail.proxyProtocol) }}
+{{- if and (not .Values.mail.proxyProtocol) (eq $etp "Cluster") (ne .Values.mail.service.type "ClusterIP") }}
+
+WARNING: mail.proxyProtocol is false and the mail Service uses externalTrafficPolicy Cluster.
+  Client connections may be SNAT'd to node or pod-CIDR addresses; if those fall into mailcow.networks,
+  postfix relays for everyone (open relay). Use externalTrafficPolicy Local or PROXY protocol.
+{{- end }}
+{{- if not .Values.mailcow.sogoTrustedNets }}
+
+WARNING: mailcow.sogoTrustedNets is empty, so SOGO_TRUSTED_NETS = mailcow.networks ({{ .Values.mailcow.networks }}).
+  Every address in it may log in to dovecot with SOGo's plaintext/SSO privileges, bypassing protocol
+  ACLs. Narrow it to the sogo pod's range if your CNI can pin one. See README "Security".
+{{- end }}

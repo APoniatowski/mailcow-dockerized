@@ -27,6 +27,8 @@ spec:
         {{- include "mailcow.podAnnotations" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
+      # bootstrap-sogo.sh checks its own port as `nc -z sogo-mailcow 20000`
+      hostname: sogo-mailcow
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
       {{- include "mailcow.podCommon" (dict "root" . "shared" true) | nindent 6 }}
       initContainers:
@@ -59,13 +61,10 @@ spec:
             - name: MASTER
               value: {{ $m.master | quote }}
             {{- include "mailcow.env.redis" . | nindent 12 }}
-            # P1.2 / P1.4 (opt-in env, read once the sogo image change lands)
-            - name: SOGO_IMAP_HOST
-              value: dovecot-mailcow
-            - name: SOGO_SIEVE_HOST
-              value: dovecot-mailcow
-            - name: SOGO_SMTP_HOST
-              value: postfix-mailcow
+            - name: DOVECOTHOST
+              value: dovecot
+            - name: POSTFIXHOST
+              value: postfix
             {{- include "mailcow.secretEnv" (list . "SOGO_ENCRYPTION_KEY" "SOGO_ENCRYPTION_KEY") | nindent 12 }}
           ports:
             - name: sogo

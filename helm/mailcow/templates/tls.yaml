@@ -96,6 +96,8 @@ spec:
     spec:
       restartPolicy: Never
       serviceAccountName: {{ $fullname }}-tls-bootstrap
+      # POSTs the Secret to the API with its token
+      automountServiceAccountToken: true
       {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
       containers:
         - name: tls-bootstrap

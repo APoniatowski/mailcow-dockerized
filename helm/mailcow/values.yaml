@@ -11,6 +11,7 @@ fullnameOverride: ""
 
 # -- Existing Secret holding DBPASS, DBROOT, REDISPASS, API_KEY, API_KEY_READ_ONLY,
 # SOGO_URL_ENCRYPTION_KEY, SOGO_ENCRYPTION_KEY, SOGO_SSO_PASS, DOVECOT_MASTER_USER, DOVECOT_MASTER_PASS.
+# SOGO_ENCRYPTION_KEY goes into a plist: alphanumeric only (no & < >).
 # Empty: the chart creates `<release>-secrets` with random values once and keeps them on upgrade (lookup).
 existingSecret: ""
 
@@ -61,8 +62,8 @@ mailcow:
   webauthnOnlyTrustedVendors: "n"
   # -- LOG_LINES kept in Redis per log list.
   logLines: "9999"
-  # -- IPV4_NETWORK: compose subnet prefix. Still read by images for trust decisions until
-  # MAILCOW_NETWORKS/SOGO_TRUSTED_NETS (P1.3) and host overrides (P1.2) land.
+  # -- IPV4_NETWORK: compose subnet prefix. Images still read it, but the chart overrides every
+  # address/trust decision derived from it (host vars, MAILCOW_NETWORKS, *_TRUSTED_NETS).
   ipv4Network: 172.22.1
   # -- IPV6_NETWORK
   ipv6Network: fd4d:6169:6c63:6f77::/64
@@ -116,13 +117,24 @@ mailcow:
   redisSlaveofPort: ""
   # -- REDISMASTERPASS
   redisMasterPass: ""
-  # -- MAILCOW_NETWORKS (P1.3): CIDRs mailcow trusts as "internal" (postfix mynetworks, rspamd local_addrs,
-  # dovecot trusted maps). Set it to your cluster POD CIDR only (kind default 10.244.0.0/16).
+  # -- MAILCOW_NETWORKS (postfix, rspamd, php-fpm): comma-separated CIDRs trusted as "internal"
+  # (postfix mynetworks = relay without auth, rspamd local_addrs, fail2ban never bans them).
+  # Set it to your cluster POD CIDR(s) only (kind default 10.244.0.0/16), IPv6 without brackets.
   # Never include node or load balancer ranges: SNAT'd external clients would become trusted relays.
+  # See README "Security".
   networks: 10.244.0.0/16
-  # -- SOGO_TRUSTED_NETS (P1.3): CIDRs dovecot accepts SOGo SSO/plaintext auth from. Empty = `networks`.
+  # -- SOGO_TRUSTED_NETS (dovecot, php-fpm): CIDRs allowed to use SOGo's plaintext/SSO auth to dovecot.
+  # Empty = `networks` (every pod of the cluster), and NOTES.txt warns. Narrow it if your CNI can give
+  # the sogo pod a dedicated range. See README "Security".
   sogoTrustedNets: ""
-  # -- DOVECOT_MASTER_USER override (otherwise generated into the release Secret, P1.4 stable sieve creds).
+  # -- DOVECOT_TRUSTED_NETS (rspamd): SMTP client addresses rspamd treats as dovecot's sieve
+  # (SIEVE_HOST: DKIM-signed, exempt from SPOOFED_UNAUTH). Empty = `networks`. Always set by the chart.
+  dovecotTrustedNets: ""
+  # -- RSPAMD_TRUSTED_NETS (rspamd): SMTP client addresses rspamd treats as itself (RSPAMD_HOST:
+  # exempt from SPOOFED_UNAUTH). Empty = `networks`. Always set by the chart.
+  rspamdTrustedNets: ""
+  # -- DOVECOT_MASTER_USER override (otherwise generated into the release Secret; a stable value keeps
+  # SOGo's sieve.creds/cron.creds valid across dovecot restarts).
   dovecotMasterUser: ""
 
 # Compose SKIP_* switches. true = SKIP_*=y everywhere and the component's workload is not rendered
@@ -216,7 +228,7 @@ persistence:
   # rspamd-override (controller password), sogo-conf (+ creds), sogo-sso, global-sieve, ssl + acme-challenge (acme on).
   # ReadWriteMany for multi-node. ReadWriteOnce works only with every pod on one node: the chart then adds a
   # required podAffinity so all pods mounting it co-locate. rspamd.sock is a unix socket: even with RWX
-  # its users must share a node (phase 3 moves the controller to TCP).
+  # its users must share a node.
   shared:
     size: 1Gi
     accessMode: ReadWriteMany
@@ -231,7 +243,10 @@ mail:
   # false: plain ports + externalTrafficPolicy Local (client IP preserved only on the node that has the pod).
   proxyProtocol: true
   # -- Source networks dovecot accepts PROXY headers from (haproxy_trusted_networks, space separated).
-  # Must cover the load balancer / node addresses the PROXY connections come from.
+  # Must cover the addresses the PROXY connections arrive from: load balancer IPs (IP-target NLBs),
+  # node IPs (externalTrafficPolicy Cluster SNATs to them) or the pod CIDR (CNIs that SNAT into it).
+  # postfix's PROXY listeners have no such setting and accept PROXY headers from anyone who can
+  # connect: restrict them with networkPolicy.publicMailFrom.
   proxyTrustedNetworks: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10"
   # -- Expose POP3/POP3S too.
   pop3: true
@@ -428,7 +443,7 @@ olefy:
 dockerapi:
   image:
     repository: ghcr.io/mailcow/dockerapi
-    tag: "2.12"
+    tag: "2.13"
     pullPolicy: IfNotPresent
   resources:
     requests: {cpu: 10m, memory: 64Mi}
@@ -533,8 +548,16 @@ cronjobs:
     dovecot-fts: {enabled: true, schedule: "0 0 * * *"}
     dovecot-repl-health: {enabled: true, schedule: "*/5 * * * *"}
 
+# Ingress NetworkPolicies (need a CNI that enforces them). dockerapi :443 is always limited to
+# php-fpm, watchdog, acme and dovecot, whatever `enabled` says (it is an unauthenticated exec API).
 networkPolicy:
-  # -- Restrict mysql 3306, redis 6379 and dovecot doveadm 12345 to pods of this namespace.
-  enabled: false
+  # -- true: every mailcow port only from pods of this release, except client mail ports
+  # (publicMailFrom) and nginx http/https (anywhere). "" = on when mail.proxyProtocol is true.
+  enabled: ""
+  # -- NetworkPolicy peers allowed on the client mail ports (PROXY listeners with mail.proxyProtocol,
+  # plain 25/465/587/143/993/110/995/4190 otherwise). Empty = anywhere. Set it to the load balancer /
+  # node ranges so other pods of the cluster cannot send forged PROXY headers, e.g.
+  # [{ipBlock: {cidr: 10.0.0.0/16}}]
+  publicMailFrom: []
   # -- Extra CIDRs allowed to redis (node addresses of the hostNetwork netfilter DaemonSet).
   nodeCIDRs: []

@@ -78,9 +78,8 @@ spec:
             {{- include "mailcow.env.redis" . | nindent 12 }}
             - name: DEV_MODE
               value: {{ $m.devMode | quote }}
-            # P1.2 (opt-in env, read once the watchdog image change lands)
-            - name: DOCKERAPI_HOST
-              value: dockerapi-mailcow
+            - name: DOCKERAPIHOST
+              value: dockerapi
             {{- range $k, $val := $env }}
             - name: {{ $k }}
               value: {{ $val | toString | quote }}

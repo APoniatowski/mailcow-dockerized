@@ -49,11 +49,9 @@ spec:
               value: ""
             - name: DISABLE_NETFILTER_ISOLATION_RULE
               value: {{ $v.disableIsolationRule | quote }}
-            # P1.2 / P1.3 (opt-in env, read once the netfilter image change lands)
-            - name: REDIS_HOST
-              value: redis-mailcow
-            - name: MAILCOW_NETWORKS
-              value: {{ include "mailcow.networks" . | quote }}
+            # hostNetwork pod: the node's resolv.conf search list does not cover the namespace
+            - name: NETFILTER_REDISHOST
+              value: {{ include "mailcow.svcFqdn" (list . "redis-mailcow") | quote }}
           volumeMounts:
             - name: modules
               mountPath: /lib/modules

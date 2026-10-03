@@ -77,9 +77,12 @@ fi
               value: {{ $v.dnsProvider | quote }}
             - name: ACME_ACCOUNT_EMAIL
               value: {{ $v.accountEmail | quote }}
-            # P1.2 (opt-in env, read once the acme image change lands)
-            - name: DOCKERAPI_HOST
-              value: dockerapi-mailcow
+            - name: DOCKERAPIHOST
+              value: dockerapi
+            - name: NGINXHOST
+              value: nginx
+            - name: WAIT_TCP
+              value: "y"
           volumeMounts:
             - name: shared
               subPath: acme-challenge

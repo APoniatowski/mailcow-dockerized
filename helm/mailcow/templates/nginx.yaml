@@ -79,12 +79,14 @@ spec:
             - name: HTTP_REDIRECT
               value: {{ $m.httpRedirect | quote }}
             - name: PHPFPMHOST
-              value: ""
-            # existing override; compose default is ${IPV4_NETWORK}.248
+              value: php-fpm-mailcow
+            # compose default is ${IPV4_NETWORK}.248
             - name: SOGOHOST
               value: sogo-mailcow
             - name: RSPAMDHOST
-              value: ""
+              value: rspamd-mailcow
+            - name: WAIT_TCP
+              value: "y"
             - name: REDISHOST
               value: ""
             - name: IPV4_NETWORK

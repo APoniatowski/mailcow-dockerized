@@ -44,11 +44,16 @@ spec:
             {{- include "mailcow.env.redis" . | nindent 12 }}
             - name: SPAMHAUS_DQS_KEY
               value: {{ .Values.mailcow.spamhausDqsKey | quote }}
-            # P1.3 / P1.2 (opt-in env, read once the rspamd image change lands)
             - name: MAILCOW_NETWORKS
               value: {{ include "mailcow.networks" . | quote }}
-            - name: RSPAMD_BCC_HOST
-              value: postfix-mailcow
+            # unset, the entrypoint resolves `dovecot`/`rspamd` with dig in a loop (no search domains)
+            - name: DOVECOT_TRUSTED_NETS
+              value: {{ include "mailcow.dovecotTrustedNets" . | quote }}
+            - name: RSPAMD_TRUSTED_NETS
+              value: {{ include "mailcow.rspamdTrustedNets" . | quote }}
+            # BCC delivery: rspamd's resolver ignores search domains, so the FQDN
+            - name: POSTFIXHOST
+              value: {{ include "mailcow.svcFqdn" (list . "postfix") | quote }}
           ports:
             - name: normal
               containerPort: 11333

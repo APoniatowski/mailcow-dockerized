@@ -90,9 +90,9 @@ spec:
               value: {{ $m.clustermode | quote }}
             - name: ADDITIONAL_SERVER_NAMES
               value: {{ $m.additionalServerNames | quote }}
-            # P1.2 / P1.3 (opt-in env, read once the phpfpm image / PHP change lands)
-            - name: DOCKERAPI_HOST
-              value: dockerapi-mailcow
+            # the UI also calls the literal name `dockerapi`
+            - name: DOCKERAPIHOST
+              value: dockerapi
             - name: MAILCOW_NETWORKS
               value: {{ include "mailcow.networks" . | quote }}
             - name: SOGO_TRUSTED_NETS

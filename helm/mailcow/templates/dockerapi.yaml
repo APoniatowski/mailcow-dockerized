@@ -8,8 +8,10 @@ metadata:
   labels:
     {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
 ---
-# DOCKERAPI_BACKEND=kubernetes (P1.5): list/inspect pods by app.kubernetes.io/component, exec via
+# DOCKERAPI_BACKEND=kubernetes: list/inspect pods by app.kubernetes.io/component, exec via
 # pods/exec (websocket exec needs get), restart = delete pod, stats from metrics.k8s.io.
+# A Role cannot be limited to labels: dockerapi can exec into and delete every pod of the
+# namespace, so run mailcow in a namespace of its own.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -19,13 +21,13 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "delete"]
+    verbs: ["get", "list", "delete"]
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create", "get"]
   - apiGroups: ["metrics.k8s.io"]
     resources: ["pods"]
-    verbs: ["get", "list"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -59,6 +61,7 @@ spec:
         {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
     spec:
       serviceAccountName: {{ $name }}
+      automountServiceAccountToken: true
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
       {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
       containers:
@@ -69,17 +72,14 @@ spec:
             {{- include "mailcow.secretEnv" (list . "DBROOT" "DBROOT") | nindent 12 }}
             {{- include "mailcow.env.tz" . | nindent 12 }}
             {{- include "mailcow.env.redis" . | nindent 12 }}
-            # P1.5 (opt-in env, read once the dockerapi kubernetes backend lands)
             - name: DOCKERAPI_BACKEND
               value: kubernetes
+            # must equal php-fpm's value (php-fpm filters containers by project label)
             - name: COMPOSE_PROJECT_NAME
               value: {{ .Values.mailcow.composeProjectName | quote }}
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-            - name: RELEASE_NAME
-              value: {{ .Release.Name | quote }}
+            # namespace: the ServiceAccount's own
+            - name: K8S_POD_SELECTOR
+              value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s" (include "mailcow.name" .) .Release.Name | quote }}
           ports:
             - name: https
               containerPort: 443

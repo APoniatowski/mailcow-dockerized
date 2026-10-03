@@ -4,6 +4,8 @@
 mailcow:
   hostname: mail.example.org
   networks: 10.244.0.0/16
+  # test cluster: SOGo may authenticate from anywhere in the pod CIDR
+  sogoTrustedNets: 10.244.0.0/16
   # the smoke test calls the API from the host through the NodePort; the source address nginx sees is
   # the kind docker bridge / node address (SNAT), so allow the private ranges
   apiAllowFrom: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1"

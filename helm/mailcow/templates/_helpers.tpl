@@ -97,7 +97,7 @@ app.kubernetes.io/part-of: mailcow
 {{ include "mailcow.secretEnv" (list . "REDISPASS" "REDISPASS") }}
 {{- end -}}
 
-{{/* DBHOST/DBPORT: P1.1 (MySQL over TCP; unset = socket like compose) */}}
+{{/* DBHOST/DBPORT: MySQL over TCP (unset = unix socket like compose) */}}
 {{- define "mailcow.env.db" -}}
 - name: DBNAME
   value: {{ .Values.mailcow.dbName | quote }}
@@ -116,6 +116,37 @@ app.kubernetes.io/part-of: mailcow
 
 {{- define "mailcow.sogoTrustedNets" -}}
 {{- default .Values.mailcow.networks .Values.mailcow.sogoTrustedNets -}}
+{{- end -}}
+
+{{/* rspamd DOVECOT_TRUSTED_NETS / RSPAMD_TRUSTED_NETS: always set, unset makes rspamd loop on `dig dovecot` */}}
+{{- define "mailcow.dovecotTrustedNets" -}}
+{{- default .Values.mailcow.networks .Values.mailcow.dovecotTrustedNets -}}
+{{- end -}}
+
+{{- define "mailcow.rspamdTrustedNets" -}}
+{{- default .Values.mailcow.networks .Values.mailcow.rspamdTrustedNets -}}
+{{- end -}}
+
+{{/* FQDN of a release Service: include "mailcow.svcFqdn" (list . "postfix") */}}
+{{- define "mailcow.svcFqdn" -}}
+{{- $root := index . 0 -}}
+{{- printf "%s.%s.svc.%s" (index . 1) $root.Release.Namespace $root.Values.clusterDomain -}}
+{{- end -}}
+
+{{/* "true" when the NetworkPolicies are rendered (networkPolicy.enabled; empty = mail.proxyProtocol) */}}
+{{- define "mailcow.networkPolicy" -}}
+{{- $e := toString .Values.networkPolicy.enabled -}}
+{{- if eq $e "true" -}}true
+{{- else if and (ne $e "false") .Values.mail.proxyProtocol -}}true
+{{- end -}}
+{{- end -}}
+
+{{/* NetworkPolicy peer: every pod of this release (same namespace) */}}
+{{- define "mailcow.releasePeer" -}}
+- podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "mailcow.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{/* ---------- pod scaffolding ---------- */}}

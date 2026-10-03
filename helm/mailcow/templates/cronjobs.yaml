@@ -93,6 +93,7 @@ spec:
             mailcow.email/cron-job: {{ $job }}
         spec:
           serviceAccountName: {{ $name }}
+          automountServiceAccountToken: true
           restartPolicy: Never
           securityContext:
             runAsNonRoot: true

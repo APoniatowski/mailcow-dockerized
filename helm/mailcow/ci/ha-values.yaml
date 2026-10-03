@@ -40,5 +40,9 @@ watchdog:
 
 networkPolicy:
   enabled: true
+  # NLB (IP targets) sources: only the VPC may send PROXY headers to postfix/dovecot
+  publicMailFrom:
+    - ipBlock:
+        cidr: 10.0.0.0/16
   nodeCIDRs:
     - 10.0.0.0/16

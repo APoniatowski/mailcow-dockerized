@@ -34,6 +34,11 @@ spec:
             {{- include "mailcow.env.redis" . | nindent 12 }}
             - name: DEV_MODE
               value: {{ .Values.mailcow.devMode | quote }}
+            # DNSSEC-validating resolver (compose: Docker's 127.0.0.11 -> unbound)
+            - name: TLSPOL_DNS
+              value: {{ printf "%s:53" .Values.unbound.clusterIP | quote }}
+            - name: WAIT_TCP
+              value: "y"
           ports:
             - name: tlspol
               containerPort: 8642
