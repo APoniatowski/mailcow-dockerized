@@ -487,6 +487,16 @@ fi
 # Reset main.cf
 sed -i '/Overrides/q' /opt/postfix/conf/main.cf
 echo >> /opt/postfix/conf/main.cf
+if [[ -n "${MAILCOW_NETWORKS}" ]]; then
+  MYNETWORKS="127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128"
+  for net in ${MAILCOW_NETWORKS//,/ }; do
+    if [[ ${net} == *:* && ${net} != \[* ]]; then
+      [[ ${net} == */* ]] && net="[${net%/*}]/${net#*/}" || net="[${net}]"
+    fi
+    MYNETWORKS="${MYNETWORKS} ${net}"
+  done
+  echo "mynetworks = ${MYNETWORKS}" >> /opt/postfix/conf/main.cf
+fi
 # Append postscreen dnsbl sites to main.cf
 if [ ! -z "$DNSBL_CONFIG" ]; then
   echo -e "${DNSBL_CONFIG}\n${SPAMHAUS_DNSBL_CONFIG}" >> /opt/postfix/conf/main.cf

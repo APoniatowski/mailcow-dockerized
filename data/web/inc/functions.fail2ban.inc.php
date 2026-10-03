@@ -196,13 +196,13 @@ function fail2ban($_action, $_data = null, $_extra = null) {
             // Blacklist network
             elseif ($_data['action'] == "blacklist") {
               if (empty($network)) { continue; }
-              if (valid_network($network) && !in_array($network, array(
+              if (valid_network($network) && !in_array($network, array_merge(array(
                 '0.0.0.0',
                 '0.0.0.0/0',
                 getenv('IPV4_NETWORK') . '.0/24',
                 getenv('IPV4_NETWORK') . '.0',
                 getenv('IPV6_NETWORK')
-              ))) {
+              ), env_list('MAILCOW_NETWORKS')))) {
                 try {
                   $redis->hSet('F2B_BLACKLIST', $network, 1);
                   $redis->hDel('F2B_WHITELIST', $network, 1);
@@ -297,13 +297,13 @@ function fail2ban($_action, $_data = null, $_extra = null) {
           $bl_array = array_filter($bl_array);
           if (is_array($bl_array)) {
             foreach ($bl_array as $bl_item) {
-              if (valid_network($bl_item) && !in_array($bl_item, array(
+              if (valid_network($bl_item) && !in_array($bl_item, array_merge(array(
                 '0.0.0.0',
                 '0.0.0.0/0',
                 getenv('IPV4_NETWORK') . '.0/24',
                 getenv('IPV4_NETWORK') . '.0',
                 getenv('IPV6_NETWORK')
-              ))) {
+              ), env_list('MAILCOW_NETWORKS')))) {
                 $redis->hSet('F2B_BLACKLIST', $bl_item, 1);
               }
               else {

@@ -68,7 +68,8 @@ require_once 'functions.ratelimit.inc.php';
 require_once 'functions.acl.inc.php';
 
 
-$isSOGoRequest = $post['real_rip'] == getenv('IPV4_NETWORK') . '.248';
+$isSOGoRequest = getenv('SOGO_TRUSTED_NETS') ? ip_acl($post['real_rip'], env_list('SOGO_TRUSTED_NETS'))
+                                              : $post['real_rip'] == getenv('IPV4_NETWORK') . '.248';
 $result = false;
 if ($isSOGoRequest) {
   // This is a SOGo Auth request. First check for SSO password.
