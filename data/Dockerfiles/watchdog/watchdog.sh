@@ -37,8 +37,18 @@ if [[ ! -p /tmp/com_pipe ]]; then
   mkfifo /tmp/com_pipe
 fi
 
+if [[ -n "${DBHOST}" ]]; then
+  DB_CONN_ARGS="--protocol=tcp --host=${DBHOST} --port=${DBPORT:-3306}"
+  NAGIOS_MYSQL_ARGS="-H ${DBHOST} -P ${DBPORT:-3306}"
+  NAGIOS_SLAVE_ARGS="${NAGIOS_MYSQL_ARGS}"
+else
+  DB_CONN_ARGS="--socket=/var/run/mysqld/mysqld.sock"
+  NAGIOS_MYSQL_ARGS="-s /var/run/mysqld/mysqld.sock"
+  NAGIOS_SLAVE_ARGS="-S /var/run/mysqld/mysqld.sock"
+fi
+
 # Wait for containers
-while ! mariadb-admin status --skip-ssl --socket=/var/run/mysqld/mysqld.sock -u${DBUSER} -p${DBPASS} --silent; do
+while ! mariadb-admin status --skip-ssl ${DB_CONN_ARGS} -u${DBUSER} -p${DBPASS} --silent; do
   echo "Waiting for SQL..."
   sleep 2
 done
@@ -239,7 +249,7 @@ external_checks() {
   diff_c=0
   THRESHOLD=${EXTERNAL_CHECKS_THRESHOLD}
   # Reduce error count by 2 after restarting an unhealthy container
-  GUID=$(mariadb --skip-ssl -u${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT version FROM versions WHERE application = 'GUID'" -BN)
+  GUID=$(mariadb --skip-ssl ${DB_CONN_ARGS} -u${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT version FROM versions WHERE application = 'GUID'" -BN)
   trap "[ ${err_count} -gt 1 ] && err_count=$(( ${err_count} - 2 ))" USR1
   while [ ${err_count} -lt ${THRESHOLD} ]; do
     err_c_cur=${err_count}
@@ -359,8 +369,8 @@ mysql_checks() {
   while [ ${err_count} -lt ${THRESHOLD} ]; do
     touch /tmp/mysql-mailcow; echo "$(tail -50 /tmp/mysql-mailcow)" > /tmp/mysql-mailcow
     err_c_cur=${err_count}
-    /usr/lib/nagios/plugins/check_mysql -f /etc/my.cnf.d/client.cnf -s /var/run/mysqld/mysqld.sock -u ${DBUSER} -p ${DBPASS} -d ${DBNAME} 2>> /tmp/mysql-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
-    /usr/lib/nagios/plugins/check_mysql_query -f /etc/my.cnf.d/client.cnf -s /var/run/mysqld/mysqld.sock -u ${DBUSER} -p ${DBPASS} -d ${DBNAME} -q "SELECT COUNT(*) FROM information_schema.tables" 2>> /tmp/mysql-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
+    /usr/lib/nagios/plugins/check_mysql -f /etc/my.cnf.d/client.cnf ${NAGIOS_MYSQL_ARGS} -u ${DBUSER} -p ${DBPASS} -d ${DBNAME} 2>> /tmp/mysql-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
+    /usr/lib/nagios/plugins/check_mysql_query -f /etc/my.cnf.d/client.cnf ${NAGIOS_MYSQL_ARGS} -u ${DBUSER} -p ${DBPASS} -d ${DBNAME} -q "SELECT COUNT(*) FROM information_schema.tables" 2>> /tmp/mysql-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
     [ ${err_c_cur} -eq ${err_count} ] && [ ! $((${err_count} - 1)) -lt 0 ] && err_count=$((${err_count} - 1)) diff_c=1
     [ ${err_c_cur} -ne ${err_count} ] && diff_c=$(( ${err_c_cur} - ${err_count} ))
     progress "MySQL/MariaDB" ${THRESHOLD} $(( ${THRESHOLD} - ${err_count} )) ${diff_c}
@@ -384,7 +394,7 @@ mysql_repl_checks() {
   while [ ${err_count} -lt ${THRESHOLD} ]; do
     touch /tmp/mysql_repl_checks; echo "$(tail -50 /tmp/mysql_repl_checks)" > /tmp/mysql_repl_checks
     err_c_cur=${err_count}
-    /usr/lib/nagios/plugins/check_mysql_slavestatus.sh -o /etc/my.cnf.d/client.cnf -S /var/run/mysqld/mysqld.sock -u root -p ${DBROOT} 2>> /tmp/mysql_repl_checks 1>&2; err_count=$(( ${err_count} + $? ))
+    /usr/lib/nagios/plugins/check_mysql_slavestatus.sh -o /etc/my.cnf.d/client.cnf ${NAGIOS_SLAVE_ARGS} -u root -p ${DBROOT} 2>> /tmp/mysql_repl_checks 1>&2; err_count=$(( ${err_count} + $? ))
     [ ${err_c_cur} -eq ${err_count} ] && [ ! $((${err_count} - 1)) -lt 0 ] && err_count=$((${err_count} - 1)) diff_c=1
     [ ${err_c_cur} -ne ${err_count} ] && diff_c=$(( ${err_c_cur} - ${err_count} ))
     progress "MySQL/MariaDB replication" ${THRESHOLD} $(( ${THRESHOLD} - ${err_count} )) ${diff_c}

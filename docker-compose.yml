@@ -117,7 +117,7 @@ services:
             - rspamd
 
     php-fpm-mailcow:
-      image: ghcr.io/mailcow/phpfpm:8.2.29-3
+      image: ghcr.io/mailcow/phpfpm:8.2.29-4
       command: "php-fpm -d date.timezone=${TZ} -d expose_php=0"
       depends_on:
         - redis-mailcow
@@ -156,6 +156,8 @@ services:
         - LOG_LINES=${LOG_LINES:-9999}
         - TZ=${TZ}
         - DBNAME=${DBNAME}
+        - DBHOST=${DBHOST:-}
+        - DBPORT=${DBPORT:-}
         - DBUSER=${DBUSER}
         - DBPASS=${DBPASS}
         - MAILCOW_HOSTNAME=${MAILCOW_HOSTNAME}
@@ -200,9 +202,11 @@ services:
             - phpfpm
 
     sogo-mailcow:
-      image: ghcr.io/mailcow/sogo:5.12.11-1
+      image: ghcr.io/mailcow/sogo:5.12.11-2
       environment:
         - DBNAME=${DBNAME}
+        - DBHOST=${DBHOST:-}
+        - DBPORT=${DBPORT:-}
         - DBUSER=${DBUSER}
         - DBPASS=${DBPASS}
         - TZ=${TZ}
@@ -252,7 +256,7 @@ services:
             - sogo
 
     dovecot-mailcow:
-      image: ghcr.io/mailcow/dovecot:2.3.21.1-2
+      image: ghcr.io/mailcow/dovecot:2.3.21.1-3
       depends_on:
         - mysql-mailcow
         - netfilter-mailcow
@@ -281,6 +285,8 @@ services:
         - DOVEADM_REPLICA_PORT=${DOVEADM_REPLICA_PORT:-}
         - LOG_LINES=${LOG_LINES:-9999}
         - DBNAME=${DBNAME}
+        - DBHOST=${DBHOST:-}
+        - DBPORT=${DBPORT:-}
         - DBUSER=${DBUSER}
         - DBPASS=${DBPASS}
         - TZ=${TZ}
@@ -339,7 +345,7 @@ services:
             - dovecot
 
     postfix-mailcow:
-      image: ghcr.io/mailcow/postfix:3.10.12-1
+      image: ghcr.io/mailcow/postfix:3.10.12-2
       depends_on:
         mysql-mailcow:
           condition: service_started
@@ -359,6 +365,8 @@ services:
         - LOG_LINES=${LOG_LINES:-9999}
         - TZ=${TZ}
         - DBNAME=${DBNAME}
+        - DBHOST=${DBHOST:-}
+        - DBPORT=${DBPORT:-}
         - DBUSER=${DBUSER}
         - DBPASS=${DBPASS}
         - REDIS_SLAVEOF_IP=${REDIS_SLAVEOF_IP:-}
@@ -465,7 +473,7 @@ services:
           condition: service_started
         unbound-mailcow:
           condition: service_healthy
-      image: ghcr.io/mailcow/acme:1.98
+      image: ghcr.io/mailcow/acme:1.99
       dns:
         - ${IPV4_NETWORK:-172.22.1}.254
       environment:
@@ -474,6 +482,8 @@ services:
         - AUTODISCOVER_SAN=${AUTODISCOVER_SAN:-y}
         - MAILCOW_HOSTNAME=${MAILCOW_HOSTNAME}
         - DBNAME=${DBNAME}
+        - DBHOST=${DBHOST:-}
+        - DBPORT=${DBPORT:-}
         - DBUSER=${DBUSER}
         - DBPASS=${DBPASS}
         - SKIP_LETS_ENCRYPT=${SKIP_LETS_ENCRYPT:-n}
@@ -526,7 +536,7 @@ services:
         - /lib/modules:/lib/modules:ro
 
     watchdog-mailcow:
-      image: ghcr.io/mailcow/watchdog:2.11
+      image: ghcr.io/mailcow/watchdog:2.12
       dns:
         - ${IPV4_NETWORK:-172.22.1}.254
       tmpfs:
@@ -548,6 +558,8 @@ services:
         - LOG_LINES=${LOG_LINES:-9999}
         - TZ=${TZ}
         - DBNAME=${DBNAME}
+        - DBHOST=${DBHOST:-}
+        - DBPORT=${DBPORT:-}
         - DBUSER=${DBUSER}
         - DBPASS=${DBPASS}
         - DBROOT=${DBROOT}

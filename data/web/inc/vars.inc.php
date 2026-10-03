@@ -11,6 +11,8 @@ This file will be reset on upgrades.
 $database_type = 'mysql';
 $database_sock = '/var/run/mysqld/mysqld.sock';
 $database_host = 'mysql';
+$database_tcp_host = getenv('DBHOST');
+$database_tcp_port = getenv('DBPORT') ?: 3306;
 $database_user = getenv('DBUSER');
 $database_pass = getenv('DBPASS');
 $database_name = getenv('DBNAME');

@@ -131,8 +131,14 @@ fi
 
 chmod 600 ${ACME_BASE}/key.pem
 
+if [[ -n "${DBHOST}" ]]; then
+  DB_CONN_ARGS="--protocol=tcp --host=${DBHOST} --port=${DBPORT:-3306}"
+else
+  DB_CONN_ARGS="--socket=/var/run/mysqld/mysqld.sock"
+fi
+
 log_f "Waiting for database..."
-while ! /usr/bin/mariadb-admin status --ssl=false --socket=/var/run/mysqld/mysqld.sock -u${DBUSER} -p${DBPASS} --silent > /dev/null; do
+while ! /usr/bin/mariadb-admin status --ssl=false ${DB_CONN_ARGS} -u${DBUSER} -p${DBPASS} --silent > /dev/null; do
   sleep 2
 done
 log_f "Database OK"
@@ -153,7 +159,7 @@ log_f "Resolver OK"
 log_f "Waiting for domain table..."
 while [[ -z ${DOMAIN_TABLE} ]]; do
   curl --silent http://nginx.${COMPOSE_PROJECT_NAME}_mailcow-network/ >/dev/null 2>&1
-  DOMAIN_TABLE=$(mariadb --skip-ssl --socket=/var/run/mysqld/mysqld.sock -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SHOW TABLES LIKE 'domain'" -Bs)
+  DOMAIN_TABLE=$(mariadb --skip-ssl ${DB_CONN_ARGS} -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SHOW TABLES LIKE 'domain'" -Bs)
   [[ -z ${DOMAIN_TABLE} ]] && sleep 10
 done
 log_f "OK" no_date
@@ -234,7 +240,7 @@ while true; do
 
   #########################################
   # IP and webroot challenge verification #
-  SQL_DOMAINS=$(mariadb --skip-ssl --socket=/var/run/mysqld/mysqld.sock -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT domain FROM domain WHERE backupmx=0 and active=1" -Bs)
+  SQL_DOMAINS=$(mariadb --skip-ssl ${DB_CONN_ARGS} -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT domain FROM domain WHERE backupmx=0 and active=1" -Bs)
   if [[ ! $? -eq 0 ]]; then
     log_f "Failed to read SQL domains, retrying in 1 minute..."
     sleep 1m
@@ -253,7 +259,7 @@ while true; do
   unset MTA_STS_ACTIVE_DOMAINS
   declare -A MTA_STS_ACTIVE_DOMAINS
   if [[ ${AUTODISCOVER_SAN} == "y" ]]; then
-    SQL_MTA_STS_DOMAINS=$(mariadb --skip-ssl --socket=/var/run/mysqld/mysqld.sock -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT domain FROM mta_sts WHERE active = 1" -Bs)
+    SQL_MTA_STS_DOMAINS=$(mariadb --skip-ssl ${DB_CONN_ARGS} -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT domain FROM mta_sts WHERE active = 1" -Bs)
     if [[ $? -eq 0 ]]; then
       while read mta_sts_domain; do
         if [[ -z "${mta_sts_domain}" ]]; then
@@ -295,7 +301,7 @@ while true; do
 
   # Fetch alias domains where target domain has MTA-STS enabled
   if [[ ${AUTODISCOVER_SAN} == "y" ]]; then
-    SQL_ALIAS_DOMAINS=$(mariadb --skip-ssl --socket=/var/run/mysqld/mysqld.sock -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT ad.alias_domain FROM alias_domain ad INNER JOIN mta_sts m ON ad.target_domain = m.domain WHERE ad.active = 1 AND m.active = 1" -Bs)
+    SQL_ALIAS_DOMAINS=$(mariadb --skip-ssl ${DB_CONN_ARGS} -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT ad.alias_domain FROM alias_domain ad INNER JOIN mta_sts m ON ad.target_domain = m.domain WHERE ad.active = 1 AND m.active = 1" -Bs)
     if [[ $? -eq 0 ]]; then
       while read alias_domain; do
         if [[ -z "${alias_domain}" ]]; then
