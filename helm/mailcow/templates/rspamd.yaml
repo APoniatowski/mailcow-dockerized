@@ -1,0 +1,97 @@
+{{- $c := "rspamd" }}
+{{- $v := .Values.rspamd }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mailcow.fullname" . }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+        {{- include "mailcow.sharedLabel" . | nindent 8 }}
+      annotations:
+        {{- include "mailcow.podAnnotations" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      # worker-proxy binds "rspamd:9900": the hostname maps to the pod IP in /etc/hosts
+      hostname: rspamd
+      terminationGracePeriodSeconds: {{ $v.terminationGracePeriodSeconds }}
+      {{- include "mailcow.dnsUnbound" . | nindent 6 }}
+      {{- include "mailcow.podCommon" (dict "root" . "shared" true) | nindent 6 }}
+      initContainers:
+        {{- $slices := list "hooks/rspamd" "conf/rspamd/override.d" "conf/rspamd/local.d" "conf/rspamd/plugins.d" "conf/rspamd/lua" "conf/rspamd/rspamd.conf.local" "conf/rspamd/rspamd.conf.override" }}
+        {{- $shared := list (dict "dir" "rspamd-custom" "src" "conf/rspamd/custom") (dict "dir" "rspamd-vol") }}
+        {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "touch" (list "rspamd-override/worker-controller-password.inc")) | nindent 8 }}
+      containers:
+        - name: rspamd-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          env:
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+            - name: IPV4_NETWORK
+              value: {{ .Values.mailcow.ipv4Network | quote }}
+            - name: IPV6_NETWORK
+              value: {{ .Values.mailcow.ipv6Network | quote }}
+            {{- include "mailcow.env.redis" . | nindent 12 }}
+            - name: SPAMHAUS_DQS_KEY
+              value: {{ .Values.mailcow.spamhausDqsKey | quote }}
+            # P1.3 / P1.2 (opt-in env, read once the rspamd image change lands)
+            - name: MAILCOW_NETWORKS
+              value: {{ include "mailcow.networks" . | quote }}
+            - name: RSPAMD_BCC_HOST
+              value: postfix-mailcow
+          ports:
+            - name: normal
+              containerPort: 11333
+            - name: controller
+              containerPort: 11334
+            - name: proxy
+              containerPort: 9900
+            - name: fuzzy
+              containerPort: 11445
+          {{- include "mailcow.tcpProbes" (dict "port" 11334 "startup" 90) | nindent 10 }}
+          volumeMounts:
+            {{- include "mailcow.hooksMount" "rspamd" | nindent 12 }}
+            - name: shared
+              subPath: rspamd-custom
+              mountPath: /etc/rspamd/custom
+            - name: seed
+              subPath: conf/rspamd/override.d
+              mountPath: /etc/rspamd/override.d
+            # rspamd UI password (dockerapi rspamd/worker_password writes it, then restarts = deletes the pod)
+            - name: shared
+              subPath: rspamd-override/worker-controller-password.inc
+              mountPath: /etc/rspamd/override.d/worker-controller-password.inc
+            - name: seed
+              subPath: conf/rspamd/local.d
+              mountPath: /etc/rspamd/local.d
+            - name: seed
+              subPath: conf/rspamd/plugins.d
+              mountPath: /etc/rspamd/plugins.d
+            - name: seed
+              subPath: conf/rspamd/lua
+              mountPath: /etc/rspamd/lua/
+              readOnly: true
+            - name: seed
+              subPath: conf/rspamd/rspamd.conf.local
+              mountPath: /etc/rspamd/rspamd.conf.local
+            - name: seed
+              subPath: conf/rspamd/rspamd.conf.override
+              mountPath: /etc/rspamd/rspamd.conf.override
+            # rspamd-vol-1: rspamd.sock is used by php-fpm/dovecot/postfix (same node)
+            - name: shared
+              subPath: rspamd-vol
+              mountPath: /var/lib/rspamd
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      volumes:
+        {{- include "mailcow.seedVolumes" (dict "root" . "shared" true) | nindent 8 }}

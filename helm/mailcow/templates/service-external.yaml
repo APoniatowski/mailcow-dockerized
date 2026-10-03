@@ -1,0 +1,136 @@
+{{- /*
+External mail entry point: one Service selecting postfix AND dovecot pods. Target ports are
+container port *names*; each pod only provides its own names, so every port's endpoints contain
+just the right pod and both protocols share one load balancer IP.
+*/ -}}
+{{- $root := . }}
+{{- $pp := .Values.mail.proxyProtocol }}
+{{- $ms := .Values.mail.service }}
+{{- $ports := list
+  (list "smtp" 25 "smtp" "smtp-pp")
+  (list "smtps" 465 "smtps" "smtps-pp")
+  (list "submission" 587 "submission" "subm-pp")
+  (list "imap" 143 "imap" "imap-pp")
+  (list "imaps" 993 "imaps" "imaps-pp")
+  (list "sieve" 4190 "sieve" "sieve-pp") }}
+{{- if .Values.mail.pop3 }}
+{{- $ports = concat $ports (list (list "pop3" 110 "pop3" "pop3-pp") (list "pop3s" 995 "pop3s" "pop3s-pp")) }}
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mailcow.fullname" . }}-mail
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" "mail") | nindent 4 }}
+  {{- with $ms.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $ms.type }}
+  externalTrafficPolicy: {{ $ms.externalTrafficPolicy | default (ternary "Cluster" "Local" $pp) }}
+  {{- with $ms.loadBalancerClass }}
+  loadBalancerClass: {{ . }}
+  {{- end }}
+  {{- with $ms.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- with $ms.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    app.kubernetes.io/name: {{ include "mailcow.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    mailcow.email/mail-ingress: "true"
+  ports:
+    {{- range $ports }}
+    - name: {{ index . 0 }}
+      port: {{ index . 1 }}
+      targetPort: {{ ternary (index . 3) (index . 2) $pp }}
+      protocol: TCP
+      {{- with (get $ms.nodePorts (index . 0)) }}
+      nodePort: {{ . }}
+      {{- end }}
+    {{- end }}
+{{- if .Values.http.service.enabled }}
+{{- $hs := .Values.http.service }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mailcow.fullname" . }}-http
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" "nginx") | nindent 4 }}
+  {{- with $hs.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $hs.type }}
+  {{- with $hs.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+  {{- with $hs.loadBalancerClass }}
+  loadBalancerClass: {{ . }}
+  {{- end }}
+  {{- with $hs.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  selector:
+    {{- include "mailcow.selectorLabels" (dict "root" . "component" "nginx") | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+      {{- with $hs.nodePorts.http }}
+      nodePort: {{ . }}
+      {{- end }}
+    - name: https
+      port: 443
+      targetPort: https
+      protocol: TCP
+      {{- with $hs.nodePorts.https }}
+      nodePort: {{ . }}
+      {{- end }}
+{{- end }}
+{{- if .Values.http.ingress.enabled }}
+{{- $ing := .Values.http.ingress }}
+{{- $domain := regexReplaceAll "^[^.]+\\." .Values.mailcow.hostname "" }}
+{{- $hosts := $ing.hosts | default (list .Values.mailcow.hostname (printf "autodiscover.%s" $domain) (printf "autoconfig.%s" $domain)) }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "mailcow.fullname" . }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" "nginx") | nindent 4 }}
+  {{- with $ing.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with $ing.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if $ing.tls.enabled }}
+  tls:
+    - hosts:
+        {{- toYaml $hosts | nindent 8 }}
+      secretName: {{ $ing.tls.secretName | default (printf "%s-ingress-tls" (include "mailcow.fullname" .)) }}
+  {{- end }}
+  rules:
+    {{- range $hosts }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nginx-mailcow
+                port:
+                  name: http
+    {{- end }}
+{{- end }}

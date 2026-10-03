@@ -1,0 +1,56 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- /* v0.1: only the sensitive internal ports; everything else stays open. */ -}}
+{{- $root := . }}
+{{- range list (list "mysql" 3306) (list "redis" 6379) }}
+{{- $c := index . 0 }}{{ $port := index . 1 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "mailcow.fullname" $root }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" $root "component" $c) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" $root "component" $c) | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector: {}
+        {{- if and (eq $c "redis") $root.Values.netfilter.enabled }}
+        {{- range $root.Values.networkPolicy.nodeCIDRs }}
+        # hostNetwork netfilter DaemonSet connects from node addresses
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+        {{- end }}
+      ports:
+        - port: {{ $port }}
+          protocol: TCP
+{{- end }}
+---
+# dovecot: doveadm (12345) only from this namespace; every other dovecot port stays reachable.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "mailcow.fullname" . }}-dovecot
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" "dovecot") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" "dovecot") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 12345
+          protocol: TCP
+    - ports:
+        {{- range list 143 993 110 995 4190 24 10001 10143 10993 10110 10995 14190 }}
+        - port: {{ . }}
+          protocol: TCP
+        {{- end }}
+{{- end }}

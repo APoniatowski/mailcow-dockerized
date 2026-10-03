@@ -1,0 +1,123 @@
+{{- if .Values.cronjobs.enabled }}
+{{- /*
+ofelia job-exec labels from docker-compose.yml -> CronJobs running `kubectl exec` into the
+component's main container (the exec'd process gets the container env, like `docker exec`, so
+the [[ $MASTER == y ]] guards keep working). Seconds field dropped; "@every 24h" -> daily.
+[job name, workload kind/name suffix, container, command]
+*/ -}}
+{{- $root := . }}
+{{- $fullname := include "mailcow.fullname" . }}
+{{- $name := printf "%s-cron" $fullname }}
+{{- $jobs := list
+  (list "phpfpm-keycloak-sync" "deployment" "php-fpm" "php /crons/keycloak-sync.php || exit 0")
+  (list "phpfpm-ldap-sync" "deployment" "php-fpm" "php /crons/ldap-sync.php || exit 0")
+  (list "sogo-sessions" "deployment" "sogo" "[[ ${MASTER} == y ]] && /usr/local/bin/gosu sogo /usr/sbin/sogo-tool -v expire-sessions ${SOGO_EXPIRE_SESSION} || exit 0")
+  (list "sogo-ealarms" "deployment" "sogo" "[[ ${MASTER} == y ]] && /usr/local/bin/gosu sogo /usr/sbin/sogo-ealarms-notify -p /etc/sogo/cron.creds || exit 0")
+  (list "sogo-eautoreply" "deployment" "sogo" "[[ ${MASTER} == y ]] && /usr/local/bin/gosu sogo /usr/sbin/sogo-tool update-autoreply -p /etc/sogo/sieve.creds || exit 0")
+  (list "sogo-backup" "deployment" "sogo" "[[ ${MASTER} == y ]] && /usr/local/bin/gosu sogo /usr/sbin/sogo-tool backup /sogo_backup ALL || exit 0")
+  (list "dovecot-imapsync-runner" "statefulset" "dovecot" "[[ ${MASTER} == y ]] && /usr/local/bin/gosu nobody /usr/local/bin/imapsync_runner.pl || exit 0")
+  (list "dovecot-trim-logs" "statefulset" "dovecot" "[[ ${MASTER} == y ]] && /usr/local/bin/gosu vmail /usr/local/bin/trim_logs.sh || exit 0")
+  (list "dovecot-quarantine" "statefulset" "dovecot" "[[ ${MASTER} == y ]] && /usr/local/bin/gosu vmail /usr/local/bin/quarantine_notify.py || exit 0")
+  (list "dovecot-clean-q-aged" "statefulset" "dovecot" "[[ ${MASTER} == y ]] && /usr/local/bin/gosu vmail /usr/local/bin/clean_q_aged.sh || exit 0")
+  (list "dovecot-maildir-gc" "statefulset" "dovecot" "source /source_env.sh ; /usr/local/bin/gosu vmail /usr/local/bin/maildir_gc.sh")
+  (list "dovecot-sarules" "statefulset" "dovecot" "/usr/local/bin/sa-rules.sh")
+  (list "dovecot-fts" "statefulset" "dovecot" "/usr/local/bin/gosu vmail /usr/local/bin/optimize-fts.sh")
+  (list "dovecot-repl-health" "statefulset" "dovecot" "/usr/local/bin/gosu vmail /usr/local/bin/repl_health.sh") }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" "cron") | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" "cron") | nindent 4 }}
+rules:
+  # `kubectl exec deployment/x` resolves the workload's selector, then picks a pod
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" "cron") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+{{- range $jobs }}
+{{- $job := index . 0 }}{{ $kind := index . 1 }}{{ $comp := index . 2 }}{{ $cmd := index . 3 }}
+{{- $cfg := index $root.Values.cronjobs.jobs $job | default dict }}
+{{- if and (ne (toString $cfg.enabled) "false") (not (and (eq $comp "sogo") $root.Values.skip.sogo)) }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $fullname }}-{{ $job }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" $root "component" "cron") | nindent 4 }}
+    mailcow.email/cron-target: {{ $comp }}
+spec:
+  schedule: {{ $cfg.schedule | quote }}
+  timeZone: {{ $root.Values.mailcow.tz | quote }}
+  # ofelia no-overlap
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: {{ $root.Values.cronjobs.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ $root.Values.cronjobs.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: {{ $root.Values.cronjobs.ttlSecondsAfterFinished }}
+      template:
+        metadata:
+          labels:
+            {{- include "mailcow.selectorLabels" (dict "root" $root "component" "cron") | nindent 12 }}
+            mailcow.email/cron-job: {{ $job }}
+        spec:
+          serviceAccountName: {{ $name }}
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+          {{- include "mailcow.podCommon" (dict "root" $root) | nindent 10 }}
+          containers:
+            - name: kubectl
+              image: {{ include "mailcow.image" $root.Values.cronjobs.image }}
+              imagePullPolicy: {{ $root.Values.cronjobs.image.pullPolicy }}
+              args:
+                - exec
+                - {{ printf "%s/%s-%s" $kind $fullname $comp }}
+                - -c
+                - {{ printf "%s-mailcow" $comp }}
+                - --
+                - /bin/bash
+                - -c
+                - {{ $cmd | quote }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,135 @@
+{{- $fullname := include "mailcow.fullname" . }}
+{{- $domain := regexReplaceAll "^[^.]+\\." .Values.mailcow.hostname "" }}
+{{- if and (not .Values.acme.enabled) .Values.tls.certManager.enabled }}
+{{- $cm := .Values.tls.certManager }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "mailcow.commonLabels" . | nindent 4 }}
+spec:
+  secretName: {{ include "mailcow.tlsSecretName" . }}
+  commonName: {{ .Values.mailcow.hostname }}
+  dnsNames:
+    {{- toYaml ($cm.dnsNames | default (list .Values.mailcow.hostname (printf "autodiscover.%s" $domain) (printf "autoconfig.%s" $domain))) | nindent 4 }}
+  {{- with $cm.duration }}
+  duration: {{ . }}
+  {{- end }}
+  {{- with $cm.renewBefore }}
+  renewBefore: {{ . }}
+  {{- end }}
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    rotationPolicy: Always
+  issuerRef:
+    {{- toYaml $cm.issuerRef | nindent 4 }}
+{{- else if include "mailcow.tlsSelfSigned" . }}
+{{- /*
+Self-signed bootstrap (like generate_config.sh's snake-oil): a pre-install/pre-upgrade hook Job
+creates <fullname>-tls once. openssl + curl from the files image; POSTs the Secret to the API
+and treats 409 (already exists) as success, so upgrades never replace it.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}-tls-bootstrap
+  labels:
+    {{- include "mailcow.commonLabels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-tls-bootstrap
+  labels:
+    {{- include "mailcow.commonLabels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-tls-bootstrap
+  labels:
+    {{- include "mailcow.commonLabels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-9"
+    helm.sh/hook-delete-policy: before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-tls-bootstrap
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fullname }}-tls-bootstrap
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $fullname }}-tls-bootstrap
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" "tls-bootstrap") | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.selectorLabels" (dict "root" . "component" "tls-bootstrap") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ $fullname }}-tls-bootstrap
+      {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
+      containers:
+        - name: tls-bootstrap
+          image: {{ include "mailcow.filesImage" . }}
+          imagePullPolicy: {{ .Values.files.image.pullPolicy }}
+          env:
+            - name: SECRET_NAME
+              value: {{ include "mailcow.tlsSecretName" . }}
+            - name: CN
+              value: {{ .Values.mailcow.hostname | quote }}
+            - name: SAN
+              value: {{ printf "DNS:%s,DNS:autodiscover.%s,DNS:autoconfig.%s" .Values.mailcow.hostname $domain $domain | quote }}
+            - name: DAYS
+              value: {{ .Values.tls.selfSigned.days | quote }}
+            - name: BITS
+              value: {{ .Values.tls.selfSigned.keySize | quote }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              SA=/var/run/secrets/kubernetes.io/serviceaccount
+              NS=$(cat $SA/namespace)
+              cd /tmp
+              openssl req -x509 -newkey rsa:${BITS} -keyout key.pem -out cert.pem -days ${DAYS} \
+                -subj "/C=DE/ST=NRW/L=Willich/O=mailcow/OU=mailcow/CN=${CN}" -addext "subjectAltName=${SAN}" -sha256 -nodes
+              printf '{"apiVersion":"v1","kind":"Secret","type":"kubernetes.io/tls","metadata":{"name":"%s","labels":{"app.kubernetes.io/part-of":"mailcow"}},"data":{"tls.crt":"%s","tls.key":"%s"}}' \
+                "$SECRET_NAME" "$(base64 cert.pem | tr -d '\n')" "$(base64 key.pem | tr -d '\n')" > secret.json
+              code=$(curl -sS -o resp.json -w '%{http_code}' --cacert $SA/ca.crt \
+                -H "Authorization: Bearer $(cat $SA/token)" -H 'Content-Type: application/json' \
+                -X POST --data @secret.json "https://kubernetes.default.svc/api/v1/namespaces/${NS}/secrets")
+              case "$code" in
+                201) echo "created Secret ${SECRET_NAME}" ;;
+                409) echo "Secret ${SECRET_NAME} exists, keeping it" ;;
+                *) echo "API returned ${code}"; cat resp.json; exit 1 ;;
+              esac
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+{{- end }}

@@ -1,0 +1,67 @@
+{{- if .Values.netfilter.enabled }}
+{{- $c := "netfilter" }}
+{{- $v := .Values.netfilter }}
+{{- $m := .Values.mailcow }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "mailcow.fullname" . }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      # compose: network_mode host + privileged
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: {{ $v.terminationGracePeriodSeconds }}
+      {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
+      containers:
+        - name: netfilter-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          securityContext:
+            {{- if $v.privileged }}
+            privileged: true
+            {{- else }}
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]
+            {{- end }}
+          env:
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+            - name: IPV4_NETWORK
+              value: {{ $m.ipv4Network | quote }}
+            - name: IPV6_NETWORK
+              value: {{ $m.ipv6Network | quote }}
+            - name: SNAT_TO_SOURCE
+              value: "n"
+            - name: SNAT6_TO_SOURCE
+              value: "n"
+            {{- include "mailcow.env.redis" . | nindent 12 }}
+            - name: MAILCOW_REPLICA_IP
+              value: ""
+            - name: DISABLE_NETFILTER_ISOLATION_RULE
+              value: {{ $v.disableIsolationRule | quote }}
+            # P1.2 / P1.3 (opt-in env, read once the netfilter image change lands)
+            - name: REDIS_HOST
+              value: redis-mailcow
+            - name: MAILCOW_NETWORKS
+              value: {{ include "mailcow.networks" . | quote }}
+          volumeMounts:
+            - name: modules
+              mountPath: /lib/modules
+              readOnly: true
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      volumes:
+        - name: modules
+          hostPath:
+            path: /lib/modules
+{{- end }}

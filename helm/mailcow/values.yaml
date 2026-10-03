@@ -1,0 +1,540 @@
+# Default values for the mailcow chart.
+# Keys under `mailcow:` mirror mailcow.conf names in camelCase (MAILCOW_HOSTNAME -> mailcow.hostname).
+# Defaults follow docker-compose.yml (`${VAR:-default}`), not generate_config.sh, unless noted.
+# One release per namespace: Services are named exactly like the compose aliases and
+# container names (mysql, mysql-mailcow, ...) because mailcow code addresses them that way.
+
+# -- Override the chart name used in object names.
+nameOverride: ""
+# -- Override the full name (<release>-<chart>) used as prefix for workloads, PVCs, ConfigMaps.
+fullnameOverride: ""
+
+# -- Existing Secret holding DBPASS, DBROOT, REDISPASS, API_KEY, API_KEY_READ_ONLY,
+# SOGO_URL_ENCRYPTION_KEY, SOGO_ENCRYPTION_KEY, SOGO_SSO_PASS, DOVECOT_MASTER_USER, DOVECOT_MASTER_PASS.
+# Empty: the chart creates `<release>-secrets` with random values once and keeps them on upgrade (lookup).
+existingSecret: ""
+
+# -- Kubernetes cluster DNS domain (search domains of pods that resolve through unbound).
+clusterDomain: cluster.local
+# -- ClusterIP of kube-dns/CoreDNS. unbound forwards `clusterDomain` there (kind/kubeadm default 10.96.0.10).
+clusterDNS: 10.96.0.10
+
+# -- Image pull secrets for every pod.
+imagePullSecrets: []
+
+# -- Scheduling defaults applied to every mailcow pod.
+podDefaults:
+  # -- nodeSelector for every pod.
+  nodeSelector: {}
+  # -- tolerations for every pod.
+  tolerations: []
+  # -- Extra pod annotations for every pod.
+  annotations: {}
+
+mailcow:
+  # -- MAILCOW_HOSTNAME: FQDN of the mail server (MX/IMAP/web).
+  hostname: mail.example.org
+  # -- TZ: time zone for every container and for CronJob schedules.
+  tz: Etc/UTC
+  # -- MAILCOW_PASS_SCHEME: password hash algorithm.
+  passScheme: BLF-CRYPT
+  # -- DBNAME
+  dbName: mailcow
+  # -- DBUSER
+  dbUser: mailcow
+  # -- COMPOSE_PROJECT_NAME: php-fpm matches dockerapi containers by this project label;
+  # the dockerapi kubernetes backend reports it for every pod.
+  composeProjectName: mailcowdockerized
+  # -- ADDITIONAL_SERVER_NAMES (comma separated) for nginx.
+  additionalServerNames: ""
+  # -- ACL_ANYONE
+  aclAnyone: disallow
+  # -- MAILDIR_GC_TIME (minutes)
+  maildirGcTime: "7200"
+  # -- MAILDIR_SUB (compose default empty; generate_config.sh writes Maildir).
+  maildirSub: ""
+  # -- SOGO_EXPIRE_SESSION (minutes)
+  sogoExpireSession: "480"
+  # -- ALLOW_ADMIN_EMAIL_LOGIN y/n
+  allowAdminEmailLogin: "n"
+  # -- WEBAUTHN_ONLY_TRUSTED_VENDORS y/n
+  webauthnOnlyTrustedVendors: "n"
+  # -- LOG_LINES kept in Redis per log list.
+  logLines: "9999"
+  # -- IPV4_NETWORK: compose subnet prefix. Still read by images for trust decisions until
+  # MAILCOW_NETWORKS/SOGO_TRUSTED_NETS (P1.3) and host overrides (P1.2) land.
+  ipv4Network: 172.22.1
+  # -- IPV6_NETWORK
+  ipv6Network: fd4d:6169:6c63:6f77::/64
+  # -- ENABLE_IPV6 for nginx listeners. Most clusters are single-stack IPv4, so false here (compose: true).
+  enableIpv6: "false"
+  # -- HTTP_PORT nginx listens on inside the pod.
+  httpPort: "80"
+  # -- HTTPS_PORT nginx listens on inside the pod.
+  httpsPort: "443"
+  # -- HTTP_REDIRECT y/n (keep n when an Ingress terminates TLS and talks plain HTTP to nginx).
+  httpRedirect: "n"
+  # -- Client-facing ports shown in the UI / autoconfig (SMTP_PORT, SMTPS_PORT, ...).
+  smtpPort: "25"
+  # -- SMTPS_PORT
+  smtpsPort: "465"
+  # -- SUBMISSION_PORT
+  submissionPort: "587"
+  # -- IMAP_PORT
+  imapPort: "143"
+  # -- IMAPS_PORT
+  imapsPort: "993"
+  # -- POP_PORT
+  popPort: "110"
+  # -- POPS_PORT
+  popsPort: "995"
+  # -- SIEVE_PORT
+  sievePort: "4190"
+  # -- API_ALLOW_FROM: comma separated IPs/CIDRs allowed to use API_KEY/API_KEY_READ_ONLY ("invalid" = API off).
+  apiAllowFrom: invalid
+  # -- MASTER y/n (CronJob tasks are guarded by it exactly like the ofelia jobs).
+  master: "y"
+  # -- DEV_MODE y/n
+  devMode: "n"
+  # -- DEMO_MODE y/n
+  demoMode: "n"
+  # -- CLUSTERMODE
+  clustermode: ""
+  # -- FTS_HEAP (MB)
+  ftsHeap: "512"
+  # -- FTS_PROCS
+  ftsProcs: "3"
+  # -- SPAMHAUS_DQS_KEY
+  spamhausDqsKey: ""
+  # -- TRUSTED_PROXIES (comma separated) nginx accepts X-Forwarded-For from, e.g. the Ingress controller pod CIDR.
+  trustedProxies: ""
+  # -- NGINX_USE_PROXY_PROTOCOL y/n (when an L4 load balancer sends PROXY protocol to nginx).
+  nginxUseProxyProtocol: "n"
+  # -- REDIS_SLAVEOF_IP
+  redisSlaveofIp: ""
+  # -- REDIS_SLAVEOF_PORT
+  redisSlaveofPort: ""
+  # -- REDISMASTERPASS
+  redisMasterPass: ""
+  # -- MAILCOW_NETWORKS (P1.3): CIDRs mailcow trusts as "internal" (postfix mynetworks, rspamd local_addrs,
+  # dovecot trusted maps). Set it to your cluster POD CIDR only (kind default 10.244.0.0/16).
+  # Never include node or load balancer ranges: SNAT'd external clients would become trusted relays.
+  networks: 10.244.0.0/16
+  # -- SOGO_TRUSTED_NETS (P1.3): CIDRs dovecot accepts SOGo SSO/plaintext auth from. Empty = `networks`.
+  sogoTrustedNets: ""
+  # -- DOVECOT_MASTER_USER override (otherwise generated into the release Secret, P1.4 stable sieve creds).
+  dovecotMasterUser: ""
+
+# Compose SKIP_* switches. true = SKIP_*=y everywhere and the component's workload is not rendered
+# (its Services stay, so connections fail fast like against the sleeping compose container).
+skip:
+  # -- SKIP_CLAMD
+  clamd: false
+  # -- SKIP_OLEFY
+  olefy: false
+  # -- SKIP_SOGO
+  sogo: false
+  # -- SKIP_FTS (compose default y)
+  fts: true
+  # -- SKIP_UNBOUND_HEALTHCHECK (the image's ping/dig loop; the chart probes unbound over TCP anyway)
+  unboundHealthcheck: false
+
+# Files image: data/web, data/conf, data/assets, data/hooks of one mailcow release.
+# Build: docker build -f helm/mailcow/files-image/Dockerfile -t <repo>:<tag> . (from the repo root)
+files:
+  image:
+    # -- Files image repository.
+    repository: ghcr.io/mailcow/mailcow-files
+    # -- Files image tag (default: Chart appVersion).
+    tag: ""
+    # -- Pull policy.
+    pullPolicy: IfNotPresent
+
+# -- User overrides copied over the files image slice after the base copy, keyed by path relative to
+# the repo's data/ directory. Works for paths inside a slice a pod mounts (conf/postfix, conf/dovecot,
+# conf/nginx, conf/rspamd/{local.d,override.d,...}, conf/sogo, web/inc/vars.local.inc.php, hooks/<svc>/...).
+# Files under hooks/ are made executable.
+extraFiles: {}
+  # conf/postfix/extra.cf: |
+  #   smtpd_banner = $myhostname ESMTP
+  # conf/dovecot/extra.conf: |
+  #   mail_max_userip_connections = 50
+  # conf/nginx/site.custom.custom: |
+  #   location /foo { return 204; }
+
+persistence:
+  # -- Default storageClass for every PVC ("" = cluster default).
+  storageClass: ""
+  # -- Annotate data PVCs with helm.sh/resource-policy=keep so `helm uninstall` does not delete mail.
+  keep: true
+  # -- vmail-vol-1 (/var/vmail on dovecot). Back it up.
+  vmail:
+    size: 20Gi
+    accessMode: ReadWriteOnce
+    existingClaim: ""
+  # -- vmail-index-vol-1 (/var/vmail_index on dovecot).
+  vmailIndex:
+    size: 5Gi
+    accessMode: ReadWriteOnce
+    existingClaim: ""
+  # -- mysql-vol-1
+  mysql:
+    size: 5Gi
+    accessMode: ReadWriteOnce
+    existingClaim: ""
+  # -- redis-vol-1
+  redis:
+    size: 1Gi
+    accessMode: ReadWriteOnce
+    existingClaim: ""
+  # -- postfix-vol-1 (queue). Also mounted by watchdog (same node).
+  postfix:
+    size: 2Gi
+    accessMode: ReadWriteOnce
+    existingClaim: ""
+  # -- postfix-tlspol-vol-1
+  postfixTlspol:
+    size: 256Mi
+    accessMode: ReadWriteOnce
+    existingClaim: ""
+  # -- crypt-vol-1 (mail_crypt keypair). Losing it makes all mail unreadable. Back it up.
+  crypt:
+    size: 64Mi
+    accessMode: ReadWriteOnce
+    existingClaim: ""
+  # -- clamd-db-vol-1 (signatures; not created when skip.clamd).
+  clamdDb:
+    size: 2Gi
+    accessMode: ReadWriteOnce
+    existingClaim: ""
+  # -- sogo-userdata-backup-vol-1
+  sogoBackup:
+    size: 1Gi
+    accessMode: ReadWriteOnce
+    existingClaim: ""
+  # -- Cross-pod config/state dirs (subPaths): rspamd-custom, rspamd-vol (rspamd.sock + rspamd state),
+  # rspamd-override (controller password), sogo-conf (+ creds), sogo-sso, global-sieve, ssl + acme-challenge (acme on).
+  # ReadWriteMany for multi-node. ReadWriteOnce works only with every pod on one node: the chart then adds a
+  # required podAffinity so all pods mounting it co-locate. rspamd.sock is a unix socket: even with RWX
+  # its users must share a node (phase 3 moves the controller to TCP).
+  shared:
+    size: 1Gi
+    accessMode: ReadWriteMany
+    storageClass: ""
+    existingClaim: ""
+
+# Mail ports (postfix + dovecot) behind one Service selecting both pods via named target ports.
+mail:
+  # -- Map external 25/465/587/143/993/110/995/4190 to the PROXY-protocol listeners
+  # (10025/10465/10587/10143/10993/10110/10995/14190) so postfix/dovecot see real client IPs.
+  # Your load balancer must send PROXY v1/v2 (e.g. AWS NLB proxy_protocol_v2, MetalLB+haproxy, ...).
+  # false: plain ports + externalTrafficPolicy Local (client IP preserved only on the node that has the pod).
+  proxyProtocol: true
+  # -- Source networks dovecot accepts PROXY headers from (haproxy_trusted_networks, space separated).
+  # Must cover the load balancer / node addresses the PROXY connections come from.
+  proxyTrustedNetworks: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10"
+  # -- Expose POP3/POP3S too.
+  pop3: true
+  service:
+    # -- Service type for mail ports (LoadBalancer, NodePort).
+    type: LoadBalancer
+    # -- Annotations (cloud LB settings, e.g. service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: "*").
+    annotations: {}
+    # -- loadBalancerClass
+    loadBalancerClass: ""
+    # -- Requested load balancer IP (provider specific).
+    loadBalancerIP: ""
+    # -- loadBalancerSourceRanges
+    loadBalancerSourceRanges: []
+    # -- externalTrafficPolicy override ("" = Cluster with proxyProtocol, Local without).
+    externalTrafficPolicy: ""
+    # -- Fixed nodePorts (NodePort/LoadBalancer), keyed smtp/smtps/submission/imap/imaps/pop3/pop3s/sieve.
+    nodePorts: {}
+
+http:
+  service:
+    # -- Expose nginx with its own Service (besides the in-cluster `nginx`/`nginx-mailcow` ClusterIPs).
+    enabled: true
+    # -- LoadBalancer or NodePort.
+    type: LoadBalancer
+    # -- Annotations.
+    annotations: {}
+    # -- loadBalancerClass
+    loadBalancerClass: ""
+    # -- loadBalancerIP
+    loadBalancerIP: ""
+    # -- externalTrafficPolicy (Local keeps client IPs for nginx/rspamd UI/fail2ban).
+    externalTrafficPolicy: Local
+    # -- Fixed nodePorts keyed http/https.
+    nodePorts: {}
+  ingress:
+    # -- Create an Ingress to nginx (plain HTTP backend on httpPort; keep mailcow.httpRedirect n).
+    enabled: false
+    # -- ingressClassName
+    className: ""
+    # -- Annotations, e.g. cert-manager.io/cluster-issuer: letsencrypt.
+    annotations: {}
+    # -- Hosts (default: mailcow.hostname + autodiscover/autoconfig of its domain).
+    hosts: []
+    tls:
+      # -- Add a TLS section.
+      enabled: true
+      # -- Secret for the Ingress certificate (default <fullname>-ingress-tls; cert-manager ingress-shim fills it).
+      secretName: ""
+
+# Certificate mounted at /etc/ssl/mail (cert.pem, key.pem, dhparams.pem) in postfix, dovecot, nginx.
+# Precedence: acme.enabled > tls.certManager.enabled > tls.existingSecret > self-signed bootstrap Job.
+tls:
+  # -- Existing kubernetes.io/tls Secret (tls.crt/tls.key).
+  existingSecret: ""
+  certManager:
+    # -- Create a cert-manager Certificate into <fullname>-tls.
+    enabled: false
+    # -- Issuer reference.
+    issuerRef:
+      name: letsencrypt
+      kind: ClusterIssuer
+      group: cert-manager.io
+    # -- dnsNames (default: hostname, autodiscover.<domain>, autoconfig.<domain>).
+    dnsNames: []
+    # -- Certificate duration.
+    duration: ""
+    # -- renewBefore.
+    renewBefore: ""
+  selfSigned:
+    # -- Validity of the bootstrap snake-oil certificate (generate_config.sh uses 365).
+    days: 365
+    # -- RSA key size (generate_config.sh uses 4096).
+    keySize: 4096
+
+# Images default to docker-compose.yml tags (scripts/check-tags.sh keeps them in sync).
+unbound:
+  image:
+    repository: ghcr.io/mailcow/unbound
+    tag: "1.26.1-1"
+    pullPolicy: IfNotPresent
+  # -- Fixed ClusterIP of the `unbound` Service; pods that used `dns: .254` in compose use it as nameserver.
+  # MUST be inside your cluster's service CIDR and unused (kind/kubeadm 10.96.0.0/12 -> 10.96.53.53 is fine).
+  clusterIP: 10.96.53.53
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+
+mysql:
+  image:
+    repository: mariadb
+    tag: "10.11"
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+  # -- terminationGracePeriodSeconds (compose stop_grace_period 45s).
+  terminationGracePeriodSeconds: 45
+
+redis:
+  image:
+    repository: redis
+    tag: "7.4.11-alpine"
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+  # -- Pod sysctls. compose sets net.core.somaxconn=4096, which is an *unsafe* sysctl in Kubernetes
+  # (kubelet must allow it via --allowed-unsafe-sysctls), so it is off by default:
+  # sysctls: [{name: net.core.somaxconn, value: "4096"}]
+  sysctls: []
+
+clamd:
+  image:
+    repository: ghcr.io/mailcow/clamd
+    tag: "1.4.6-1"
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 50m, memory: 1Gi}
+
+rspamd:
+  image:
+    repository: ghcr.io/mailcow/rspamd
+    tag: "4.1.4-2"
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+  # -- terminationGracePeriodSeconds (compose stop_grace_period 30s).
+  terminationGracePeriodSeconds: 30
+
+phpFpm:
+  image:
+    repository: ghcr.io/mailcow/phpfpm
+    tag: "8.2.29-4"
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+
+sogo:
+  image:
+    repository: ghcr.io/mailcow/sogo
+    tag: "5.12.11-2"
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+
+dovecot:
+  image:
+    repository: ghcr.io/mailcow/dovecot
+    tag: "2.3.21.1-3"
+    pullPolicy: IfNotPresent
+  # Note: compose ulimits (nproc 65535, nofile 20000/40000) have no pod-level equivalent; containerd's
+  # default RLIMIT_NOFILE (usually 1048576) is above them. Lower limits must be set on the node runtime.
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+
+postfix:
+  image:
+    repository: ghcr.io/mailcow/postfix
+    tag: "3.10.12-2"
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+
+postfixTlspol:
+  image:
+    repository: ghcr.io/mailcow/postfix-tlspol
+    tag: "1.11.0-1"
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+
+memcached:
+  image:
+    repository: memcached
+    tag: alpine
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 10m, memory: 64Mi}
+
+nginx:
+  image:
+    repository: ghcr.io/mailcow/nginx
+    tag: "1.30.4-2"
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+
+olefy:
+  image:
+    repository: ghcr.io/mailcow/olefy
+    tag: "1.15"
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 10m, memory: 64Mi}
+
+dockerapi:
+  image:
+    repository: ghcr.io/mailcow/dockerapi
+    tag: "2.12"
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 10m, memory: 64Mi}
+
+acme:
+  # -- Run the mailcow ACME client (HTTP-01 via nginx, certs on the shared PVC). Off: use cert-manager / a Secret.
+  enabled: false
+  image:
+    repository: ghcr.io/mailcow/acme
+    tag: "1.99"
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+  # -- ADDITIONAL_SAN
+  additionalSan: ""
+  # -- AUTODISCOVER_SAN
+  autodiscoverSan: "y"
+  # -- SKIP_LETS_ENCRYPT
+  skipLetsEncrypt: "n"
+  # -- DIRECTORY_URL
+  directoryUrl: ""
+  # -- ENABLE_SSL_SNI
+  enableSslSni: "n"
+  # -- SKIP_IP_CHECK (the IP check compares DNS with the egress IP; usually wrong behind NAT -> y)
+  skipIpCheck: "y"
+  # -- SKIP_HTTP_VERIFICATION
+  skipHttpVerification: "n"
+  # -- ONLY_MAILCOW_HOSTNAME
+  onlyMailcowHostname: "n"
+  # -- LE_STAGING
+  leStaging: "n"
+  # -- ACME_DNS_CHALLENGE
+  dnsChallenge: "n"
+  # -- ACME_DNS_PROVIDER
+  dnsProvider: dns_xxx
+  # -- ACME_ACCOUNT_EMAIL
+  accountEmail: me@example.com
+  # -- SNAT_TO_SOURCE
+  snatToSource: "n"
+  # -- SNAT6_TO_SOURCE
+  snat6ToSource: "n"
+
+watchdog:
+  # -- Deploy the watchdog (restarts go through the dockerapi kubernetes backend; probes already self-heal).
+  enabled: false
+  image:
+    repository: ghcr.io/mailcow/watchdog
+    tag: "2.12"
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 10m, memory: 64Mi}
+  # -- Extra env for watchdog (USE_WATCHDOG, WATCHDOG_NOTIFY_EMAIL, *_THRESHOLD, ...); compose defaults are set by the chart.
+  env: {}
+
+netfilter:
+  # -- Fail2ban-style banning as a hostNetwork DaemonSet with NET_ADMIN/NET_RAW. Only useful when client IPs
+  # reach the node unmodified (externalTrafficPolicy Local, no PROXY protocol, no SNAT).
+  enabled: false
+  image:
+    repository: ghcr.io/mailcow/netfilter
+    tag: "1.65"
+    pullPolicy: IfNotPresent
+  # -- Run privileged like compose instead of NET_ADMIN/NET_RAW only.
+  privileged: false
+  # -- DISABLE_NETFILTER_ISOLATION_RULE (the br-mailcow isolation rule has no meaning in k8s).
+  disableIsolationRule: "y"
+  # -- terminationGracePeriodSeconds (compose stop_grace_period 30s).
+  terminationGracePeriodSeconds: 30
+  resources:
+    requests: {cpu: 10m, memory: 64Mi}
+
+# ofelia replacement: one CronJob per ofelia job label, `kubectl exec` into the component's main container.
+cronjobs:
+  # -- Render the CronJobs.
+  enabled: true
+  image:
+    # -- kubectl image (distroless, entrypoint /bin/kubectl).
+    repository: registry.k8s.io/kubectl
+    tag: v1.36.5
+    pullPolicy: IfNotPresent
+  # -- successfulJobsHistoryLimit
+  successfulJobsHistoryLimit: 1
+  # -- failedJobsHistoryLimit
+  failedJobsHistoryLimit: 1
+  # -- Seconds a finished Job is kept (ttlSecondsAfterFinished).
+  ttlSecondsAfterFinished: 300
+  # -- Per-job overrides: enabled, schedule (5-field cron; ofelia's seconds field dropped).
+  jobs:
+    phpfpm-keycloak-sync: {enabled: true, schedule: "* * * * *"}
+    phpfpm-ldap-sync: {enabled: true, schedule: "* * * * *"}
+    sogo-sessions: {enabled: true, schedule: "* * * * *"}
+    sogo-ealarms: {enabled: true, schedule: "* * * * *"}
+    sogo-eautoreply: {enabled: true, schedule: "*/5 * * * *"}
+    sogo-backup: {enabled: true, schedule: "0 0 * * *"}
+    dovecot-imapsync-runner: {enabled: true, schedule: "* * * * *"}
+    dovecot-trim-logs: {enabled: true, schedule: "* * * * *"}
+    dovecot-quarantine: {enabled: true, schedule: "*/20 * * * *"}
+    dovecot-clean-q-aged: {enabled: true, schedule: "0 0 * * *"}
+    dovecot-maildir-gc: {enabled: true, schedule: "*/30 * * * *"}
+    # ofelia "@every 24h"
+    dovecot-sarules: {enabled: true, schedule: "0 3 * * *"}
+    dovecot-fts: {enabled: true, schedule: "0 0 * * *"}
+    dovecot-repl-health: {enabled: true, schedule: "*/5 * * * *"}
+
+networkPolicy:
+  # -- Restrict mysql 3306, redis 6379 and dovecot doveadm 12345 to pods of this namespace.
+  enabled: false
+  # -- Extra CIDRs allowed to redis (node addresses of the hostNetwork netfilter DaemonSet).
+  nodeCIDRs: []

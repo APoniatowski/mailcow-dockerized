@@ -1,0 +1,65 @@
+# local kind cluster: single node, podSubnet 10.244.0.0/16,
+# serviceSubnet 10.96.0.0/16, host ports 127.0.0.1:30080..34190 -> NodePorts of the same number.
+# Images built from the working tree are kind-loaded (build-load.sh), hence IfNotPresent.
+mailcow:
+  hostname: mail.example.org
+  networks: 10.244.0.0/16
+  # the smoke test calls the API from the host through the NodePort; the source address nginx sees is
+  # the kind docker bridge / node address (SNAT), so allow the private ranges
+  apiAllowFrom: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1"
+
+skip:
+  clamd: true
+
+clusterDNS: 10.96.0.10
+unbound:
+  clusterIP: 10.96.53.53
+
+files:
+  image:
+    repository: localhost/mailcow-files
+    tag: dev
+    pullPolicy: IfNotPresent
+
+persistence:
+  storageClass: standard
+  shared:
+    # kind's local-path provisioner has no RWX; RWO + the chart's podAffinity keeps every pod on the node
+    accessMode: ReadWriteOnce
+  vmail:
+    size: 1Gi
+  vmailIndex:
+    size: 512Mi
+  mysql:
+    size: 1Gi
+  postfix:
+    size: 512Mi
+
+mail:
+  proxyProtocol: false
+  service:
+    type: NodePort
+    externalTrafficPolicy: Local
+    nodePorts:
+      smtp: 30025
+      smtps: 30465
+      submission: 30587
+      imap: 30143
+      imaps: 30993
+      sieve: 34190
+
+http:
+  service:
+    enabled: true
+    type: NodePort
+    externalTrafficPolicy: Cluster
+    nodePorts:
+      http: 30080
+      https: 30443
+
+# no tls.* set -> self-signed bootstrap Job (snake-oil for mail.example.org)
+
+cronjobs:
+  # completed CronJob pods would never turn Ready and stall `kubectl wait --all`
+  successfulJobsHistoryLimit: 0
+  ttlSecondsAfterFinished: 0

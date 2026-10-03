@@ -1,0 +1,48 @@
+{{- /*
+In-cluster Services: every compose alias and every container name (*-mailcow) gets a ClusterIP
+Service, because mailcow code addresses both. Services of skipped components stay so the names
+resolve and connections fail fast.
+[component, alias, ports [name port protocol]]
+*/ -}}
+{{- $root := . }}
+{{- $svcs := list
+  (list "unbound" "unbound" (list (list "dns-udp" 53 "UDP") (list "dns-tcp" 53 "TCP")))
+  (list "mysql" "mysql" (list (list "mysql" 3306 "TCP")))
+  (list "redis" "redis" (list (list "redis" 6379 "TCP")))
+  (list "clamd" "clamd" (list (list "clamd" 3310 "TCP")))
+  (list "rspamd" "rspamd" (list (list "normal" 11333 "TCP") (list "controller" 11334 "TCP") (list "proxy" 9900 "TCP") (list "fuzzy" 11445 "TCP") (list "fuzzy-udp" 11445 "UDP")))
+  (list "php-fpm" "phpfpm" (list (list "fpm-auth" 9001 "TCP") (list "fpm" 9002 "TCP")))
+  (list "sogo" "sogo" (list (list "sogo" 20000 "TCP")))
+  (list "dovecot" "dovecot" (list (list "imap" 143 "TCP") (list "imaps" 993 "TCP") (list "pop3" 110 "TCP") (list "pop3s" 995 "TCP") (list "sieve" 4190 "TCP") (list "lmtp" 24 "TCP") (list "auth-inet" 10001 "TCP") (list "doveadm" 12345 "TCP") (list "imap-pp" 10143 "TCP") (list "imaps-pp" 10993 "TCP") (list "pop3-pp" 10110 "TCP") (list "pop3s-pp" 10995 "TCP") (list "sieve-pp" 14190 "TCP")))
+  (list "postfix" "postfix" (list (list "smtp" 25 "TCP") (list "smtps" 465 "TCP") (list "submission" 587 "TCP") (list "smtp-588" 588 "TCP") (list "smtp-589" 589 "TCP") (list "smtp-590" 590 "TCP") (list "smtp-591" 591 "TCP") (list "smtp-pp" 10025 "TCP") (list "smtps-pp" 10465 "TCP") (list "subm-pp" 10587 "TCP")))
+  (list "postfix-tlspol" "postfix-tlspol" (list (list "tlspol" 8642 "TCP")))
+  (list "memcached" "memcached" (list (list "memcached" 11211 "TCP")))
+  (list "nginx" "nginx" (list (list "http" (int .Values.mailcow.httpPort) "TCP") (list "https" (int .Values.mailcow.httpsPort) "TCP") (list "http-8081" 8081 "TCP") (list "http-9081" 9081 "TCP") (list "https-9082" 9082 "TCP")))
+  (list "dockerapi" "dockerapi" (list (list "https" 443 "TCP")))
+  (list "olefy" "olefy" (list (list "olefy" 10055 "TCP"))) }}
+{{- range $svcs }}
+{{- $component := index . 0 }}{{ $alias := index . 1 }}{{ $ports := index . 2 }}
+{{- range $name := list $alias (printf "%s-mailcow" $component) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" $root "component" $component) | nindent 4 }}
+spec:
+  type: ClusterIP
+  {{- if and (eq $component "unbound") (eq $name "unbound") }}
+  clusterIP: {{ $root.Values.unbound.clusterIP }}
+  {{- end }}
+  selector:
+    {{- include "mailcow.selectorLabels" (dict "root" $root "component" $component) | nindent 4 }}
+  ports:
+    {{- range $ports }}
+    - name: {{ index . 0 }}
+      port: {{ index . 1 }}
+      targetPort: {{ index . 1 }}
+      protocol: {{ index . 2 }}
+    {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,81 @@
+{{- $c := "postfix" }}
+{{- $v := .Values.postfix }}
+{{- $m := .Values.mailcow }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "mailcow.fullname" . }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  replicas: 1
+  serviceName: postfix-mailcow
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+        {{- include "mailcow.sharedLabel" . | nindent 8 }}
+        mailcow.email/mail-ingress: "true"
+      annotations:
+        {{- include "mailcow.podAnnotations" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "mailcow.dnsUnbound" . | nindent 6 }}
+      {{- include "mailcow.podCommon" (dict "root" . "shared" true) | nindent 6 }}
+      initContainers:
+        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/postfix" "conf/postfix") "shared" (list (dict "dir" "rspamd-vol")) "ssl" true) | nindent 8 }}
+      containers:
+        - name: postfix-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          securityContext:
+            capabilities:
+              add: ["NET_BIND_SERVICE"]
+          env:
+            - name: LOG_LINES
+              value: {{ $m.logLines | quote }}
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+            {{- include "mailcow.env.db" . | nindent 12 }}
+            {{- include "mailcow.env.redis" . | nindent 12 }}
+            - name: MAILCOW_HOSTNAME
+              value: {{ $m.hostname | quote }}
+            - name: SPAMHAUS_DQS_KEY
+              value: {{ $m.spamhausDqsKey | quote }}
+            # P1.3 (opt-in env, read once the postfix image change lands)
+            - name: MAILCOW_NETWORKS
+              value: {{ include "mailcow.networks" . | quote }}
+          ports:
+            - {name: smtp, containerPort: 25}
+            - {name: smtps, containerPort: 465}
+            - {name: submission, containerPort: 587}
+            - {name: smtp-588, containerPort: 588}
+            - {name: smtp-589, containerPort: 589}
+            - {name: smtp-590, containerPort: 590}
+            - {name: smtp-591, containerPort: 591}
+            - {name: smtp-pp, containerPort: 10025}
+            - {name: smtps-pp, containerPort: 10465}
+            - {name: subm-pp, containerPort: 10587}
+          {{- include "mailcow.tcpProbes" (dict "port" 589 "startup" 90) | nindent 10 }}
+          volumeMounts:
+            {{- include "mailcow.hooksMount" "postfix" | nindent 12 }}
+            - name: seed
+              subPath: conf/postfix
+              mountPath: /opt/postfix/conf
+            {{- include "mailcow.tlsMounts" . | nindent 12 }}
+            - name: spool
+              mountPath: /var/spool/postfix
+            # compose also mounts crypt-vol-1 at /var/lib/zeyple: legacy (zeyple unused), not mounted here
+            - name: shared
+              subPath: rspamd-vol
+              mountPath: /var/lib/rspamd
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      volumes:
+        {{- include "mailcow.seedVolumes" (dict "root" . "shared" true) | nindent 8 }}
+        {{- include "mailcow.tlsVolumes" . | nindent 8 }}
+        - name: spool
+          persistentVolumeClaim:
+            claimName: {{ include "mailcow.claimName" (list . "postfix" "postfix") }}

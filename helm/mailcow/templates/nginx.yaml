@@ -1,0 +1,148 @@
+{{- $c := "nginx" }}
+{{- $v := .Values.nginx }}
+{{- $m := .Values.mailcow }}
+{{- $acme := .Values.acme.enabled }}
+{{- $sogo := not .Values.skip.sogo }}
+{{- $logos := list (list "custom-favicon.ico" "img/sogo.ico") (list "custom-shortlogo.svg" "img/sogo-compact.svg") (list "custom-fulllogo.svg" "img/sogo-full.svg") (list "custom-fulllogo.png" "img/sogo-logo.png") (list "custom-theme.js" "js/theme.js") (list "custom-sogo.js" "js/custom-sogo.js") }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mailcow.fullname" . }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+        {{- if $acme }}
+        {{- include "mailcow.sharedLabel" . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "mailcow.podAnnotations" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "mailcow.dnsUnbound" . | nindent 6 }}
+      {{- include "mailcow.podCommon" (dict "root" . "shared" $acme) | nindent 6 }}
+      initContainers:
+        {{- if $sogo }}
+        # compose sogo-web-vol-1 (rsync'ed by bootstrap-sogo.sh): copy the SOGo web assets straight from
+        # the sogo image. bootstrap-sogo.sh's navMailcowBtns.diff only patches Templates/*.wox, which
+        # sogod renders itself; nginx serves WebServerResources and */Resources only, so no patch here.
+        - name: sogo-web
+          image: {{ include "mailcow.image" .Values.sogo.image }}
+          imagePullPolicy: {{ .Values.sogo.image.pullPolicy }}
+          command: ["/bin/sh", "-ec", "cp -a /usr/local/lib/GNUstep/SOGo/. /sogo_web/"]
+          volumeMounts:
+            - name: sogo-web
+              mountPath: /sogo_web
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+        {{- end }}
+        {{- $slices := list "web" "conf/rspamd/dynmaps" "conf/nginx" "conf/rspamd/meta_exporter" "conf/dovecot/auth/mailcowauth.php" }}
+        {{- $script := "" }}
+        {{- $mounts := list }}
+        {{- if $sogo }}
+        {{- range $logos }}
+        {{- $slices = append $slices (printf "conf/sogo/%s" (index . 0)) }}
+        {{- $script = printf "%scp /seed/conf/sogo/%s /sogo_web/WebServerResources/%s\n" $script (index . 0) (index . 1) }}
+        {{- end }}
+        {{- $mounts = list (dict "name" "sogo-web" "mountPath" "/sogo_web") }}
+        {{- end }}
+        {{- $shared := list }}
+        {{- if $acme }}{{ $shared = list (dict "dir" "acme-challenge") }}{{ end }}
+        {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "ssl" true "script" $script "extraMounts" $mounts) | nindent 8 }}
+      containers:
+        - name: nginx-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          env:
+            - name: HTTPS_PORT
+              value: {{ $m.httpsPort | quote }}
+            - name: HTTP_PORT
+              value: {{ $m.httpPort | quote }}
+            - name: MAILCOW_HOSTNAME
+              value: {{ $m.hostname | quote }}
+            - name: ADDITIONAL_SERVER_NAMES
+              value: {{ $m.additionalServerNames | quote }}
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+            - name: SKIP_SOGO
+              value: {{ include "mailcow.yn" .Values.skip.sogo | quote }}
+            - name: SKIP_RSPAMD
+              value: "n"
+            - name: ENABLE_IPV6
+              value: {{ $m.enableIpv6 | quote }}
+            - name: HTTP_REDIRECT
+              value: {{ $m.httpRedirect | quote }}
+            - name: PHPFPMHOST
+              value: ""
+            # existing override; compose default is ${IPV4_NETWORK}.248
+            - name: SOGOHOST
+              value: sogo-mailcow
+            - name: RSPAMDHOST
+              value: ""
+            - name: REDISHOST
+              value: ""
+            - name: IPV4_NETWORK
+              value: {{ $m.ipv4Network | quote }}
+            - name: NGINX_USE_PROXY_PROTOCOL
+              value: {{ $m.nginxUseProxyProtocol | quote }}
+            - name: TRUSTED_PROXIES
+              value: {{ $m.trustedProxies | quote }}
+          ports:
+            - name: http
+              containerPort: {{ int $m.httpPort }}
+            - name: https
+              containerPort: {{ int $m.httpsPort }}
+            - name: http-8081
+              containerPort: 8081
+            - name: http-9081
+              containerPort: 9081
+            - name: https-9082
+              containerPort: 9082
+          {{- include "mailcow.tcpProbes" (dict "port" 8081 "startup" 90) | nindent 10 }}
+          volumeMounts:
+            - name: seed
+              subPath: web
+              mountPath: /web
+              readOnly: true
+            {{- if $acme }}
+            # compose: acme writes ./data/web/.well-known/acme-challenge, nginx serves it from /web
+            - name: shared
+              subPath: acme-challenge
+              mountPath: /web/.well-known/acme-challenge
+              readOnly: true
+            {{- end }}
+            - name: seed
+              subPath: conf/rspamd/dynmaps
+              mountPath: /dynmaps
+              readOnly: true
+            {{- include "mailcow.tlsMounts" . | nindent 12 }}
+            - name: seed
+              subPath: conf/nginx
+              mountPath: /etc/nginx/conf.d/
+            - name: seed
+              subPath: conf/rspamd/meta_exporter
+              mountPath: /meta_exporter
+              readOnly: true
+            - name: seed
+              subPath: conf/dovecot/auth/mailcowauth.php
+              mountPath: /mailcowauth/mailcowauth.php
+            {{- range list "functions.inc.php" "functions.auth.inc.php" "sessions.inc.php" }}
+            - name: seed
+              subPath: web/inc/{{ . }}
+              mountPath: /mailcowauth/{{ . }}
+            {{- end }}
+            - name: sogo-web
+              mountPath: /usr/local/lib/GNUstep/SOGo/
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      volumes:
+        {{- include "mailcow.seedVolumes" (dict "root" . "shared" $acme) | nindent 8 }}
+        {{- include "mailcow.tlsVolumes" . | nindent 8 }}
+        - name: sogo-web
+          emptyDir: {}

@@ -1,0 +1,27 @@
+# cert-manager issued certificate for postfix/dovecot/nginx + Ingress for the web UI.
+mailcow:
+  hostname: mail.example.org
+  httpRedirect: "n"
+  # ingress-nginx pod CIDR (X-Forwarded-For trusted by nginx)
+  trustedProxies: 10.244.0.0/16
+
+tls:
+  certManager:
+    enabled: true
+    issuerRef:
+      name: letsencrypt-prod
+      kind: ClusterIssuer
+      group: cert-manager.io
+    renewBefore: 720h
+
+http:
+  service:
+    enabled: false
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/proxy-body-size: 100m
+    tls:
+      enabled: true

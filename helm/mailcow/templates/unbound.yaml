@@ -1,0 +1,54 @@
+{{- $c := "unbound" }}
+{{- $v := .Values.unbound }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mailcow.fullname" . }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+      annotations:
+        {{- include "mailcow.podAnnotations" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
+      initContainers:
+        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "conf/unbound/unbound.conf" "hooks/unbound") "appends" (list (dict "key" "unbound-k8s.conf" "dst" "conf/unbound/unbound.conf"))) | nindent 8 }}
+      containers:
+        - name: unbound-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          # compose: tty: true (entrypoint chowns /dev/console, which only exists with a tty)
+          tty: true
+          env:
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+            - name: SKIP_UNBOUND_HEALTHCHECK
+              value: {{ include "mailcow.yn" .Values.skip.unboundHealthcheck | quote }}
+          ports:
+            - name: dns-udp
+              containerPort: 53
+              protocol: UDP
+            - name: dns-tcp
+              containerPort: 53
+              protocol: TCP
+          # compose healthcheck pings 1.1.1.1/8.8.8.8/9.9.9.9; a failing readiness probe would empty the
+          # `unbound` Service and break DNS for every mailcow pod, so probe the listener only.
+          {{- include "mailcow.tcpProbes" (dict "port" 53 "startup" 30) | nindent 10 }}
+          volumeMounts:
+            {{- include "mailcow.hooksMount" "unbound" | nindent 12 }}
+            - name: seed
+              subPath: conf/unbound/unbound.conf
+              mountPath: /etc/unbound/unbound.conf
+              readOnly: true
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      volumes:
+        {{- include "mailcow.seedVolumes" (dict "root" .) | nindent 8 }}

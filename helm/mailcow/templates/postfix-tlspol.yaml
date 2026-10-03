@@ -1,0 +1,49 @@
+{{- $c := "postfix-tlspol" }}
+{{- $v := .Values.postfixTlspol }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mailcow.fullname" . }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+      annotations:
+        {{- include "mailcow.podAnnotations" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "mailcow.dnsUnbound" . | nindent 6 }}
+      {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
+      containers:
+        - name: postfix-tlspol-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          env:
+            - name: LOG_LINES
+              value: {{ .Values.mailcow.logLines | quote }}
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+            {{- include "mailcow.env.redis" . | nindent 12 }}
+            - name: DEV_MODE
+              value: {{ .Values.mailcow.devMode | quote }}
+          ports:
+            - name: tlspol
+              containerPort: 8642
+          {{- include "mailcow.tcpProbes" (dict "port" 8642 "startup" 90) | nindent 10 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postfix-tlspol
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "mailcow.claimName" (list . "postfixTlspol" "postfix-tlspol") }}

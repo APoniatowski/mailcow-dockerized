@@ -1,0 +1,101 @@
+{{- if .Values.acme.enabled }}
+{{- $c := "acme" }}
+{{- $v := .Values.acme }}
+{{- $m := .Values.mailcow }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mailcow.fullname" . }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+        {{- include "mailcow.sharedLabel" . | nindent 8 }}
+      annotations:
+        {{- include "mailcow.podAnnotations" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "mailcow.dnsUnbound" . | nindent 6 }}
+      {{- include "mailcow.podCommon" (dict "root" . "shared" true) | nindent 6 }}
+      initContainers:
+        {{- /* snake-oil + dhparams on the shared ssl dir so nginx/postfix/dovecot can start before the first issue */}}
+        {{- $script := printf `if [ ! -s /shared/ssl/cert.pem ] || [ ! -s /shared/ssl/key.pem ]; then
+  cp /mailcow/data/assets/ssl-example/dhparams.pem /shared/ssl/dhparams.pem
+  openssl req -x509 -newkey rsa:4096 -keyout /shared/ssl/key.tmp -out /shared/ssl/cert.tmp -days 365 -subj "/C=DE/ST=NRW/L=Willich/O=mailcow/OU=mailcow/CN=%s" -sha256 -nodes
+  mv /shared/ssl/key.tmp /shared/ssl/key.pem && mv /shared/ssl/cert.tmp /shared/ssl/cert.pem
+fi
+[ -f /shared/ssl/dhparams.pem ] || cp /mailcow/data/assets/ssl-example/dhparams.pem /shared/ssl/dhparams.pem` $m.hostname }}
+        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "assets/ssl-example" "conf/acme") "shared" (list (dict "dir" "ssl") (dict "dir" "acme-challenge")) "script" $script) | nindent 8 }}
+      containers:
+        - name: acme-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          env:
+            - name: LOG_LINES
+              value: {{ $m.logLines | quote }}
+            - name: ADDITIONAL_SAN
+              value: {{ $v.additionalSan | quote }}
+            - name: AUTODISCOVER_SAN
+              value: {{ $v.autodiscoverSan | quote }}
+            - name: MAILCOW_HOSTNAME
+              value: {{ $m.hostname | quote }}
+            {{- include "mailcow.env.db" . | nindent 12 }}
+            - name: SKIP_LETS_ENCRYPT
+              value: {{ $v.skipLetsEncrypt | quote }}
+            - name: COMPOSE_PROJECT_NAME
+              value: {{ $m.composeProjectName | quote }}
+            - name: DIRECTORY_URL
+              value: {{ $v.directoryUrl | quote }}
+            - name: ENABLE_SSL_SNI
+              value: {{ $v.enableSslSni | quote }}
+            - name: SKIP_IP_CHECK
+              value: {{ $v.skipIpCheck | quote }}
+            - name: SKIP_HTTP_VERIFICATION
+              value: {{ $v.skipHttpVerification | quote }}
+            - name: ONLY_MAILCOW_HOSTNAME
+              value: {{ $v.onlyMailcowHostname | quote }}
+            - name: LE_STAGING
+              value: {{ $v.leStaging | quote }}
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+            {{- include "mailcow.env.redis" . | nindent 12 }}
+            - name: SNAT_TO_SOURCE
+              value: {{ $v.snatToSource | quote }}
+            - name: SNAT6_TO_SOURCE
+              value: {{ $v.snat6ToSource | quote }}
+            - name: ACME_DNS_CHALLENGE
+              value: {{ $v.dnsChallenge | quote }}
+            - name: ACME_DNS_PROVIDER
+              value: {{ $v.dnsProvider | quote }}
+            - name: ACME_ACCOUNT_EMAIL
+              value: {{ $v.accountEmail | quote }}
+            # P1.2 (opt-in env, read once the acme image change lands)
+            - name: DOCKERAPI_HOST
+              value: dockerapi-mailcow
+          volumeMounts:
+            - name: shared
+              subPath: acme-challenge
+              mountPath: /var/www/acme
+            - name: shared
+              subPath: ssl
+              mountPath: /var/lib/acme/
+            - name: seed
+              subPath: assets/ssl-example
+              mountPath: /var/lib/ssl-example/
+              readOnly: true
+            - name: seed
+              subPath: conf/acme
+              mountPath: /etc/acme/
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      volumes:
+        {{- include "mailcow.seedVolumes" (dict "root" . "shared" true) | nindent 8 }}
+{{- end }}

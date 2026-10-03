@@ -1,0 +1,34 @@
+mailcow {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Hostname: {{ .Values.mailcow.hostname }}
+Default UI login: admin / moohoo  -- change it right away.
+
+Secrets: {{ include "mailcow.secretName" . }}
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "mailcow.secretName" . }} -o jsonpath='{.data.API_KEY}' | base64 -d
+
+TLS (/etc/ssl/mail):
+{{- if .Values.acme.enabled }}
+  mailcow ACME client on the shared PVC (snake-oil until the first certificate is issued).
+{{- else if .Values.tls.certManager.enabled }}
+  cert-manager Certificate {{ include "mailcow.fullname" . }} -> Secret {{ include "mailcow.tlsSecretName" . }}.
+{{- else if .Values.tls.existingSecret }}
+  Secret {{ .Values.tls.existingSecret }}.
+{{- else }}
+  self-signed snake-oil Secret {{ include "mailcow.tlsSecretName" . }} (bootstrap Job). Use cert-manager for production.
+{{- end }}
+
+Mail:  kubectl -n {{ .Release.Namespace }} get svc {{ include "mailcow.fullname" . }}-mail
+       ({{ .Values.mail.service.type }}, PROXY protocol {{ ternary "ON: your load balancer must send PROXY headers" "off" .Values.mail.proxyProtocol }})
+{{- if .Values.http.service.enabled }}
+Web:   kubectl -n {{ .Release.Namespace }} get svc {{ include "mailcow.fullname" . }}-http
+{{- end }}
+{{- if .Values.http.ingress.enabled }}
+Web:   Ingress {{ include "mailcow.fullname" . }}
+{{- end }}
+
+Checks:
+  - unbound Service clusterIP {{ .Values.unbound.clusterIP }} must lie in the cluster service CIDR.
+  - mailcow.networks ({{ .Values.mailcow.networks }}) must be the pod CIDR and nothing wider.
+{{- if eq .Values.persistence.shared.accessMode "ReadWriteOnce" }}
+  - shared PVC is ReadWriteOnce: all mailcow pods are pinned to one node.
+{{- end }}

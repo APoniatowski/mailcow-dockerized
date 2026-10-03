@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mailcow.fullname" . }}-k8s
+  labels:
+    {{- include "mailcow.commonLabels" . | nindent 4 }}
+data:
+  # Appended to data/conf/unbound/unbound.conf (unbound has no include in the repo config).
+  # DNSSEC validation stays on for the internet; the cluster zone is unsigned -> domain-insecure.
+  unbound-k8s.conf: |
+
+    # --- added by the mailcow Helm chart ---
+    server:
+    {{- range (splitList "," .Values.mailcow.networks) }}
+    {{- if trim . }}
+      access-control: {{ trim . }} allow
+    {{- end }}
+    {{- end }}
+      domain-insecure: "{{ .Values.clusterDomain }}"
+      private-domain: "{{ .Values.clusterDomain }}"
+      local-zone: "{{ .Values.clusterDomain }}." transparent
+    forward-zone:
+      name: "{{ .Values.clusterDomain }}"
+      forward-addr: {{ .Values.clusterDNS }}
+  # Appended to data/conf/dovecot/extra.conf (after extraFiles).
+  dovecot-k8s.conf: |
+
+    # --- added by the mailcow Helm chart ---
+    haproxy_trusted_networks = {{ .Values.mail.proxyTrustedNetworks }}
+{{- if .Values.extraFiles }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mailcow.fullname" . }}-extra-files
+  labels:
+    {{- include "mailcow.commonLabels" . | nindent 4 }}
+data:
+  {{- range $path, $content := .Values.extraFiles }}
+  # {{ $path }}
+  {{ printf "f-%s" (sha256sum $path | trunc 16) }}: {{ $content | toString | quote }}
+  {{- end }}
+{{- end }}

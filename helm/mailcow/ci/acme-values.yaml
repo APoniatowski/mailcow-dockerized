@@ -1,0 +1,33 @@
+# mailcow ACME client instead of cert-manager, plus extraFiles and skipped components.
+mailcow:
+  hostname: mail.example.org
+
+acme:
+  enabled: true
+  accountEmail: postmaster@example.org
+
+skip:
+  sogo: true
+  olefy: true
+  fts: false
+
+extraFiles:
+  conf/postfix/extra.cf: |
+    smtpd_banner = $myhostname ESMTP
+  conf/dovecot/extra.conf: |
+    mail_max_userip_connections = 50
+  conf/sogo/sogo.conf: |
+    // replaced sogo.conf (unused while skip.sogo)
+  conf/rspamd/custom/ip_wl.map: |
+    192.0.2.1
+  hooks/postfix/10-hello.sh: |
+    #!/bin/sh
+    echo hello from hook
+
+http:
+  service:
+    type: LoadBalancer
+
+persistence:
+  shared:
+    accessMode: ReadWriteOnce

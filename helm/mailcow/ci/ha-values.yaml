@@ -1,0 +1,44 @@
+# Multi-node cluster: RWX shared volume, cloud LoadBalancer with PROXY protocol, opt-in extras.
+mailcow:
+  hostname: mail.example.org
+  networks: 100.64.0.0/16
+  nginxUseProxyProtocol: "n"
+
+persistence:
+  shared:
+    accessMode: ReadWriteMany
+    storageClass: efs-sc
+
+mail:
+  proxyProtocol: true
+  proxyTrustedNetworks: "10.0.0.0/16"
+  service:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: external
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+      service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: "*"
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+
+http:
+  service:
+    enabled: true
+    type: LoadBalancer
+    externalTrafficPolicy: Local
+
+tls:
+  certManager:
+    enabled: true
+
+# Note: with PROXY protocol the node only sees load balancer addresses, so netfilter bans have no
+# effect on mail ports; enabled here to exercise the DaemonSet + NetworkPolicy rendering.
+netfilter:
+  enabled: true
+
+watchdog:
+  enabled: true
+
+networkPolicy:
+  enabled: true
+  nodeCIDRs:
+    - 10.0.0.0/16

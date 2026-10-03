@@ -1,0 +1,57 @@
+{{- $c := "redis" }}
+{{- $v := .Values.redis }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "mailcow.fullname" . }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  replicas: 1
+  serviceName: redis-mailcow
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+      annotations:
+        {{- include "mailcow.podAnnotations" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with $v.sysctls }}
+      securityContext:
+        sysctls:
+          {{- toYaml . | nindent 10 }}
+      {{- end }}
+      {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
+      initContainers:
+        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "conf/redis/redis-conf.sh")) | nindent 8 }}
+      containers:
+        - name: redis-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          command: ["/bin/sh", "/redis-conf.sh"]
+          env:
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+            {{- include "mailcow.secretEnv" (list . "REDISPASS" "REDISPASS") | nindent 12 }}
+            - name: REDISMASTERPASS
+              value: {{ .Values.mailcow.redisMasterPass | quote }}
+          ports:
+            - name: redis
+              containerPort: 6379
+          {{- include "mailcow.tcpProbes" (dict "port" 6379 "startup" 30) | nindent 10 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data/
+            - name: seed
+              subPath: conf/redis/redis-conf.sh
+              mountPath: /redis-conf.sh
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      volumes:
+        {{- include "mailcow.seedVolumes" (dict "root" .) | nindent 8 }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "mailcow.claimName" (list . "redis" "redis") }}
