@@ -10,7 +10,7 @@ resolve and connections fail fast.
   (list "mysql" "mysql" (list (list "mysql" 3306 "TCP")))
   (list "redis" "redis" (list (list "redis" 6379 "TCP")))
   (list "clamd" "clamd" (list (list "clamd" 3310 "TCP")))
-  (list "rspamd" "rspamd" (list (list "normal" 11333 "TCP") (list "controller" 11334 "TCP") (list "proxy" 9900 "TCP") (list "fuzzy" 11445 "TCP") (list "fuzzy-udp" 11445 "UDP")))
+  (list "rspamd" "rspamd" (list (list "normal" 11333 "TCP") (list "controller" 11334 "TCP") (list "proxy" 9900 "TCP") (list "fuzzy" 11445 "TCP") (list "fuzzy-udp" 11445 "UDP") (list "controller-relay" 11335 "TCP")))
   (list "php-fpm" "phpfpm" (list (list "fpm-auth" 9001 "TCP") (list "fpm" 9002 "TCP")))
   (list "sogo" "sogo" (list (list "sogo" 20000 "TCP")))
   (list "dovecot" "dovecot" (list (list "imap" 143 "TCP") (list "imaps" 993 "TCP") (list "pop3" 110 "TCP") (list "pop3s" 995 "TCP") (list "sieve" 4190 "TCP") (list "lmtp" 24 "TCP") (list "auth-inet" 10001 "TCP") (list "doveadm" 12345 "TCP") (list "imap-pp" 10143 "TCP") (list "imaps-pp" 10993 "TCP") (list "pop3-pp" 10110 "TCP") (list "pop3s-pp" 10995 "TCP") (list "sieve-pp" 14190 "TCP")))

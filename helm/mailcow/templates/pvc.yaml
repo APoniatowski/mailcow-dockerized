@@ -4,6 +4,7 @@
   (list "vmailIndex" "vmail-index" true)
   (list "mysql" "mysql" true)
   (list "redis" "redis" true)
+  (list "rspamd" "rspamd" true)
   (list "postfix" "postfix" true)
   (list "postfixTlspol" "postfix-tlspol" true)
   (list "crypt" "crypt" true)

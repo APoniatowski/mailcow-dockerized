@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # mailcow files image: data/web, data/conf, data/assets, data/hooks of one mailcow release.
 # Every chart pod copies its slice into an emptyDir from this image (initContainer "seed"),
-# the TLS bootstrap Job uses its openssl + curl.
+# the TLS bootstrap Job uses its openssl + curl, the rspamd controller socket relays its socat.
 #
 # Build from the repository root (BuildKit picks up Dockerfile.dockerignore next to this file):
 #   docker build -f helm/mailcow/files-image/Dockerfile \
@@ -13,7 +13,7 @@ FROM alpine:3.23
 LABEL org.opencontainers.image.title="mailcow-files" \
       org.opencontainers.image.source="https://github.com/mailcow/mailcow-dockerized"
 
-RUN apk add --no-cache openssl curl
+RUN apk add --no-cache openssl curl socat
 
 COPY data/web /mailcow/data/web
 COPY data/conf /mailcow/data/conf

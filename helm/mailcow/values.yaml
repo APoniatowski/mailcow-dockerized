@@ -11,7 +11,9 @@ fullnameOverride: ""
 
 # -- Existing Secret holding DBPASS, DBROOT, REDISPASS, API_KEY, API_KEY_READ_ONLY,
 # SOGO_URL_ENCRYPTION_KEY, SOGO_ENCRYPTION_KEY, SOGO_SSO_PASS, DOVECOT_MASTER_USER, DOVECOT_MASTER_PASS.
-# SOGO_ENCRYPTION_KEY goes into a plist: alphanumeric only (no & < >).
+# SOGO_ENCRYPTION_KEY goes into a plist: alphanumeric only (no & < >). sogo and php-fpm derive SOGo's
+# sieve.creds, cron.creds and sogo-sso.pass from SOGO_SSO_PASS and DOVECOT_MASTER_USER/PASS with the
+# same unquoted shell echo as dovecot's entrypoint: no glob characters (* ? [) in those three.
 # Empty: the chart creates `<release>-secrets` with random values once and keeps them on upgrade (lookup).
 existingSecret: ""
 
@@ -199,6 +201,12 @@ persistence:
     size: 1Gi
     accessMode: ReadWriteOnce
     existingClaim: ""
+  # -- rspamd-vol-1 (/var/lib/rspamd: controller socket + non-critical state; bayes/fuzzy live in
+  # Redis) and the rspamd UI password (override/worker-controller-password.inc). rspamd only.
+  rspamd:
+    size: 512Mi
+    accessMode: ReadWriteOnce
+    existingClaim: ""
   # -- postfix-vol-1 (queue). Also mounted by watchdog (same node).
   postfix:
     size: 2Gi
@@ -224,11 +232,11 @@ persistence:
     size: 1Gi
     accessMode: ReadWriteOnce
     existingClaim: ""
-  # -- Cross-pod config/state dirs (subPaths): rspamd-custom, rspamd-vol (rspamd.sock + rspamd state),
-  # rspamd-override (controller password), sogo-conf (+ creds), sogo-sso, global-sieve, ssl + acme-challenge (acme on).
-  # ReadWriteMany for multi-node. ReadWriteOnce works only with every pod on one node: the chart then adds a
-  # required podAffinity so all pods mounting it co-locate. rspamd.sock is a unix socket: even with RWX
-  # its users must share a node.
+  # -- Cross-pod config dirs (subPaths): rspamd-custom (php-fpm, dovecot, rspamd), global-sieve
+  # (php-fpm, dovecot), plus ssl + acme-challenge with acme.enabled (acme, nginx, postfix, dovecot, watchdog).
+  # ReadWriteMany for multi-node. ReadWriteOnce works only with those pods on one node: the chart then
+  # adds a required podAffinity so the pods mounting it co-locate (php-fpm, dovecot, rspamd; + acme,
+  # nginx, postfix, watchdog with acme). README "Storage".
   shared:
     size: 1Gi
     accessMode: ReadWriteMany
@@ -387,6 +395,13 @@ rspamd:
     requests: {cpu: 50m, memory: 256Mi}
   # -- terminationGracePeriodSeconds (compose stop_grace_period 30s).
   terminationGracePeriodSeconds: 30
+  # socat sidecars (files image) carrying the controller socket: `rspamd-sock-relay` in the rspamd pod
+  # (unix socket -> TCP 11335), `rspamd-sock` in php-fpm, dovecot, postfix, watchdog (TCP -> local socket).
+  socketRelay:
+    # -- Resources of every relay sidecar.
+    resources:
+      requests: {cpu: 5m, memory: 8Mi}
+      limits: {memory: 64Mi}
 
 phpFpm:
   image:
@@ -564,8 +579,9 @@ cronjobs:
     dovecot-fts: {enabled: true, schedule: "0 0 * * *"}
     dovecot-repl-health: {enabled: true, schedule: "*/5 * * * *"}
 
-# Ingress NetworkPolicies (need a CNI that enforces them). dockerapi :443 is always limited to
-# php-fpm, watchdog, acme and dovecot, whatever `enabled` says (it is an unauthenticated exec API).
+# Ingress NetworkPolicies (need a CNI that enforces them). Whatever `enabled` says, dockerapi :443 is
+# always limited to php-fpm, watchdog, acme and dovecot (unauthenticated exec API), and the rspamd
+# controller relay :11335 to php-fpm, dovecot, postfix and watchdog (unauthenticated controller access).
 networkPolicy:
   # -- Every mailcow port only from pods of this release, except client mail ports (publicMailFrom)
   # and nginx http/https (anywhere). false = off (anything else, including "", counts as on).

@@ -1,6 +1,8 @@
 {{- $c := "postfix" }}
 {{- $v := .Values.postfix }}
 {{- $m := .Values.mailcow }}
+{{- /* the shared PVC only carries /etc/ssl/mail with acme */}}
+{{- $acme := .Values.acme.enabled }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -17,16 +19,19 @@ spec:
     metadata:
       labels:
         {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+        {{- if $acme }}
         {{- include "mailcow.sharedLabel" . | nindent 8 }}
+        {{- end }}
         mailcow.email/mail-ingress: "true"
       annotations:
         {{- include "mailcow.podAnnotations" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
-      {{- include "mailcow.podCommon" (dict "root" . "shared" true) | nindent 6 }}
+      {{- include "mailcow.podCommon" (dict "root" . "shared" $acme) | nindent 6 }}
       initContainers:
-        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/postfix" "conf/postfix") "shared" (list (dict "dir" "rspamd-vol")) "appends" (list (dict "key" "postfix-k8s.cf" "dst" "conf/postfix/extra.cf")) "ssl" true) | nindent 8 }}
+        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/postfix" "conf/postfix") "appends" (list (dict "key" "postfix-k8s.cf" "dst" "conf/postfix/extra.cf")) "ssl" true) | nindent 8 }}
+        {{- include "mailcow.rspamdSockSidecar" . | nindent 8 }}
       containers:
         - name: postfix-mailcow
           image: {{ include "mailcow.image" $v.image }}
@@ -67,14 +72,15 @@ spec:
             - name: spool
               mountPath: /var/spool/postfix
             # compose also mounts crypt-vol-1 at /var/lib/zeyple: legacy (zeyple unused), not mounted here
-            - name: shared
-              subPath: rspamd-vol
+            # rspamd.sock from the rspamd-sock sidecar (rspamd-pipe-ham/spam)
+            - name: rspamd-sock
               mountPath: /var/lib/rspamd
           resources:
             {{- toYaml $v.resources | nindent 12 }}
       volumes:
-        {{- include "mailcow.seedVolumes" (dict "root" . "shared" true) | nindent 8 }}
+        {{- include "mailcow.seedVolumes" (dict "root" . "shared" $acme) | nindent 8 }}
         {{- include "mailcow.tlsVolumes" . | nindent 8 }}
+        {{- include "mailcow.rspamdSockVolume" . | nindent 8 }}
         - name: spool
           persistentVolumeClaim:
             claimName: {{ include "mailcow.claimName" (list . "postfix" "postfix") }}

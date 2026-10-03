@@ -26,9 +26,10 @@ spec:
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
       {{- include "mailcow.podCommon" (dict "root" . "shared" true) | nindent 6 }}
       initContainers:
-        {{- $shared := list (dict "dir" "rspamd-custom" "src" "conf/rspamd/custom") (dict "dir" "rspamd-vol") (dict "dir" "sogo-conf") (dict "dir" "sogo-sso") }}
+        {{- $shared := list (dict "dir" "rspamd-custom" "src" "conf/rspamd/custom") }}
         {{- $appends := list (dict "key" "dovecot-k8s.conf" "dst" "conf/dovecot/extra.conf") }}
         {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/dovecot" "conf/dovecot" "assets/templates") "shared" $shared "files" (list (dict "src" "conf/dovecot/global_sieve_before" "dst" "global-sieve/before") (dict "src" "conf/dovecot/global_sieve_after" "dst" "global-sieve/after")) "appends" $appends "ssl" true) | nindent 8 }}
+        {{- include "mailcow.rspamdSockSidecar" . | nindent 8 }}
       containers:
         - name: dovecot-mailcow
           image: {{ include "mailcow.image" $v.image }}
@@ -110,11 +111,12 @@ spec:
               subPath: global-sieve/after
               mountPath: /etc/dovecot/global_sieve_after
             {{- include "mailcow.tlsMounts" . | nindent 12 }}
-            - name: shared
-              subPath: sogo-conf
+            # the entrypoint writes SOGo's creds files here on every start (compose: into the sogo and
+            # php-fpm bind mounts); pod-local, those pods derive the same files from the Secret.
+            # imapsync_runner.pl reads /etc/sogo/sieve.creds locally.
+            - name: sogo-creds
               mountPath: /etc/sogo/
-            - name: shared
-              subPath: sogo-sso
+            - name: phpfpm-sso
               mountPath: /etc/phpfpm/
             - name: vmail
               mountPath: /var/vmail
@@ -129,14 +131,19 @@ spec:
               subPath: assets/templates
               mountPath: /templates
               readOnly: true
-            - name: shared
-              subPath: rspamd-vol
+            # rspamd.sock from the rspamd-sock sidecar (rspamd-pipe-ham/spam)
+            - name: rspamd-sock
               mountPath: /var/lib/rspamd
           resources:
             {{- toYaml $v.resources | nindent 12 }}
       volumes:
         {{- include "mailcow.seedVolumes" (dict "root" . "shared" true) | nindent 8 }}
         {{- include "mailcow.tlsVolumes" . | nindent 8 }}
+        {{- include "mailcow.rspamdSockVolume" . | nindent 8 }}
+        - name: sogo-creds
+          emptyDir: {}
+        - name: phpfpm-sso
+          emptyDir: {}
         - name: vmail
           persistentVolumeClaim:
             claimName: {{ include "mailcow.claimName" (list . "vmail" "vmail") }}

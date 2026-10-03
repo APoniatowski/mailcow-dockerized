@@ -29,8 +29,46 @@ spec:
       {{- include "mailcow.podCommon" (dict "root" . "shared" true) | nindent 6 }}
       initContainers:
         {{- $slices := list "hooks/rspamd" "conf/rspamd/override.d" "conf/rspamd/local.d" "conf/rspamd/plugins.d" "conf/rspamd/lua" "conf/rspamd/rspamd.conf.local" "conf/rspamd/rspamd.conf.override" }}
-        {{- $shared := list (dict "dir" "rspamd-custom" "src" "conf/rspamd/custom") (dict "dir" "rspamd-vol") }}
-        {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "touch" (list "rspamd-override/worker-controller-password.inc")) | nindent 8 }}
+        {{- $shared := list (dict "dir" "rspamd-custom" "src" "conf/rspamd/custom") }}
+        {{- /* rspamd PVC: data/ = /var/lib/rspamd, override/ = UI password. Chart < 0.5.0 kept both on the
+        shared PVC (rspamd-vol, rspamd-override): copied over once, the socket left behind. */}}
+        {{- $script := `mkdir -p /rspamd/data /rspamd/override
+if [ ! -e /rspamd/.migrated-from-shared ]; then
+  if [ -d /shared/rspamd-vol ]; then
+    find /shared/rspamd-vol -mindepth 1 -maxdepth 1 ! -type s -exec cp -a {} /rspamd/data/ \;
+  fi
+  if [ -s /shared/rspamd-override/worker-controller-password.inc ] && [ ! -s /rspamd/override/worker-controller-password.inc ]; then
+    cp /shared/rspamd-override/worker-controller-password.inc /rspamd/override/worker-controller-password.inc
+  fi
+  touch /rspamd/.migrated-from-shared
+fi
+touch /rspamd/override/worker-controller-password.inc` }}
+        {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "script" $script "extraMounts" (list (dict "name" "rspamd" "mountPath" "/rspamd"))) | nindent 8 }}
+        # controller unix socket -> TCP 11335 for the rspamd-sock sidecars of php-fpm, dovecot, postfix
+        # (and watchdog). Probe without connecting: every connection reaches the controller, which logs
+        # an EOF error for a bare connect.
+        - name: rspamd-sock-relay
+          image: {{ include "mailcow.filesImage" . }}
+          imagePullPolicy: {{ .Values.files.image.pullPolicy }}
+          restartPolicy: Always
+          command: ["socat"]
+          args: ["TCP-LISTEN:11335,fork,reuseaddr", "UNIX-CONNECT:/var/lib/rspamd/rspamd.sock"]
+          {{- include "mailcow.relaySecurityContext" . | nindent 10 }}
+          ports:
+            - name: ctrl-relay
+              containerPort: 11335
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "netstat -ltn | grep -q ':11335 '"]
+            periodSeconds: 2
+            failureThreshold: 30
+          volumeMounts:
+            - name: rspamd
+              subPath: data
+              mountPath: /var/lib/rspamd
+              readOnly: true
+          resources:
+            {{- toYaml $v.socketRelay.resources | nindent 12 }}
       containers:
         - name: rspamd-mailcow
           image: {{ include "mailcow.image" $v.image }}
@@ -63,7 +101,8 @@ spec:
               containerPort: 9900
             - name: fuzzy
               containerPort: 11445
-          {{- include "mailcow.tcpProbes" (dict "port" 11334 "startup" 90) | nindent 10 }}
+          # controller /ping answers "pong" without auth (a bare TCP connect logs an EOF error per probe)
+          {{- include "mailcow.probes" (dict "handler" (dict "httpGet" (dict "path" "/ping" "port" 11334)) "startup" 90 "timeout" 5) | nindent 10 }}
           volumeMounts:
             {{- include "mailcow.hooksMount" "rspamd" | nindent 12 }}
             - name: shared
@@ -73,8 +112,8 @@ spec:
               subPath: conf/rspamd/override.d
               mountPath: /etc/rspamd/override.d
             # rspamd UI password (dockerapi rspamd/worker_password writes it, then restarts = deletes the pod)
-            - name: shared
-              subPath: rspamd-override/worker-controller-password.inc
+            - name: rspamd
+              subPath: override/worker-controller-password.inc
               mountPath: /etc/rspamd/override.d/worker-controller-password.inc
             - name: seed
               subPath: conf/rspamd/local.d
@@ -92,11 +131,14 @@ spec:
             - name: seed
               subPath: conf/rspamd/rspamd.conf.override
               mountPath: /etc/rspamd/rspamd.conf.override
-            # rspamd-vol-1: rspamd.sock is used by php-fpm/dovecot/postfix (same node)
-            - name: shared
-              subPath: rspamd-vol
+            # rspamd-vol-1 (own RWO PVC); rspamd.sock reaches the other pods through rspamd-sock-relay
+            - name: rspamd
+              subPath: data
               mountPath: /var/lib/rspamd
           resources:
             {{- toYaml $v.resources | nindent 12 }}
       volumes:
         {{- include "mailcow.seedVolumes" (dict "root" . "shared" true) | nindent 8 }}
+        - name: rspamd
+          persistentVolumeClaim:
+            claimName: {{ include "mailcow.claimName" (list . "rspamd" "rspamd") }}

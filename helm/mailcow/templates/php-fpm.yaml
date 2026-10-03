@@ -24,9 +24,10 @@ spec:
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
       {{- include "mailcow.podCommon" (dict "root" . "shared" true) | nindent 6 }}
       initContainers:
-        {{- $slices := list "hooks/phpfpm" "web" "conf/rspamd/dynmaps" "conf/dovecot/auth/mailcowauth.php" "conf/rspamd/meta_exporter" "conf/phpfpm/crons" "conf/phpfpm/php-fpm.d/pools.conf" "conf/phpfpm/php-conf.d" "assets/templates" "conf/nginx" }}
-        {{- $shared := list (dict "dir" "rspamd-custom" "src" "conf/rspamd/custom") (dict "dir" "rspamd-vol") (dict "dir" "sogo-conf") (dict "dir" "sogo-sso") }}
-        {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "files" (list (dict "src" "conf/dovecot/global_sieve_before" "dst" "global-sieve/before") (dict "src" "conf/dovecot/global_sieve_after" "dst" "global-sieve/after"))) | nindent 8 }}
+        {{- $slices := list "hooks/phpfpm" "web" "conf/rspamd/dynmaps" "conf/dovecot/auth/mailcowauth.php" "conf/rspamd/meta_exporter" "conf/phpfpm/crons" "conf/phpfpm/php-fpm.d/pools.conf" "conf/phpfpm/php-conf.d" "assets/templates" "conf/nginx" "conf/sogo" }}
+        {{- $shared := list (dict "dir" "rspamd-custom" "src" "conf/rspamd/custom") }}
+        {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "files" (list (dict "src" "conf/dovecot/global_sieve_before" "dst" "global-sieve/before") (dict "src" "conf/dovecot/global_sieve_after" "dst" "global-sieve/after")) "env" (include "mailcow.secretEnv" (list . "SOGO_SSO_PASS" "SOGO_SSO_PASS")) "script" (include "mailcow.sogoSsoScript" .)) | nindent 8 }}
+        {{- include "mailcow.rspamdSockSidecar" . | nindent 8 }}
       containers:
         - name: php-fpm-mailcow
           image: {{ include "mailcow.image" $v.image }}
@@ -123,12 +124,14 @@ spec:
               subPath: web/inc/{{ . }}
               mountPath: /mailcowauth/{{ . }}
             {{- end }}
-            - name: shared
-              subPath: rspamd-vol
+            # rspamd.sock from the rspamd-sock sidecar (UI: learn, quarantine, settings)
+            - name: rspamd-sock
               mountPath: /var/lib/rspamd
-            - name: shared
-              subPath: sogo-conf
+            # unused by php-fpm; the repo slice like compose's bind mount
+            - name: seed
+              subPath: conf/sogo
               mountPath: /etc/sogo/
+              readOnly: true
             - name: seed
               subPath: conf/rspamd/meta_exporter
               mountPath: /meta_exporter
@@ -136,9 +139,11 @@ spec:
             - name: seed
               subPath: conf/phpfpm/crons
               mountPath: /crons
-            - name: shared
-              subPath: sogo-sso
+            # sogo-sso.pass, derived from SOGO_SSO_PASS by the seed initContainer
+            - name: seed
+              subPath: conf/phpfpm/sogo-sso
               mountPath: /etc/sogo-sso/
+              readOnly: true
             - name: seed
               subPath: conf/phpfpm/php-fpm.d/pools.conf
               mountPath: /usr/local/etc/php-fpm.d/z-pools.conf
@@ -167,3 +172,4 @@ spec:
             {{- toYaml $v.resources | nindent 12 }}
       volumes:
         {{- include "mailcow.seedVolumes" (dict "root" . "shared" true) | nindent 8 }}
+        {{- include "mailcow.rspamdSockVolume" . | nindent 8 }}

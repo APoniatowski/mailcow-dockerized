@@ -22,7 +22,8 @@ helm install mailcow helm/mailcow -n mailcow --create-namespace \
   --set files.image.repository=registry.example.org/mailcow-files
 ```
 
-Before installing, check these cluster-specific values:
+Requires Kubernetes >= 1.29 (native sidecar containers, beta and on by default since 1.29, GA in
+1.33; `kubeVersion` in `Chart.yaml`). Before installing, check these cluster-specific values:
 
 | value | what | how to find it |
 |---|---|---|
@@ -42,7 +43,7 @@ Login: `admin` / `moohoo`. API key: `kubectl -n mailcow get secret mailcow-secre
 | unbound | Deployment + Service `unbound` with fixed ClusterIP; repo `unbound.conf` + appended `forward-zone` for `clusterDomain` → `clusterDNS` (`domain-insecure`, DNSSEC stays on for the rest), plus `forward-zone "."` → `unbound.forwarders` when set |
 | mysql, redis | StatefulSet (1 replica, PVC). Clients use TCP (`DBHOST=mysql`) |
 | dovecot, postfix | StatefulSet (1 replica) |
-| rspamd | Deployment, `hostname: rspamd` (worker-proxy binds `rspamd:9900`) |
+| rspamd | Deployment, `hostname: rspamd` (worker-proxy binds `rspamd:9900`), own PVC; controller socket relayed over TCP 11335 ([Storage](#storage)) |
 | php-fpm, sogo, nginx, clamd, olefy, memcached, postfix-tlspol | Deployment |
 | dockerapi | Deployment + ServiceAccount/Role (pods get/list/delete, pods/exec, metrics.k8s.io pods get), `DOCKERAPI_BACKEND=kubernetes`; Services `dockerapi`/`dockerapi-mailcow`, NetworkPolicy always on |
 | acme | optional (`acme.enabled`), default off → cert-manager / Secret / self-signed |
@@ -74,8 +75,8 @@ extraFiles:
     #!/bin/sh
 ```
 
-They are copied over the base slice on every pod start (also into shared dirs such as
-`conf/rspamd/custom` and `conf/sogo`, where they overwrite UI edits).
+They are copied over the base slice on every pod start (also into the shared dir
+`conf/rspamd/custom`, where they overwrite UI edits).
 
 ### Storage
 
@@ -83,15 +84,58 @@ They are copied over the base slice on every pod start (also into shared dirs su
 |---|---|
 | `vmail`, `vmail-index`, `crypt` | dovecot (**back up `crypt`**, without it mail is unreadable) |
 | `mysql`, `redis`, `postfix-tlspol`, `sogo-backup`, `clamd-db` | their component |
+| `rspamd` | rspamd: `data/` = `/var/lib/rspamd` (controller socket, non-critical state; bayes and fuzzy hashes live in Redis), `override/worker-controller-password.inc` (UI password) |
 | `postfix` | postfix (+ watchdog, same node) |
-| `shared` (subPaths) | `rspamd-vol` (rspamd.sock + state: rspamd, php-fpm, dovecot, postfix, watchdog), `rspamd-custom`, `rspamd-override` (UI password), `sogo-conf` (sogo.conf + dovecot-written creds), `sogo-sso`, `global-sieve`, `ssl` + `acme-challenge` (acme only) |
+| `shared` (subPaths) | see below |
 
-`persistence.shared.accessMode` defaults to ReadWriteMany. With ReadWriteOnce every pod mounting it
-gets a required podAffinity to one node (single-node clusters). Even with RWX, rspamd.sock is a unix
-socket, so its users effectively need one node. `global-sieve/{before,after}` (global filters, edited
-in the UI) start as the repo's `data/conf/dovecot/global_sieve_*` (or `extraFiles` with those paths)
-and are only re-seeded while missing or empty. Data PVCs and
-the generated Secret are kept on `helm uninstall` (`persistence.keep`).
+Only directories that one pod writes and another reads at runtime remain on `shared`:
+
+| subPath | written by | read by |
+|---|---|---|
+| `rspamd-custom` (`data/conf/rspamd/custom`) | php-fpm (UI maps), dovecot (`sa-rules` CronJob) | rspamd |
+| `global-sieve/{before,after}` | php-fpm (UI global filters) | dovecot |
+| `ssl`, `acme-challenge` (only `acme.enabled`) | acme | nginx, postfix, dovecot, watchdog |
+
+So `shared` is mounted by php-fpm, dovecot and rspamd, plus acme, nginx, postfix and watchdog with
+`acme.enabled`. sogo never mounts it, nor do nginx, postfix and watchdog without acme.
+
+`persistence.shared.accessMode` defaults to ReadWriteMany (multi-node: the pods above may run
+anywhere). With ReadWriteOnce (single node, or no RWX storage class) the pods that mount it get the
+label `mailcow.email/shared-volume` and a required podAffinity to each other, so they land on the
+node holding the volume; every other pod schedules freely. `global-sieve/{before,after}` start as the
+repo's `data/conf/dovecot/global_sieve_*` (or `extraFiles` with those paths) and are only re-seeded
+while missing or empty. Data PVCs and the generated Secret are kept on `helm uninstall`
+(`persistence.keep`).
+
+Not shared (compose shares them through bind mounts or named volumes):
+
+- SOGo credentials: dovecot's entrypoint writes `sieve.creds`, `cron.creds` (`/etc/sogo`) and
+  `sogo-sso.pass` (`/etc/phpfpm`) on every start. In the chart these two directories are pod-local
+  `emptyDir`s in dovecot (`imapsync_runner.pl` reads its local `sieve.creds`), and the seed
+  initContainers of sogo (`/etc/sogo/{sieve,cron}.creds`, next to the repo's `data/conf/sogo`) and
+  php-fpm (`/etc/sogo-sso/sogo-sso.pass`) write byte-identical files from the same Secret keys
+  (`DOVECOT_MASTER_USER`, `DOVECOT_MASTER_PASS`, `SOGO_SSO_PASS`, same `echo`/`echo -n` as the
+  entrypoint). With `existingSecret` nothing new is needed: those keys were already required. The
+  SOGo CronJobs read the files in the sogo pod.
+- rspamd's controller socket (`/var/lib/rspamd/rspamd.sock`, trusted without password by
+  `worker-controller.inc`): the rspamd pod runs a native sidecar `rspamd-sock-relay` (socat, files
+  image) that forwards TCP 11335 to the socket. php-fpm, dovecot, postfix and watchdog get an
+  `emptyDir` at `/var/lib/rspamd` and a native sidecar `rspamd-sock` that listens on
+  `/var/lib/rspamd/rspamd.sock` (mode 0666, like rspamd's own) and connects to
+  `rspamd-mailcow.<ns>.svc.<clusterDomain>:11335` per connection. Clients and rspamd config are
+  unchanged; rspamd still sees unix-socket clients. `rspamd.socketRelay.resources` sizes the sidecars.
+
+#### Upgrading from chart < 0.5.0
+
+- rspamd's state (`shared/rspamd-vol`) and UI password (`shared/rspamd-override`) move to the new
+  `rspamd` PVC: rspamd's seed initContainer copies both once (marker `.migrated-from-shared` on the
+  new PVC), so the rspamd UI password keeps working. Only if the old data is not on the `shared` PVC
+  at that point (e.g. a new `shared` claim), set the rspamd UI password again in the admin UI.
+- The `shared` subdirs `rspamd-vol`, `rspamd-override`, `sogo-conf` and `sogo-sso` are unused
+  afterwards and can be deleted. `sogo-conf` held UI-independent copies of `data/conf/sogo`; use
+  `extraFiles` (`conf/sogo/...`) for SOGo customisation, as before.
+- postfix, sogo and nginx (without acme) lose the shared-volume podAffinity and may be rescheduled
+  to other nodes.
 
 ### TLS
 
@@ -162,7 +206,7 @@ The chart sets them; images at the tags pinned in `docker-compose.yml` support a
 | `MAILCOW_NETWORKS` | rspamd, postfix, php-fpm | `mailcow.networks` |
 | `SOGO_TRUSTED_NETS` | dovecot, php-fpm | `mailcow.sogoTrustedNets` (empty = `mailcow.networks`) |
 | `DOVECOT_TRUSTED_NETS`, `RSPAMD_TRUSTED_NETS` | rspamd | `mailcow.dovecotTrustedNets` / `rspamdTrustedNets` (empty = `mailcow.networks`); unset, rspamd waits forever for `dig dovecot` |
-| `SOGO_SSO_PASS`, `DOVECOT_MASTER_USER/PASS` | dovecot | release Secret (stable SOGo SSO, sieve.creds, cron.creds) |
+| `SOGO_SSO_PASS`, `DOVECOT_MASTER_USER/PASS` | dovecot (+ seed initContainers of sogo, php-fpm) | release Secret (stable SOGo SSO, sieve.creds, cron.creds; sogo/php-fpm derive the same files, see [Storage](#storage)) |
 | `SOGO_ENCRYPTION_KEY` | sogo | release Secret (alphanumeric) |
 | `DOCKERAPI_BACKEND=kubernetes`, `COMPOSE_PROJECT_NAME`, `K8S_POD_SELECTOR` | dockerapi | pods matched by `app.kubernetes.io/name=mailcow,app.kubernetes.io/instance=<release>` in the ServiceAccount's namespace |
 
@@ -215,9 +259,16 @@ objects are ignored silently.
 
 - Always: dockerapi :443 only from php-fpm, watchdog, acme and dovecot pods. dockerapi is an
   unauthenticated API that runs commands in every mailcow container.
+- Always: rspamd's controller relay :11335 only from php-fpm, dovecot, postfix and watchdog pods.
+  It forwards to the controller's unix socket, which rspamd trusts like localhost: no password,
+  full controller access (learn, fuzzy add/delete, settings, maps, history). The same policy opens
+  rspamd's other ports (11333, 11334, 9900, 11445) to release pods with `networkPolicy.enabled`, and
+  to anyone without it (a policy selecting the pod would block them otherwise). No other rule
+  mentions 11335. Without an enforcing CNI every pod in the cluster can reach 11335; so can traffic
+  from the node itself (kubelet, hostNetwork pods), which most CNIs never filter.
 - `networkPolicy.enabled` (default `true`, in both mail modes; only `false` turns it off, the old
-  `""` auto mode now counts as on): every port of mysql, redis, memcached, clamd, olefy, rspamd,
-  php-fpm, sogo, postfix-tlspol, unbound, postfix and dovecot only from pods of this release;
+  `""` auto mode now counts as on): every port of mysql, redis, memcached, clamd, olefy,
+  php-fpm, sogo, postfix-tlspol, unbound, postfix and dovecot (rspamd: every port but 11335) only from pods of this release;
   postfix/dovecot client ports (PROXY listeners, or the plain ports without PROXY protocol) from
   `networkPolicy.publicMailFrom`; nginx http/https from anywhere. Without it, any pod in the cluster
   can relay through postfix, since it connects from the pod CIDR.
@@ -318,7 +369,10 @@ drop traffic meet. Options:
 
 ## Limitations (0.1)
 
-- dovecot/postfix single replica; rspamd/php-fpm/dovecot/postfix share a node through rspamd.sock.
+- dovecot/postfix single replica.
+- `shared` needs RWX for php-fpm, dovecot and rspamd to spread over nodes; with RWO they share one
+  node ([Storage](#storage)). rspamd.sock no longer ties pods to a node (TCP relay).
+- Kubernetes >= 1.29 (native sidecars for the rspamd socket relays).
 - No fail2ban (netfilter); see [Brute-force protection](#brute-force-protection-no-fail2ban).
 - `redis` `net.core.somaxconn` is an unsafe sysctl (`redis.sysctls`, off by default); compose
   ulimits for dovecot have no pod equivalent (runtime defaults are higher).
@@ -330,7 +384,7 @@ drop traffic meet. Options:
 - `helm/mailcow/scripts/check-tags.sh [--fix]`: chart image tags must equal `docker-compose.yml`.
 - `ci/*-values.yaml`: kind (NodePorts 30080/30443/30025/30465/30587/30143/30993/32190, RWO shared,
   self-signed TLS, clamd skipped), cert-manager + Ingress, HA (RWX, LB + PROXY,
-  watchdog, NetworkPolicy), acme + extraFiles (postfix limits off, NetworkPolicy off), NetworkPolicy without PROXY protocol.
+  watchdog, NetworkPolicy), acme + extraFiles + watchdog (postfix limits off, NetworkPolicy off), NetworkPolicy without PROXY protocol.
   kind and cert-manager: NetworkPolicy on with the default `publicMailFrom`; cert-manager renders
   `cert-reload` with the ofelia CronJobs off.
   `check-tags.sh` skips the compose services the chart does not ship (ofelia, netfilter).

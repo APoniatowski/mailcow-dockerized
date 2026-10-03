@@ -2,6 +2,7 @@
 {{- $c := "watchdog" }}
 {{- $v := .Values.watchdog }}
 {{- $m := .Values.mailcow }}
+{{- $acme := .Values.acme.enabled }}
 {{- $defaults := dict
   "USE_WATCHDOG" "y" "WATCHDOG_NOTIFY_EMAIL" "" "WATCHDOG_NOTIFY_BAN" "y" "WATCHDOG_NOTIFY_START" "y"
   "WATCHDOG_SUBJECT" "Watchdog ALERT" "WATCHDOG_NOTIFY_WEBHOOK" "" "WATCHDOG_NOTIFY_WEBHOOK_BODY" ""
@@ -30,14 +31,17 @@ spec:
     metadata:
       labels:
         {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+        {{- if $acme }}
         {{- include "mailcow.sharedLabel" . | nindent 8 }}
+        {{- end }}
       annotations:
         {{- include "mailcow.podAnnotations" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
       {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
-      # mounts postfix's RWO queue volume (and rspamd.sock): must run on postfix's node
+      # mounts postfix's RWO queue volume: must run on postfix's node (with acme and an RWO shared
+      # PVC, postfix sits on the shared node too)
       affinity:
         podAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -46,7 +50,8 @@ spec:
                 matchLabels:
                   {{- include "mailcow.selectorLabels" (dict "root" . "component" "postfix") | nindent 18 }}
       initContainers:
-        {{- include "mailcow.seedInit" (dict "root" . "shared" (list (dict "dir" "rspamd-vol")) "ssl" true) | nindent 8 }}
+        {{- include "mailcow.seedInit" (dict "root" . "ssl" true) | nindent 8 }}
+        {{- include "mailcow.rspamdSockSidecar" . | nindent 8 }}
       containers:
         - name: watchdog-mailcow
           image: {{ include "mailcow.image" $v.image }}
@@ -87,8 +92,8 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
-            - name: shared
-              subPath: rspamd-vol
+            # rspamd.sock from the rspamd-sock sidecar (rspamd scan check)
+            - name: rspamd-sock
               mountPath: /var/lib/rspamd
             - name: postfix-spool
               mountPath: /var/spool/postfix
@@ -96,8 +101,9 @@ spec:
           resources:
             {{- toYaml $v.resources | nindent 12 }}
       volumes:
-        {{- include "mailcow.seedVolumes" (dict "root" . "shared" true) | nindent 8 }}
+        {{- include "mailcow.seedVolumes" (dict "root" . "shared" $acme) | nindent 8 }}
         {{- include "mailcow.tlsVolumes" . | nindent 8 }}
+        {{- include "mailcow.rspamdSockVolume" . | nindent 8 }}
         - name: tmp
           emptyDir:
             medium: Memory

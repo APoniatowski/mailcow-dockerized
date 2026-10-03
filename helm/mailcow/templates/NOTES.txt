@@ -30,8 +30,10 @@ Checks:
   - unbound Service clusterIP {{ .Values.unbound.clusterIP }} must lie in the cluster service CIDR.
   - mailcow.networks ({{ .Values.mailcow.networks }}) must be the pod CIDR and nothing wider.
 {{- if eq .Values.persistence.shared.accessMode "ReadWriteOnce" }}
-  - shared PVC is ReadWriteOnce: all mailcow pods are pinned to one node.
+  - shared PVC is ReadWriteOnce: php-fpm, dovecot and rspamd{{ if .Values.acme.enabled }} (+ acme, nginx, postfix, watchdog){{ end }} are pinned to one node.
 {{- end }}
+  - rspamd's controller socket reaches php-fpm, dovecot, postfix{{ if .Values.watchdog.enabled }}, watchdog{{ end }} over TCP 11335 (socat relays,
+    native sidecars: Kubernetes >= 1.29). Its NetworkPolicy is always on; it only protects with an enforcing CNI.
   - dockerapi can exec into and delete every pod in namespace {{ .Release.Namespace }}: keep mailcow alone in it.
 {{- if include "mailcow.networkPolicy" . }}
   - NetworkPolicies are rendered; they only protect anything if your CNI enforces them.
@@ -46,6 +48,13 @@ Checks:
 WARNING: mail.proxyProtocol is false and the mail Service uses externalTrafficPolicy Cluster.
   Client connections may be SNAT'd to node or pod-CIDR addresses; if those fall into mailcow.networks,
   postfix relays for everyone (open relay). Use externalTrafficPolicy Local or PROXY protocol.
+{{- end }}
+{{- if .Release.IsUpgrade }}
+
+Upgrading from chart < 0.5.0: rspamd's /var/lib/rspamd and UI password moved from the shared PVC to the
+  new PVC {{ include "mailcow.claimName" (list . "rspamd" "rspamd") }} (copied over once by rspamd's seed initContainer). SOGo's creds files are no
+  longer shared. The shared PVC subdirs rspamd-vol, rspamd-override, sogo-conf and sogo-sso are unused now
+  and can be deleted. See README "Storage".
 {{- end }}
 {{- if not .Values.mailcow.sogoTrustedNets }}
 

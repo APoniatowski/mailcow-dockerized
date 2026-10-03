@@ -22,7 +22,6 @@ spec:
     metadata:
       labels:
         {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
-        {{- include "mailcow.sharedLabel" . | nindent 8 }}
       annotations:
         {{- include "mailcow.podAnnotations" . | nindent 8 }}
     spec:
@@ -30,10 +29,11 @@ spec:
       # bootstrap-sogo.sh checks its own port as `nc -z sogo-mailcow 20000`
       hostname: sogo-mailcow
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
-      {{- include "mailcow.podCommon" (dict "root" . "shared" true) | nindent 6 }}
+      {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
       initContainers:
-        {{- $shared := list (dict "dir" "sogo-conf" "src" "conf/sogo" "clobber" true) }}
-        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/sogo" "web/inc/init_db.inc.php") "shared" $shared) | nindent 8 }}
+        {{- /* /etc/sogo: repo slice + sieve.creds/cron.creds derived from the Secret (dovecot writes the same
+        bytes into its own pod-local copy); writable, bootstrap-sogo.sh renames a custom logo in it */}}
+        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/sogo" "web/inc/init_db.inc.php" "conf/sogo") "env" (include "mailcow.sogoCredsEnv" .) "script" (include "mailcow.sogoCredsScript" .)) | nindent 8 }}
       containers:
         - name: sogo-mailcow
           image: {{ include "mailcow.image" $v.image }}
@@ -74,15 +74,15 @@ spec:
           {{- include "mailcow.probes" (dict "handler" (dict "httpGet" (dict "path" "/SOGo.index/" "port" 20000)) "startup" 90 "ready" 20 "live" 30 "timeout" 5) | nindent 10 }}
           volumeMounts:
             {{- include "mailcow.hooksMount" "sogo" | nindent 12 }}
-            - name: shared
-              subPath: sogo-conf
+            - name: seed
+              subPath: conf/sogo
               mountPath: /etc/sogo/
             - name: seed
               subPath: web/inc/init_db.inc.php
               mountPath: /init_db.inc.php
             {{- range list (list "custom-favicon.ico" "img/sogo.ico") (list "custom-shortlogo.svg" "img/sogo-compact.svg") (list "custom-fulllogo.svg" "img/sogo-full.svg") (list "custom-fulllogo.png" "img/sogo-logo.png") (list "custom-theme.js" "js/theme.js") (list "custom-sogo.js" "js/custom-sogo.js") }}
-            - name: shared
-              subPath: sogo-conf/{{ index . 0 }}
+            - name: seed
+              subPath: conf/sogo/{{ index . 0 }}
               mountPath: {{ $res }}/{{ index . 1 }}
             {{- end }}
             # sogo-web-vol-1: nginx copies the web assets from the sogo image itself (initContainer)
@@ -93,7 +93,7 @@ spec:
           resources:
             {{- toYaml $v.resources | nindent 12 }}
       volumes:
-        {{- include "mailcow.seedVolumes" (dict "root" . "shared" true) | nindent 8 }}
+        {{- include "mailcow.seedVolumes" (dict "root" .) | nindent 8 }}
         - name: sogo-web
           emptyDir: {}
         - name: backup

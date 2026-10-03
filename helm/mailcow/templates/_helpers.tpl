@@ -320,6 +320,7 @@ Args (dict):
             dst is missing or empty, so UI edits survive restarts (single-file subPath mounts)
   ssl       true: prepare /etc/ssl/mail (Secret mode) or wait for the acme cert (acme mode)
   appends   list of dicts {key, dst}: append k8s-conf ConfigMap key to /seed/<dst>
+  env       env entries (YAML string) for the script
   script    extra shell appended at the end */}}
 {{- define "mailcow.seedInit" -}}
 {{- $root := .root -}}
@@ -395,6 +396,10 @@ Args (dict):
       {{- with .script }}
       {{- . | nindent 6 }}
       {{- end }}
+  {{- with .env }}
+  env:
+    {{- . | nindent 4 }}
+  {{- end }}
   volumeMounts:
     - name: seed
       mountPath: /seed
@@ -424,6 +429,79 @@ Args (dict):
 - name: seed
   subPath: hooks/{{ . }}
   mountPath: /hooks
+{{- end -}}
+
+{{/* ---------- SOGo credential files ----------
+dovecot's entrypoint writes sieve.creds, cron.creds (into /etc/sogo) and sogo-sso.pass (into
+/etc/phpfpm) on every start, from DOVECOT_MASTER_USER/PASS and SOGO_SSO_PASS. The sogo and php-fpm
+pods derive the same bytes from the same Secret keys in their seed initContainer (same unquoted
+echo / echo -n as the entrypoint), so nothing is shared with the dovecot pod. */}}
+{{- define "mailcow.sogoCredsEnv" -}}
+{{ include "mailcow.secretEnv" (list . "DOVECOT_MASTER_USER" "DOVECOT_MASTER_USER") }}
+{{ include "mailcow.secretEnv" (list . "DOVECOT_MASTER_PASS" "DOVECOT_MASTER_PASS") }}
+{{ include "mailcow.secretEnv" (list . "SOGO_SSO_PASS" "SOGO_SSO_PASS") }}
+{{- end -}}
+
+{{/* /seed/conf/sogo/{sieve.creds,cron.creds} (sogo pod) */}}
+{{- define "mailcow.sogoCredsScript" -}}
+if [ -z "${DOVECOT_MASTER_USER}" ] || [ -z "${DOVECOT_MASTER_PASS}" ] || [ -z "${SOGO_SSO_PASS}" ]; then
+  echo "DOVECOT_MASTER_USER, DOVECOT_MASTER_PASS and SOGO_SSO_PASS must be set in the Secret"; exit 1
+fi
+mkdir -p /seed/conf/sogo
+echo ${DOVECOT_MASTER_USER}@mailcow.local:${DOVECOT_MASTER_PASS} > /seed/conf/sogo/sieve.creds
+echo -n ${DOVECOT_MASTER_USER}@mailcow.local:${SOGO_SSO_PASS} > /seed/conf/sogo/cron.creds
+{{- end -}}
+
+{{/* /seed/conf/phpfpm/sogo-sso/sogo-sso.pass (php-fpm pod, compose ./data/conf/phpfpm/sogo-sso) */}}
+{{- define "mailcow.sogoSsoScript" -}}
+if [ -z "${SOGO_SSO_PASS}" ]; then echo "SOGO_SSO_PASS must be set in the Secret"; exit 1; fi
+mkdir -p /seed/conf/phpfpm/sogo-sso
+echo -n ${SOGO_SSO_PASS} > /seed/conf/phpfpm/sogo-sso/sogo-sso.pass
+{{- end -}}
+
+{{/* ---------- rspamd controller socket relay ----------
+rspamd's controller trusts its unix socket (worker-controller.inc). Instead of sharing the socket's
+directory across pods, the rspamd pod exposes it on TCP 11335 (socat sidecar `rspamd-sock-relay`,
+NetworkPolicy always limits it to the socket's users) and every user pod gets a local
+/var/lib/rspamd/rspamd.sock from a socat sidecar `rspamd-sock` connecting there. */}}
+{{- define "mailcow.relaySecurityContext" -}}
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+{{- end -}}
+
+{{/* client side: native sidecar (initContainer, restartPolicy Always) + emptyDir `rspamd-sock` */}}
+{{- define "mailcow.rspamdSockSidecar" -}}
+- name: rspamd-sock
+  image: {{ include "mailcow.filesImage" . }}
+  imagePullPolicy: {{ .Values.files.image.pullPolicy }}
+  restartPolicy: Always
+  command: ["socat"]
+  args:
+    - UNIX-LISTEN:/var/lib/rspamd/rspamd.sock,fork,mode=0666,unlink-early
+    # resolved per connection; FQDN works with unbound-only pod DNS too
+    - TCP:{{ include "mailcow.svcFqdn" (list . "rspamd-mailcow") }}:11335
+  {{- include "mailcow.relaySecurityContext" . | nindent 2 }}
+  startupProbe:
+    exec:
+      command: ["test", "-S", "/var/lib/rspamd/rspamd.sock"]
+    periodSeconds: 2
+    failureThreshold: 30
+  volumeMounts:
+    - name: rspamd-sock
+      mountPath: /var/lib/rspamd
+  resources:
+    {{- toYaml .Values.rspamd.socketRelay.resources | nindent 4 }}
+{{- end -}}
+
+{{- define "mailcow.rspamdSockVolume" -}}
+- name: rspamd-sock
+  emptyDir: {}
 {{- end -}}
 
 {{/* ---------- probes ---------- */}}

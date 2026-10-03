@@ -1,5 +1,5 @@
 # mailcow ACME client instead of cert-manager, plus extraFiles, skipped components, no postfix rate limits
-# and NetworkPolicy off.
+# and NetworkPolicy off. watchdog on: with acme it mounts the shared ssl dir (RWO here) next to postfix.
 mailcow:
   hostname: mail.example.org
 
@@ -32,6 +32,9 @@ http:
 persistence:
   shared:
     accessMode: ReadWriteOnce
+
+watchdog:
+  enabled: true
 
 bruteForce:
   enabled: false
