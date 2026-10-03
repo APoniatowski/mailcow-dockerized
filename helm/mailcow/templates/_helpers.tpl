@@ -178,6 +178,9 @@ except mailcow.networks (in-cluster pods from the pod CIDR would be trusted as i
 {{- define "mailcow.egressClusterCIDRs" -}}
 {{- $e := .Values.networkPolicy.egress -}}
 {{- $in := $e.clusterCIDRs | default (concat (splitList "," .Values.mailcow.networks) (splitList "," (toString $e.serviceCIDR))) -}}
+{{- /* the API server often sits on a node/VPC address outside the cluster CIDRs: keep it out of the
+       internet rule so only the pods in <fullname>-egress-apiserver can reach it */ -}}
+{{- $in = concat $in ($e.apiServerCIDRs | default list) -}}
 {{- $out := list -}}
 {{- range $in -}}{{- if trim (toString .) -}}{{- $out = append $out (trim (toString .)) -}}{{- end -}}{{- end -}}
 {{- toJson $out -}}
