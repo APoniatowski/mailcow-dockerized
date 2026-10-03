@@ -97,6 +97,7 @@ services:
         - REDIS_SLAVEOF_PORT=${REDIS_SLAVEOF_PORT:-}
         - REDISPASS=${REDISPASS}
         - SPAMHAUS_DQS_KEY=${SPAMHAUS_DQS_KEY:-}
+        - POSTFIXHOST=${POSTFIXHOST:-}
       volumes:
         - ./data/hooks/rspamd:/hooks:Z
         - ./data/conf/rspamd/custom/:/etc/rspamd/custom:z
@@ -187,6 +188,7 @@ services:
         - WEBAUTHN_ONLY_TRUSTED_VENDORS=${WEBAUTHN_ONLY_TRUSTED_VENDORS:-n}
         - CLUSTERMODE=${CLUSTERMODE:-}
         - ADDITIONAL_SERVER_NAMES=${ADDITIONAL_SERVER_NAMES:-}
+        - DOCKERAPIHOST=${DOCKERAPIHOST:-}
       restart: always
       labels:
         ofelia.enabled: "true"
@@ -223,6 +225,8 @@ services:
         - REDIS_SLAVEOF_IP=${REDIS_SLAVEOF_IP:-}
         - REDIS_SLAVEOF_PORT=${REDIS_SLAVEOF_PORT:-}
         - REDISPASS=${REDISPASS}
+        - DOVECOTHOST=${DOVECOTHOST:-}
+        - POSTFIXHOST=${POSTFIXHOST:-}
       dns:
         - ${IPV4_NETWORK:-172.22.1}.254
       volumes:
@@ -305,6 +309,7 @@ services:
         - REDIS_SLAVEOF_PORT=${REDIS_SLAVEOF_PORT:-}
         - REDISPASS=${REDISPASS}
         - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-mailcow-dockerized}
+        - DOCKERAPIHOST=${DOCKERAPIHOST:-}
       ports:
         - "${DOVEADM_PORT:-127.0.0.1:19991}:12345"
         - "${IMAP_PORT:-143}:143"
@@ -390,7 +395,7 @@ services:
             - postfix
 
     postfix-tlspol-mailcow:
-      image: ghcr.io/mailcow/postfix-tlspol:1.11.0
+      image: ghcr.io/mailcow/postfix-tlspol:1.11.0-1
       depends_on:
         unbound-mailcow:
           condition: service_healthy
@@ -403,6 +408,8 @@ services:
         - REDIS_SLAVEOF_PORT=${REDIS_SLAVEOF_PORT:-}
         - REDISPASS=${REDISPASS}
         - DEV_MODE=${DEV_MODE:-n}
+        - TLSPOL_DNS=${TLSPOL_DNS:-}
+        - WAIT_TCP=${WAIT_TCP:-}
       restart: always
       dns:
         - ${IPV4_NETWORK:-172.22.1}.254
@@ -427,7 +434,7 @@ services:
         - php-fpm-mailcow
         - sogo-mailcow
         - rspamd-mailcow
-      image: ghcr.io/mailcow/nginx:1.30.4-1
+      image: ghcr.io/mailcow/nginx:1.30.4-2
       dns:
         - ${IPV4_NETWORK:-172.22.1}.254
       environment:
@@ -447,6 +454,7 @@ services:
         - IPV4_NETWORK=${IPV4_NETWORK:-172.22.1}
         - NGINX_USE_PROXY_PROTOCOL=${NGINX_USE_PROXY_PROTOCOL:-n}
         - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
+        - WAIT_TCP=${WAIT_TCP:-}
       volumes:
         - ./data/web:/web:ro,z
         - ./data/conf/rspamd/dynmaps:/dynmaps:ro,z
@@ -503,6 +511,9 @@ services:
         - ACME_DNS_CHALLENGE=${ACME_DNS_CHALLENGE:-n}
         - ACME_DNS_PROVIDER=${ACME_DNS_PROVIDER:-dns_xxx}
         - ACME_ACCOUNT_EMAIL=${ACME_ACCOUNT_EMAIL:-me@example.com}
+        - DOCKERAPIHOST=${DOCKERAPIHOST:-}
+        - NGINXHOST=${NGINXHOST:-}
+        - WAIT_TCP=${WAIT_TCP:-}
       volumes:
         - ./data/web/.well-known/acme-challenge:/var/www/acme:z
         - ./data/assets/ssl:/var/lib/acme/:z
@@ -516,7 +527,7 @@ services:
             - acme
 
     netfilter-mailcow:
-      image: ghcr.io/mailcow/netfilter:1.64
+      image: ghcr.io/mailcow/netfilter:1.65
       stop_grace_period: 30s
       restart: always
       privileged: true
@@ -531,6 +542,7 @@ services:
         - REDISPASS=${REDISPASS}
         - MAILCOW_REPLICA_IP=${MAILCOW_REPLICA_IP:-}
         - DISABLE_NETFILTER_ISOLATION_RULE=${DISABLE_NETFILTER_ISOLATION_RULE:-n}
+        - NETFILTER_REDISHOST=${NETFILTER_REDISHOST:-}
       network_mode: "host"
       volumes:
         - /lib/modules:/lib/modules:ro
@@ -607,6 +619,7 @@ services:
         - MAILQ_THRESHOLD=${MAILQ_THRESHOLD:-20}
         - MAILQ_CRIT=${MAILQ_CRIT:-30}
         - DEV_MODE=${DEV_MODE:-n}
+        - DOCKERAPIHOST=${DOCKERAPIHOST:-}
       networks:
         mailcow-network:
           aliases:

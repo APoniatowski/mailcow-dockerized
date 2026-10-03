@@ -63,20 +63,28 @@ if [[ "${SKIP_LETS_ENCRYPT}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
   exec $(readlink -f "$0")
 fi
 
+wait_host() {
+  if [[ "${WAIT_TCP}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+    nc -z -w 2 "$1" "$2"
+  else
+    ping "$1" -c1 > /dev/null
+  fi
+}
+
 log_f "Waiting for Docker API..."
-until ping dockerapi -c1 > /dev/null; do
+until wait_host ${DOCKERAPIHOST:-dockerapi} 443; do
   sleep 1
 done
 log_f "Docker API OK"
 
 log_f "Waiting for Postfix..."
-until ping postfix -c1 > /dev/null; do
+until wait_host postfix 25; do
   sleep 1
 done
 log_f "Postfix OK"
 
 log_f "Waiting for Dovecot..."
-until ping dovecot -c1 > /dev/null; do
+until wait_host dovecot 143; do
   sleep 1
 done
 log_f "Dovecot OK"
@@ -144,7 +152,7 @@ done
 log_f "Database OK"
 
 log_f "Waiting for Nginx..."
-until $(curl --output /dev/null --silent --head --fail http://nginx.${COMPOSE_PROJECT_NAME}_mailcow-network:8081); do
+until $(curl --output /dev/null --silent --head --fail http://${NGINXHOST:-nginx.${COMPOSE_PROJECT_NAME}_mailcow-network}:8081); do
   sleep 2
 done
 log_f "Nginx OK"
@@ -158,7 +166,7 @@ log_f "Resolver OK"
 # Waiting for domain table
 log_f "Waiting for domain table..."
 while [[ -z ${DOMAIN_TABLE} ]]; do
-  curl --silent http://nginx.${COMPOSE_PROJECT_NAME}_mailcow-network/ >/dev/null 2>&1
+  curl --silent http://${NGINXHOST:-nginx.${COMPOSE_PROJECT_NAME}_mailcow-network}/ >/dev/null 2>&1
   DOMAIN_TABLE=$(mariadb --skip-ssl ${DB_CONN_ARGS} -u ${DBUSER} -p${DBPASS} ${DBNAME} -e "SHOW TABLES LIKE 'domain'" -Bs)
   [[ -z ${DOMAIN_TABLE} ]] && sleep 10
 done

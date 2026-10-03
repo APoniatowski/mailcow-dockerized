@@ -49,11 +49,11 @@ cat <<EOF > /var/lib/sogo/GNUstep/Defaults/sogod.plist
     <key>OCSAclURL</key>
     <string>mysql://${DBUSER}:${DBPASS}@${SOGO_DB_HOST}/${DBNAME}/sogo_acl</string>
     <key>SOGoIMAPServer</key>
-    <string>imap://${IPV4_NETWORK}.250:143/?TLS=YES&amp;tlsVerifyMode=none</string>
+    <string>imap://${DOVECOTHOST:-${IPV4_NETWORK}.250}:143/?TLS=YES&amp;tlsVerifyMode=none</string>
     <key>SOGoSieveServer</key>
-    <string>sieve://${IPV4_NETWORK}.250:4190/?TLS=YES&amp;tlsVerifyMode=none</string>
+    <string>sieve://${DOVECOTHOST:-${IPV4_NETWORK}.250}:4190/?TLS=YES&amp;tlsVerifyMode=none</string>
     <key>SOGoSMTPServer</key>
-    <string>smtp://${IPV4_NETWORK}.253:588/?TLS=YES&amp;tlsVerifyMode=none</string>
+    <string>smtp://${POSTFIXHOST:-${IPV4_NETWORK}.253}:588/?TLS=YES&amp;tlsVerifyMode=none</string>
     <key>SOGoTrustProxyAuthentication</key>
     <string>YES</string>
     <key>SOGoEncryptionKey</key>

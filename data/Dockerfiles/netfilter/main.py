@@ -476,7 +476,7 @@ if __name__ == '__main__':
         "Connecting redis (SLAVEOF_IP:%s, PORT:%s)" % (redis_slaveof_ip, redis_slaveof_port))
       if "".__eq__(redis_slaveof_ip):
         r = redis.StrictRedis(
-          host=os.getenv('IPV4_NETWORK', '172.22.1') + '.249', decode_responses=True, port=6379, db=0, password=os.environ['REDISPASS'])
+          host=os.getenv('NETFILTER_REDISHOST') or os.getenv('IPV4_NETWORK', '172.22.1') + '.249', decode_responses=True, port=6379, db=0, password=os.environ['REDISPASS'])
       else:
         r = redis.StrictRedis(
           host=redis_slaveof_ip, decode_responses=True, port=redis_slaveof_port, db=0, password=os.environ['REDISPASS'])
