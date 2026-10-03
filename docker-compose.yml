@@ -186,6 +186,7 @@ services:
         - SKIP_CLAMD=${SKIP_CLAMD:-n}
         - SKIP_OLEFY=${SKIP_OLEFY:-n}
         - SKIP_SOGO=${SKIP_SOGO:-n}
+        - SKIP_MYSQL_UPGRADE=${SKIP_MYSQL_UPGRADE:-}
         - ALLOW_ADMIN_EMAIL_LOGIN=${ALLOW_ADMIN_EMAIL_LOGIN:-n}
         - MASTER=${MASTER:-y}
         - DEV_MODE=${DEV_MODE:-n}
