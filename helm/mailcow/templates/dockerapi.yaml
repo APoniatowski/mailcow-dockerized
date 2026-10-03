@@ -64,6 +64,16 @@ spec:
       automountServiceAccountToken: true
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
       {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
+      initContainers:
+        # dockerapi exits while redis is unreachable; its name resolves through unbound
+        - name: wait
+          image: {{ include "mailcow.filesImage" . }}
+          imagePullPolicy: {{ .Values.files.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - until getent hosts redis-mailcow >/dev/null && nc -z -w 2 redis-mailcow 6379; do echo "waiting for unbound and redis-mailcow:6379"; sleep 2; done
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
       containers:
         - name: dockerapi-mailcow
           image: {{ include "mailcow.image" $v.image }}

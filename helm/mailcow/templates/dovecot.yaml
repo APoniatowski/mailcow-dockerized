@@ -28,7 +28,7 @@ spec:
       initContainers:
         {{- $shared := list (dict "dir" "rspamd-custom" "src" "conf/rspamd/custom") (dict "dir" "rspamd-vol") (dict "dir" "sogo-conf") (dict "dir" "sogo-sso") }}
         {{- $appends := list (dict "key" "dovecot-k8s.conf" "dst" "conf/dovecot/extra.conf") }}
-        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/dovecot" "conf/dovecot" "assets/templates") "shared" $shared "touch" (list "global-sieve/before" "global-sieve/after") "appends" $appends "ssl" true) | nindent 8 }}
+        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/dovecot" "conf/dovecot" "assets/templates") "shared" $shared "files" (list (dict "src" "conf/dovecot/global_sieve_before" "dst" "global-sieve/before") (dict "src" "conf/dovecot/global_sieve_after" "dst" "global-sieve/after")) "appends" $appends "ssl" true) | nindent 8 }}
       containers:
         - name: dovecot-mailcow
           image: {{ include "mailcow.image" $v.image }}
@@ -93,7 +93,10 @@ spec:
             - {name: pop3-pp, containerPort: 10110}
             - {name: pop3s-pp, containerPort: 10995}
             - {name: sieve-pp, containerPort: 14190}
-          {{- include "mailcow.tcpProbes" (dict "port" 143 "startup" 90) | nindent 10 }}
+          # asks the master process over its socket: no imap-login session, nothing logged
+          # (a TCP probe on 143 logs "Disconnected (no auth attempts)" into the UI log every period)
+          # master answers + IMAP and LMTP listening, checked without connecting (a TCP probe logs a login per period)
+          {{- include "mailcow.probes" (dict "handler" (dict "exec" (dict "command" (list "sh" "-c" "doveadm service status >/dev/null && netstat -ltn | grep -q ':143 ' && netstat -ltn | grep -q ':24 '"))) "startup" 90 "ready" 20 "live" 30 "timeout" 5) | nindent 10 }}
           volumeMounts:
             {{- include "mailcow.hooksMount" "dovecot" | nindent 12 }}
             - name: seed

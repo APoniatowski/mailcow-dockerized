@@ -16,6 +16,8 @@ skip:
 clusterDNS: 10.96.0.10
 unbound:
   clusterIP: 10.96.53.53
+  # some networks intercept or block outbound :53, so recursion from the root servers fails there
+  forwarders: [1.1.1.1, 9.9.9.9]
 
 files:
   image:
@@ -62,6 +64,7 @@ http:
 # no tls.* set -> self-signed bootstrap Job (snake-oil for mail.example.org)
 
 cronjobs:
-  # completed CronJob pods would never turn Ready and stall `kubectl wait --all`
-  successfulJobsHistoryLimit: 0
-  ttlSecondsAfterFinished: 0
+  # finished Job pods never turn Ready: wait on `-l app.kubernetes.io/component!=cron`. TTL 0 / history 0
+  # delete a Job before the CronJob controller records it finished -> "MissingJob" warnings
+  successfulJobsHistoryLimit: 1
+  ttlSecondsAfterFinished: 120

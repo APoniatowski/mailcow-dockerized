@@ -69,7 +69,9 @@ spec:
           ports:
             - name: sogo
               containerPort: 20000
-          {{- include "mailcow.tcpProbes" (dict "port" 20000 "startup" 90) | nindent 10 }}
+          # watchdog's check (check_http /SOGo.index/): one access log line per probe, where a bare TCP
+          # connect logs "http server caught: (null)" as an error
+          {{- include "mailcow.probes" (dict "handler" (dict "httpGet" (dict "path" "/SOGo.index/" "port" 20000)) "startup" 90 "ready" 20 "live" 30 "timeout" 5) | nindent 10 }}
           volumeMounts:
             {{- include "mailcow.hooksMount" "sogo" | nindent 12 }}
             - name: shared

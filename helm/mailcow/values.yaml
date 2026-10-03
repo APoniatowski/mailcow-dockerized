@@ -331,6 +331,13 @@ unbound:
   # -- Fixed ClusterIP of the `unbound` Service; pods that used `dns: .254` in compose use it as nameserver.
   # MUST be inside your cluster's service CIDR and unused (kind/kubeadm 10.96.0.0/12 -> 10.96.53.53 is fine).
   clusterIP: 10.96.53.53
+  # -- Upstream resolvers for everything outside `clusterDomain` (`forward-zone: name: "."`), one
+  # `forward-addr` each in unbound syntax: `IP`, `IP@port`, `IP@port#tls-name` (the name only matters
+  # for DNS over TLS, which the chart does not enable). Empty = full recursion from the root servers
+  # like compose. Set it where outbound port 53 is filtered or intercepted.
+  # DNSSEC validation stays on either way, so the forwarders must pass DNSSEC records through.
+  # e.g. [1.1.1.1, 9.9.9.9]
+  forwarders: []
   resources:
     requests: {cpu: 10m, memory: 32Mi}
 
@@ -528,7 +535,8 @@ cronjobs:
   successfulJobsHistoryLimit: 1
   # -- failedJobsHistoryLimit
   failedJobsHistoryLimit: 1
-  # -- Seconds a finished Job is kept (ttlSecondsAfterFinished).
+  # -- Seconds a finished Job is kept (ttlSecondsAfterFinished). Keep it well above 0 (and the history
+  # limits >= 1): a Job deleted before the CronJob controller sees it finish raises "MissingJob" warnings.
   ttlSecondsAfterFinished: 300
   # -- Per-job overrides: enabled, schedule (5-field cron; ofelia's seconds field dropped).
   jobs:

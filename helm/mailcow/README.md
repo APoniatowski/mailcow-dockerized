@@ -22,12 +22,13 @@ helm install mailcow helm/mailcow -n mailcow --create-namespace \
   --set files.image.repository=registry.example.org/mailcow-files
 ```
 
-Before installing, check three cluster-specific values:
+Before installing, check these cluster-specific values:
 
 | value | what | how to find it |
 |---|---|---|
 | `unbound.clusterIP` | fixed ClusterIP of the `unbound` Service, nameserver of most mailcow pods | an unused IP inside the **service CIDR** (`kubectl cluster-info dump \| grep service-cluster-ip-range`); default `10.96.53.53` fits kind/kubeadm `10.96.0.0/12` |
 | `clusterDNS` | kube-dns/CoreDNS ClusterIP, unbound forwards `clusterDomain` to it | `kubectl -n kube-system get svc kube-dns` |
+| `unbound.forwarders` | optional upstream resolvers (`[1.1.1.1, 9.9.9.9]`, `IP@port` allowed) for everything outside `clusterDomain`; empty = full recursion from the root servers like compose | set it when outbound port 53 is filtered or intercepted (recursion from the root then fails: every external lookup SERVFAILs); the forwarders must pass DNSSEC records through, validation stays on |
 | `mailcow.networks` | `MAILCOW_NETWORKS`: CIDRs trusted as internal (postfix `mynetworks`, rspamd, dovecot) | the **pod CIDR** only. Never node or LB ranges: SNAT'd outside clients would become trusted relays |
 | `mailcow.sogoTrustedNets` | `SOGO_TRUSTED_NETS`: where SOGo's dovecot logins come from | defaults to `mailcow.networks` with a warning, see [Security](#security) |
 
@@ -38,7 +39,7 @@ Login: `admin` / `moohoo`. API key: `kubectl -n mailcow get secret mailcow-secre
 
 | compose service | Kubernetes |
 |---|---|
-| unbound | Deployment + Service `unbound` with fixed ClusterIP; repo `unbound.conf` + appended `forward-zone` for `clusterDomain` → `clusterDNS` (`domain-insecure`, DNSSEC stays on for the rest) |
+| unbound | Deployment + Service `unbound` with fixed ClusterIP; repo `unbound.conf` + appended `forward-zone` for `clusterDomain` → `clusterDNS` (`domain-insecure`, DNSSEC stays on for the rest), plus `forward-zone "."` → `unbound.forwarders` when set |
 | mysql, redis | StatefulSet (1 replica, PVC). Clients use TCP (`DBHOST=mysql`) |
 | dovecot, postfix | StatefulSet (1 replica) |
 | rspamd | Deployment, `hostname: rspamd` (worker-proxy binds `rspamd:9900`) |
@@ -87,7 +88,9 @@ They are copied over the base slice on every pod start (also into shared dirs su
 
 `persistence.shared.accessMode` defaults to ReadWriteMany. With ReadWriteOnce every pod mounting it
 gets a required podAffinity to one node (single-node clusters). Even with RWX, rspamd.sock is a unix
-socket, so its users effectively need one node. Data PVCs and
+socket, so its users effectively need one node. `global-sieve/{before,after}` (global filters, edited
+in the UI) start as the repo's `data/conf/dovecot/global_sieve_*` (or `extraFiles` with those paths)
+and are only re-seeded while missing or empty. Data PVCs and
 the generated Secret are kept on `helm uninstall` (`persistence.keep`).
 
 ### TLS

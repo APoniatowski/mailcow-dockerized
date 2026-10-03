@@ -289,6 +289,8 @@ Args (dict):
   slices    list of data/-relative paths copied into /seed
   shared    list of dicts {dir, src (data/-relative, optional), clobber (bool)} seeded into the shared PVC
   touch     list of shared-relative files that must exist (single-file subPath mounts)
+  files     list of dicts {src (data/-relative), dst (shared-relative)}: copy the default only while
+            dst is missing or empty, so UI edits survive restarts (single-file subPath mounts)
   ssl       true: prepare /etc/ssl/mail (Secret mode) or wait for the acme cert (acme mode)
   appends   list of dicts {key, dst}: append k8s-conf ConfigMap key to /seed/<dst>
   script    extra shell appended at the end */}}
@@ -339,6 +341,21 @@ Args (dict):
       {{- range .touch }}
       mkdir -p "/shared/{{ dir . }}" && touch "/shared/{{ . }}"
       {{- end }}
+      {{- if .files }}
+      seedfile() {
+        d="/shared/$2"; t="$d.tmp.$(hostname)"
+        [ -s "$d" ] && return 0
+        mkdir -p "$(dirname "$d")"
+        [ -e "$1" ] || { touch "$d"; return 0; }
+        if [ ! -e "$d" ]; then
+          cp "$1" "$t" && { ln "$t" "$d" 2>/dev/null || mv -n "$t" "$d"; }; rm -f "$t"
+        fi
+        [ -s "$d" ] || cat "$1" > "$d"
+      }
+      {{- range .files }}
+      seedfile {{ if hasKey $root.Values.extraFiles .src }}"/extra/{{ .src }}"{{ else }}"/mailcow/data/{{ .src }}"{{ end }} {{ .dst | quote }}
+      {{- end }}
+      {{- end }}
       {{- if .ssl }}
       {{- if $root.Values.acme.enabled }}
       until [ -s /shared/ssl/cert.pem ] && [ -s /shared/ssl/key.pem ]; do echo "waiting for acme to seed /shared/ssl"; sleep 2; done
@@ -360,7 +377,7 @@ Args (dict):
     - name: extra-files
       mountPath: /extra
     {{- end }}
-    {{- if or $shared .touch (and .ssl $root.Values.acme.enabled) .sharedMount }}
+    {{- if or $shared .touch .files (and .ssl $root.Values.acme.enabled) .sharedMount }}
     - name: shared
       mountPath: /shared
     {{- end }}
@@ -383,22 +400,32 @@ Args (dict):
 {{- end -}}
 
 {{/* ---------- probes ---------- */}}
-{{/* include "mailcow.tcpProbes" (dict "port" 143 "startup" 60) ; startup = failureThreshold * 10s */}}
-{{- define "mailcow.tcpProbes" -}}
+{{/* include "mailcow.probes" (dict "handler" (dict "exec" (dict "command" (list ...))) "startup" 60 "ready" 20 "live" 30 "timeout" 5)
+startup = failureThreshold * 10s; ready/live = periodSeconds (default 10/20); timeout for startup/readiness */}}
+{{- define "mailcow.probes" -}}
+{{- $h := toYaml .handler -}}
 startupProbe:
-  tcpSocket:
-    port: {{ .port }}
+  {{- $h | nindent 2 }}
   periodSeconds: 10
+  {{- with .timeout }}
+  timeoutSeconds: {{ . }}
+  {{- end }}
   failureThreshold: {{ .startup | default 60 }}
 readinessProbe:
-  tcpSocket:
-    port: {{ .port }}
-  periodSeconds: 10
+  {{- $h | nindent 2 }}
+  periodSeconds: {{ .ready | default 10 }}
+  {{- with .timeout }}
+  timeoutSeconds: {{ . }}
+  {{- end }}
   failureThreshold: 3
 livenessProbe:
-  tcpSocket:
-    port: {{ .port }}
-  periodSeconds: 20
+  {{- $h | nindent 2 }}
+  periodSeconds: {{ .live | default 20 }}
   timeoutSeconds: 5
   failureThreshold: 6
+{{- end -}}
+
+{{/* include "mailcow.tcpProbes" (dict "port" 143 "startup" 60) */}}
+{{- define "mailcow.tcpProbes" -}}
+{{- include "mailcow.probes" (dict "handler" (dict "tcpSocket" (dict "port" .port)) "startup" .startup) -}}
 {{- end -}}

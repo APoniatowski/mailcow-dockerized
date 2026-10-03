@@ -7,6 +7,7 @@ metadata:
 data:
   # Appended to data/conf/unbound/unbound.conf (unbound has no include in the repo config).
   # DNSSEC validation stays on for the internet; the cluster zone is unsigned -> domain-insecure.
+  # unbound.forwarders set: everything outside the cluster zone goes to them instead of the root servers.
   unbound-k8s.conf: |
 
     # --- added by the mailcow Helm chart ---
@@ -22,6 +23,13 @@ data:
     forward-zone:
       name: "{{ .Values.clusterDomain }}"
       forward-addr: {{ .Values.clusterDNS }}
+    {{- with .Values.unbound.forwarders }}
+    forward-zone:
+      name: "."
+      {{- range . }}
+      forward-addr: {{ . }}
+      {{- end }}
+    {{- end }}
   # Appended to data/conf/dovecot/extra.conf (after extraFiles).
   dovecot-k8s.conf: |
 

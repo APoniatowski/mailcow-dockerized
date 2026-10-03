@@ -26,7 +26,7 @@ spec:
       initContainers:
         {{- $slices := list "hooks/phpfpm" "web" "conf/rspamd/dynmaps" "conf/dovecot/auth/mailcowauth.php" "conf/rspamd/meta_exporter" "conf/phpfpm/crons" "conf/phpfpm/php-fpm.d/pools.conf" "conf/phpfpm/php-conf.d" "assets/templates" "conf/nginx" }}
         {{- $shared := list (dict "dir" "rspamd-custom" "src" "conf/rspamd/custom") (dict "dir" "rspamd-vol") (dict "dir" "sogo-conf") (dict "dir" "sogo-sso") }}
-        {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "touch" (list "global-sieve/before" "global-sieve/after")) | nindent 8 }}
+        {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "files" (list (dict "src" "conf/dovecot/global_sieve_before" "dst" "global-sieve/before") (dict "src" "conf/dovecot/global_sieve_after" "dst" "global-sieve/after"))) | nindent 8 }}
       containers:
         - name: php-fpm-mailcow
           image: {{ include "mailcow.image" $v.image }}
