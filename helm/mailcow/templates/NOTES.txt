@@ -6,6 +6,13 @@ Default UI login: admin / moohoo  -- change it right away.
 Secrets: {{ include "mailcow.secretName" . }}
   kubectl -n {{ .Release.Namespace }} get secret {{ include "mailcow.secretName" . }} -o jsonpath='{.data.API_KEY}' | base64 -d
 
+Files image: {{ include "mailcow.filesImage" . }}
+{{- if eq .Values.files.image.repository "ghcr.io/mailcow/mailcow-files" }}
+  WARNING: this default is a placeholder, no such image is published. Build and push the files image from
+  your checkout (helm/mailcow/files-image/Dockerfile, README "Install") and set files.image.repository/tag,
+  or every pod stays in Init:ImagePullBackOff.
+{{- end }}
+
 TLS (/etc/ssl/mail):
 {{- if .Values.acme.enabled }}
   mailcow ACME client on the shared PVC (snake-oil until the first certificate is issued).
@@ -19,6 +26,9 @@ TLS (/etc/ssl/mail):
 
 Mail:  kubectl -n {{ .Release.Namespace }} get svc {{ include "mailcow.fullname" . }}-mail
        ({{ .Values.mail.service.type }}, PROXY protocol {{ ternary "ON: your load balancer must send PROXY headers" "off" .Values.mail.proxyProtocol }})
+{{- if .Values.mail.proxyProtocol }}
+       PROXY headers accepted only from: {{ include "mailcow.proxyTrustedNetworks" . | fromJsonArray | join ", " }}
+{{- end }}
 {{- if .Values.http.service.enabled }}
 Web:   kubectl -n {{ .Release.Namespace }} get svc {{ include "mailcow.fullname" . }}-http
 {{- end }}
@@ -37,8 +47,8 @@ Checks:
     kept on scale-down). The admin UI queue view and flush act on one pod only{{ if .Values.watchdog.enabled }}, watchdog's queue check counts nothing{{ end }}.
     A pre-existing single queue PVC {{ include "mailcow.fullname" . }}-postfix is no longer used: delete it once its queue is drained. README "Scaling".
 {{- end }}
-  - rspamd's controller socket reaches php-fpm, dovecot, postfix{{ if .Values.watchdog.enabled }}, watchdog{{ end }} over TCP 11335 (socat relays,
-    native sidecars: Kubernetes >= 1.29). Its NetworkPolicy is always on; it only protects with an enforcing CNI.
+  - rspamd's controller socket reaches php-fpm, dovecot, postfix{{ if .Values.watchdog.enabled }}, watchdog{{ end }} over TCP 11335 with mutual TLS (socat
+    relays, native sidecars: Kubernetes >= 1.29; Secret {{ include "mailcow.rspamdRelayTlsSecret" . }}). Its NetworkPolicy is always on.
 {{- with .Values.externalDatabase }}{{ if .enabled }}
   - External database {{ .host }}:{{ .port }} (Services mysql, mysql-mailcow): database {{ $.Values.mailcow.dbName }}, user
     {{ $.Values.mailcow.dbUser }} (DBPASS from the Secret) must exist with ALL PRIVILEGES on {{ $.Values.mailcow.dbName }}.*, event_scheduler=ON,
@@ -76,12 +86,14 @@ Checks:
     The release Secret {{ include "mailcow.secretName" $ }} is not part of the backups: export and keep it separately.
     Restore: helm/mailcow/scripts/restore.sh (README "Backup and restore"). Test your restores.
 {{- end }}{{ end }}
-  - dockerapi can exec into and delete every pod in namespace {{ .Release.Namespace }}: keep mailcow alone in it.
-{{- if include "mailcow.networkPolicy" . }}
-  - NetworkPolicies are rendered; they only protect anything if your CNI enforces them.
-{{- else }}
-  - networkPolicy is off (only dockerapi is restricted): any pod in the cluster can reach postfix and
-    dovecot from the pod CIDR, which mailcow trusts (relay without auth). See README "Security".
+  - dockerapi can exec into and delete every pod and rolling-restart every Deployment/StatefulSet in
+    namespace {{ .Release.Namespace }}: keep mailcow alone in it.
+  - NetworkPolicies only protect anything if your CNI enforces them. Without enforcement dockerapi
+    (unauthenticated exec/restart API) is reachable from every pod in the cluster.
+{{- if not (include "mailcow.networkPolicy" .) }}
+  - networkPolicy is off (only dockerapi, the rspamd relay{{ if .Values.mail.proxyProtocol }} and the PROXY ports{{ end }} are restricted): any pod in
+    the cluster can reach postfix and dovecot from the pod CIDR, which mailcow trusts (relay without auth).
+    See README "Security".
 {{- end }}
 
 {{- $etp := .Values.mail.service.externalTrafficPolicy | default (ternary "Cluster" "Local" .Values.mail.proxyProtocol) }}
@@ -91,12 +103,18 @@ WARNING: mail.proxyProtocol is false and the mail Service uses externalTrafficPo
   Client connections may be SNAT'd to node or pod-CIDR addresses; if those fall into mailcow.networks,
   postfix relays for everyone (open relay). Use externalTrafficPolicy Local or PROXY protocol.
 {{- end }}
-{{- if .Release.IsUpgrade }}
+{{- if and .Values.mail.proxyProtocol (or (eq .Values.mail.service.type "NodePort") (and (eq .Values.mail.service.type "LoadBalancer") (ne (toString .Values.mail.service.allocateLoadBalancerNodePorts) "false"))) }}
 
-Upgrading from chart < 0.5.0: rspamd's /var/lib/rspamd and UI password moved from the shared PVC to the
-  new PVC {{ include "mailcow.claimName" (list . "rspamd" "rspamd") }} (copied over once by rspamd's seed initContainer). SOGo's creds files are no
-  longer shared. The shared PVC subdirs rspamd-vol, rspamd-override, sogo-conf and sogo-sso are unused now
-  and can be deleted. See README "Storage".
+WARNING: PROXY protocol on a {{ .Values.mail.service.type }} Service with node ports. postfix believes the client address in
+  any PROXY header it receives, so whoever reaches a node port from inside mail.proxyTrustedNetworks can
+  relay as an internal client.
+  {{- if eq ($.Values.mail.service.externalTrafficPolicy | default "Cluster") "Cluster" }}
+  With externalTrafficPolicy Cluster kube-proxy SNATs node-port traffic to a node address: if
+  proxyTrustedNetworks holds node addresses, ANY client that reaches a node port directly is trusted.
+  {{- end }}
+  Firewall the node ports (cloud security group / host firewall) so only the load balancer reaches them,
+  prefer externalTrafficPolicy Local with the LB's own addresses in proxyTrustedNetworks, or an LB that
+  targets pod IPs (mail.service.allocateLoadBalancerNodePorts: false). README "Security".
 {{- end }}
 {{- if not .Values.mailcow.sogoTrustedNets }}
 
@@ -104,10 +122,4 @@ WARNING: mailcow.sogoTrustedNets is empty, so SOGO_TRUSTED_NETS = mailcow.networ
   Every address in it may log in to dovecot with SOGo's plaintext/SSO privileges, bypassing protocol
   ACLs. Narrow it to the sogo pod's range if your CNI can pin one. See README "Security".
 {{- end }}
-{{- if or .Values.netfilter .Values.networkPolicy.nodeCIDRs }}
 
-WARNING: netfilter / networkPolicy.nodeCIDRs values are set but ignored: fail2ban (netfilter) is not
-  supported on Kubernetes and was removed in chart 0.3.0. Remove them from your values. Postfix rate
-  limits (bruteForce) and dovecot's auth penalty apply instead; put IP banning at the edge. See README
-  "Brute-force protection (no fail2ban)".
-{{- end }}

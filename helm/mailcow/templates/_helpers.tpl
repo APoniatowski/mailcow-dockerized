@@ -110,21 +110,78 @@ app.kubernetes.io/part-of: mailcow
   value: {{ include "mailcow.dbPort" . | quote }}
 {{- end -}}
 
+{{/* ---------- trusted networks ----------
+Validated, normalized network list (JSON array). Entries: IPv4/IPv6 address or CIDR, IPv6 without
+brackets; /0 and anything else fail (the images drop such entries with only a warning).
+Input: comma separated string or list. include "mailcow.netList" (list "mailcow.networks" $value) | fromJsonArray */}}
+{{- define "mailcow.netList" -}}
+{{- $what := index . 0 -}}
+{{- $in := index . 1 -}}
+{{- if not (kindIs "slice" $in) -}}{{- $in = splitList "," (toString $in) -}}{{- end -}}
+{{- $out := list -}}
+{{- range $in -}}
+{{- $n := trim (toString .) -}}
+{{- if $n -}}
+{{- $v4 := regexMatch `^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$` $n -}}
+{{- $v6 := and (contains ":" $n) (regexMatch `^[0-9A-Fa-f:.]+(/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))?$` $n) -}}
+{{- if not (or $v4 $v6) -}}
+{{- fail (printf "%s: %q is not an IP address or CIDR (comma separated list, IPv6 without brackets, no spaces inside an entry)" $what $n) -}}
+{{- end -}}
+{{- if hasSuffix "/0" $n -}}
+{{- fail (printf "%s: %q trusts every address; list the real ranges" $what $n) -}}
+{{- end -}}
+{{- $out = append $out $n -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $out -}}
+{{- end -}}
+
+{{/* MAILCOW_NETWORKS, comma separated without spaces (dovecot's /source_env.sh breaks on spaces) */}}
 {{- define "mailcow.networks" -}}
-{{- .Values.mailcow.networks -}}
+{{- $l := include "mailcow.netList" (list "mailcow.networks" .Values.mailcow.networks) | fromJsonArray -}}
+{{- if not $l -}}{{- fail "mailcow.networks is required: the cluster pod CIDR(s), e.g. 10.244.0.0/16" -}}{{- end -}}
+{{- join "," $l -}}
+{{- end -}}
+
+{{/* list value or mailcow.networks when empty. include "mailcow.netsOrNetworks" (list . "sogoTrustedNets") */}}
+{{- define "mailcow.netsOrNetworks" -}}
+{{- $root := index . 0 -}}{{- $key := index . 1 -}}
+{{- $l := include "mailcow.netList" (list (printf "mailcow.%s" $key) (index $root.Values.mailcow $key)) | fromJsonArray -}}
+{{- if $l -}}{{- join "," $l -}}{{- else -}}{{- include "mailcow.networks" $root -}}{{- end -}}
 {{- end -}}
 
 {{- define "mailcow.sogoTrustedNets" -}}
-{{- default .Values.mailcow.networks .Values.mailcow.sogoTrustedNets -}}
+{{- include "mailcow.netsOrNetworks" (list . "sogoTrustedNets") -}}
 {{- end -}}
 
 {{/* rspamd DOVECOT_TRUSTED_NETS / RSPAMD_TRUSTED_NETS: always set, unset makes rspamd loop on `dig dovecot` */}}
 {{- define "mailcow.dovecotTrustedNets" -}}
-{{- default .Values.mailcow.networks .Values.mailcow.dovecotTrustedNets -}}
+{{- include "mailcow.netsOrNetworks" (list . "dovecotTrustedNets") -}}
 {{- end -}}
 
 {{- define "mailcow.rspamdTrustedNets" -}}
-{{- default .Values.mailcow.networks .Values.mailcow.rspamdTrustedNets -}}
+{{- include "mailcow.netsOrNetworks" (list . "rspamdTrustedNets") -}}
+{{- end -}}
+
+{{/* mail.proxyTrustedNetworks (JSON array): required with mail.proxyProtocol, [] without */}}
+{{- define "mailcow.proxyTrustedNetworks" -}}
+{{- if .Values.mail.proxyProtocol -}}
+{{- $l := include "mailcow.netList" (list "mail.proxyTrustedNetworks" .Values.mail.proxyTrustedNetworks) | fromJsonArray -}}
+{{- if not $l -}}
+{{- fail `mail.proxyProtocol is true, so mail.proxyTrustedNetworks is required: the source addresses the PROXY-protocol connections reach the postfix/dovecot pods from, and nothing wider. postfix's PROXY listeners trust any PROXY header, so whoever can connect from these ranges can claim any client address (including one in mailcow.networks = open relay). Use the load balancer's own addresses (IP-target LBs such as AWS NLB ip mode: its subnet/private IPs), or the node addresses when the LB targets node ports with externalTrafficPolicy Cluster (then firewall the node ports so only the LB reaches them). Never the pod CIDR. Set mail.proxyProtocol=false when nothing in front sends PROXY headers. README "Security".` -}}
+{{- end -}}
+{{- toJson $l -}}
+{{- else -}}
+[]
+{{- end -}}
+{{- end -}}
+
+{{/* NetworkPolicy ipBlock peers for a JSON array of addresses/CIDRs (bare addresses become /32 or /128) */}}
+{{- define "mailcow.ipBlocks" -}}
+{{- range . }}
+- ipBlock:
+    cidr: {{ ternary . (printf "%s/%s" . (ternary "128" "32" (contains ":" .))) (contains "/" .) }}
+{{- end }}
 {{- end -}}
 
 {{/* FQDN of a release Service: include "mailcow.svcFqdn" (list . "postfix") */}}
@@ -133,9 +190,9 @@ app.kubernetes.io/part-of: mailcow
 {{- printf "%s.%s.svc.%s" (index . 1) $root.Release.Namespace $root.Values.clusterDomain -}}
 {{- end -}}
 
-{{/* "true" when the NetworkPolicies are rendered (networkPolicy.enabled; empty = mail.proxyProtocol) */}}
+{{/* "true" when the release-wide ingress NetworkPolicies are rendered (networkPolicy.enabled) */}}
 {{- define "mailcow.networkPolicy" -}}
-{{- if ne (toString .Values.networkPolicy.enabled) "false" -}}true{{- end -}}
+{{- if .Values.networkPolicy.enabled -}}true{{- end -}}
 {{- end -}}
 
 {{/* ipBlock peers 0.0.0.0/0 and ::/0, each except the given CIDRs of its family (bare addresses
@@ -170,14 +227,14 @@ except mailcow.networks (in-cluster pods from the pod CIDR would be trusted as i
 {{- if .Values.networkPolicy.publicMailFrom -}}
 {{- toYaml .Values.networkPolicy.publicMailFrom -}}
 {{- else -}}
-{{- include "mailcow.allExcept" (splitList "," .Values.mailcow.networks) -}}
+{{- include "mailcow.allExcept" (splitList "," (include "mailcow.networks" .)) -}}
 {{- end -}}
 {{- end -}}
 
 {{/* egress "internet" exceptions: networkPolicy.egress.clusterCIDRs, or mailcow.networks + serviceCIDR */}}
 {{- define "mailcow.egressClusterCIDRs" -}}
 {{- $e := .Values.networkPolicy.egress -}}
-{{- $in := $e.clusterCIDRs | default (concat (splitList "," .Values.mailcow.networks) (splitList "," (toString $e.serviceCIDR))) -}}
+{{- $in := $e.clusterCIDRs | default (concat (splitList "," (include "mailcow.networks" .)) (splitList "," (toString $e.serviceCIDR))) -}}
 {{- /* the API server often sits on a node/VPC address outside the cluster CIDRs: keep it out of the
        internet rule so only the pods in <fullname>-egress-apiserver can reach it */ -}}
 {{- $in = concat $in ($e.apiServerCIDRs | default list) -}}
@@ -340,6 +397,32 @@ checksum/k8s-conf: {{ include (print .Template.BasePath "/configmap.yaml") . | s
 {{- end }}
 {{- end -}}
 
+{{/* pod template `annotations:` block with podDefaults.annotations only (pods that read no chart ConfigMap),
+nothing when empty. include "mailcow.podDefaultAnnotations" . | nindent 6 (at metadata level) */}}
+{{- define "mailcow.podDefaultAnnotations" -}}
+{{- with .Values.podDefaults.annotations -}}
+annotations:
+  {{- toYaml . | nindent 2 }}
+{{- end -}}
+{{- end -}}
+
+{{/* ClusterIP of the cluster DNS Service: clusterDNS, or (empty) kube-system/kube-dns looked up at
+install/upgrade time; 10.96.0.10 (kubeadm/kind) when the lookup finds nothing (helm template) */}}
+{{- define "mailcow.clusterDNS" -}}
+{{- if .Values.clusterDNS -}}
+{{- .Values.clusterDNS -}}
+{{- else -}}
+{{- $svc := lookup "v1" "Service" "kube-system" "kube-dns" | default dict -}}
+{{- $ip := dig "spec" "clusterIP" "" $svc -}}
+{{- if and $ip (ne $ip "None") -}}{{- $ip -}}{{- else -}}10.96.0.10{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* SOGo custom logo / script files: [file in data/conf/sogo, path under WebServerResources] (JSON) */}}
+{{- define "mailcow.sogoLogos" -}}
+{{- toJson (list (list "custom-favicon.ico" "img/sogo.ico") (list "custom-shortlogo.svg" "img/sogo-compact.svg") (list "custom-fulllogo.svg" "img/sogo-full.svg") (list "custom-fulllogo.png" "img/sogo-logo.png") (list "custom-theme.js" "js/theme.js") (list "custom-sogo.js" "js/custom-sogo.js")) -}}
+{{- end -}}
+
 {{/* ---------- volumes ---------- */}}
 {{- define "mailcow.claimName" -}}
 {{- $root := index . 0 -}}{{- $key := index . 1 -}}{{- $suffix := index . 2 -}}
@@ -351,7 +434,26 @@ checksum/k8s-conf: {{ include (print .Template.BasePath "/configmap.yaml") . | s
 {{- include "mailcow.claimName" (list . "shared" "shared") -}}
 {{- end -}}
 
-{{/* seed emptyDir + extraFiles ConfigMap + chart ConfigMap (+ shared PVC) */}}
+{{/* extraFiles + extraSecretFiles: JSON {data/-relative path: file in the seed initContainer}.
+extraSecretFiles win over extraFiles for the same path. Paths are validated so they can be single-quoted
+in shell. include "mailcow.extraFileMap" . | fromJson */}}
+{{- define "mailcow.extraFileMap" -}}
+{{- $m := dict -}}
+{{- range $src := list (list "extraFiles" "/extra") (list "extraSecretFiles" "/extra-secret") -}}
+{{- range $path, $v := index $.Values (index $src 0) -}}
+{{- if or (not (regexMatch `^[A-Za-z0-9_@+-][A-Za-z0-9._@+/-]*$` $path)) (regexMatch `(^|/)\.\.?(/|$)` $path) (hasSuffix "/" $path) -}}
+{{- fail (printf "%s: %q must be a file path relative to data/ (letters, digits, . _ - @ + /, no . or .. segments)" (index $src 0) $path) -}}
+{{- end -}}
+{{- if and (eq (index $src 0) "extraSecretFiles") (or (not (kindIs "map" $v)) (not $v.secretName) (not $v.key)) -}}
+{{- fail (printf "extraSecretFiles.%s needs {secretName: <Secret in the release namespace>, key: <key in it>}" $path) -}}
+{{- end -}}
+{{- $_ := set $m $path (printf "%s/%s" (index $src 1) $path) -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $m -}}
+{{- end -}}
+
+{{/* seed emptyDir + extraFiles ConfigMap + extraSecretFiles Secrets + chart ConfigMap (+ shared PVC) */}}
 {{- define "mailcow.seedVolumes" -}}
 {{- $root := .root -}}
 - name: seed
@@ -367,6 +469,19 @@ checksum/k8s-conf: {{ include (print .Template.BasePath "/configmap.yaml") . | s
       {{- range $path, $_ := $root.Values.extraFiles }}
       - key: {{ printf "f-%s" (sha256sum $path | trunc 16) }}
         path: {{ $path }}
+      {{- end }}
+{{- end }}
+{{- if $root.Values.extraSecretFiles }}
+- name: extra-secret-files
+  projected:
+    defaultMode: 0444
+    sources:
+      {{- range $path, $s := $root.Values.extraSecretFiles }}
+      - secret:
+          name: {{ $s.secretName }}
+          items:
+            - key: {{ $s.key }}
+              path: {{ $path }}
       {{- end }}
 {{- end }}
 {{- if .shared }}
@@ -431,6 +546,7 @@ Args (dict):
 {{- $root := .root -}}
 {{- $slices := .slices | default list -}}
 {{- $shared := .shared | default list -}}
+{{- $extra := include "mailcow.extraFileMap" $root | fromJson -}}
 - name: seed
   image: {{ include "mailcow.filesImage" $root }}
   imagePullPolicy: {{ $root.Values.files.image.pullPolicy }}
@@ -445,13 +561,13 @@ Args (dict):
       {{- range $slices }}
       seed {{ . | quote }}
       {{- end }}
-      {{- range $path, $_ := $root.Values.extraFiles }}
+      {{- range $path, $file := $extra }}
       {{- $hit := false }}
       {{- range $slices }}{{ if or (eq . $path) (hasPrefix (printf "%s/" .) $path) }}{{ $hit = true }}{{ end }}{{ end }}
       {{- if $hit }}
-      mkdir -p "/seed/{{ dir $path }}" && cp -L "/extra/{{ $path }}" "/seed/{{ $path }}"
+      mkdir -p {{ printf "/seed/%s" (dir $path) | squote }} && cp -L {{ $file | squote }} {{ printf "/seed/%s" $path | squote }}
       {{- if hasPrefix "hooks/" $path }}
-      chmod 755 "/seed/{{ $path }}"
+      chmod 755 {{ printf "/seed/%s" $path | squote }}
       {{- end }}
       {{- end }}
       {{- end }}
@@ -463,10 +579,10 @@ Args (dict):
       {{- if .src }}
       cp -a{{ if not .clobber }}n{{ end }} "/mailcow/data/{{ .src }}/." "/shared/{{ .dir }}/"
       {{- $s := . }}
-      {{- range $path, $_ := $root.Values.extraFiles }}
+      {{- range $path, $file := $extra }}
       {{- if hasPrefix (printf "%s/" $s.src) $path }}
       {{- $rel := trimPrefix (printf "%s/" $s.src) $path }}
-      mkdir -p "/shared/{{ $s.dir }}/{{ dir $rel }}" && cp -L "/extra/{{ $path }}" "/shared/{{ $s.dir }}/{{ $rel }}"
+      mkdir -p {{ printf "/shared/%s/%s" $s.dir (dir $rel) | squote }} && cp -L {{ $file | squote }} {{ printf "/shared/%s/%s" $s.dir $rel | squote }}
       {{- end }}
       {{- end }}
       {{- end }}
@@ -486,7 +602,7 @@ Args (dict):
         [ -s "$d" ] || cat "$1" > "$d"
       }
       {{- range .files }}
-      seedfile {{ if hasKey $root.Values.extraFiles .src }}"/extra/{{ .src }}"{{ else }}"/mailcow/data/{{ .src }}"{{ end }} {{ .dst | quote }}
+      seedfile {{ get $extra .src | default (printf "/mailcow/data/%s" .src) | squote }} {{ .dst | squote }}
       {{- end }}
       {{- end }}
       {{- if .ssl }}
@@ -513,6 +629,11 @@ Args (dict):
     {{- if $root.Values.extraFiles }}
     - name: extra-files
       mountPath: /extra
+    {{- end }}
+    {{- if $root.Values.extraSecretFiles }}
+    - name: extra-secret-files
+      mountPath: /extra-secret
+      readOnly: true
     {{- end }}
     {{- if or $shared .touch .files (and .ssl $root.Values.acme.enabled) .sharedMount }}
     - name: shared
@@ -545,13 +666,25 @@ echo / echo -n as the entrypoint), so nothing is shared with the dovecot pod. */
 {{ include "mailcow.secretEnv" (list . "DOVECOT_MASTER_USER" "DOVECOT_MASTER_USER") }}
 {{ include "mailcow.secretEnv" (list . "DOVECOT_MASTER_PASS" "DOVECOT_MASTER_PASS") }}
 {{ include "mailcow.secretEnv" (list . "SOGO_SSO_PASS" "SOGO_SSO_PASS") }}
+{{ include "mailcow.secretEnv" (list . "SOGO_ENCRYPTION_KEY" "SOGO_ENCRYPTION_KEY") }}
+{{- end -}}
+
+{{/* charset of SOGO_SSO_PASS (dovecot exits otherwise), shared by the sogo and php-fpm seed scripts */}}
+{{- define "mailcow.sogoSsoCheck" -}}
+case "${SOGO_SSO_PASS}" in
+  ""|*[!A-Za-z0-9]*) echo "SOGO_SSO_PASS in Secret {{ include "mailcow.secretName" . }} must be non-empty and alphanumeric only ([A-Za-z0-9]); dovecot refuses to start otherwise"; exit 1 ;;
+esac
 {{- end -}}
 
 {{/* /seed/conf/sogo/{sieve.creds,cron.creds} (sogo pod) */}}
 {{- define "mailcow.sogoCredsScript" -}}
-if [ -z "${DOVECOT_MASTER_USER}" ] || [ -z "${DOVECOT_MASTER_PASS}" ] || [ -z "${SOGO_SSO_PASS}" ]; then
-  echo "DOVECOT_MASTER_USER, DOVECOT_MASTER_PASS and SOGO_SSO_PASS must be set in the Secret"; exit 1
+if [ -z "${DOVECOT_MASTER_USER}" ] || [ -z "${DOVECOT_MASTER_PASS}" ]; then
+  echo "DOVECOT_MASTER_USER and DOVECOT_MASTER_PASS must be set in Secret {{ include "mailcow.secretName" . }}"; exit 1
 fi
+{{ include "mailcow.sogoSsoCheck" . }}
+case "${SOGO_ENCRYPTION_KEY}" in
+  ""|*[!A-Za-z0-9_-]*) echo "SOGO_ENCRYPTION_KEY in Secret {{ include "mailcow.secretName" . }} must be non-empty and use only [A-Za-z0-9_-]; sogo refuses to start otherwise"; exit 1 ;;
+esac
 mkdir -p /seed/conf/sogo
 echo ${DOVECOT_MASTER_USER}@mailcow.local:${DOVECOT_MASTER_PASS} > /seed/conf/sogo/sieve.creds
 echo -n ${DOVECOT_MASTER_USER}@mailcow.local:${SOGO_SSO_PASS} > /seed/conf/sogo/cron.creds
@@ -559,38 +692,79 @@ echo -n ${DOVECOT_MASTER_USER}@mailcow.local:${SOGO_SSO_PASS} > /seed/conf/sogo/
 
 {{/* /seed/conf/phpfpm/sogo-sso/sogo-sso.pass (php-fpm pod, compose ./data/conf/phpfpm/sogo-sso) */}}
 {{- define "mailcow.sogoSsoScript" -}}
-if [ -z "${SOGO_SSO_PASS}" ]; then echo "SOGO_SSO_PASS must be set in the Secret"; exit 1; fi
+{{ include "mailcow.sogoSsoCheck" . }}
 mkdir -p /seed/conf/phpfpm/sogo-sso
 echo -n ${SOGO_SSO_PASS} > /seed/conf/phpfpm/sogo-sso/sogo-sso.pass
 {{- end -}}
 
 {{/* ---------- rspamd controller socket relay ----------
 rspamd's controller trusts its unix socket (worker-controller.inc). Instead of sharing the socket's
-directory across pods, the rspamd pod exposes it on TCP 11335 (socat sidecar `rspamd-sock-relay`,
-NetworkPolicy always limits it to the socket's users) and every user pod gets a local
-/var/lib/rspamd/rspamd.sock from a socat sidecar `rspamd-sock` connecting there. */}}
+directory across pods, the rspamd pod exposes it on TCP 11335 with mutual TLS (socat sidecar
+`rspamd-sock-relay`: only clients with a certificate from the relay CA get through; the NetworkPolicy
+additionally limits 11335 to the socket's users) and every user pod gets a local
+/var/lib/rspamd/rspamd.sock from a socat sidecar `rspamd-sock` connecting there with the client
+certificate. Secret: <fullname>-rspamd-relay-tls (rspamd.yaml) or rspamd.socketRelay.tls.existingSecret,
+keys ca.crt, tls.crt/tls.key (server), client.crt/client.key. */}}
+
+{{/* uid/gid of the relay sidecars: used by no mailcow image (postfix 101, dovecot 401/402/5000,
+sogo 999, nobody 65534 runs imapsync inside dovecot), so they share no uid with the processes they
+can see in a shared process namespace */}}
+{{- define "mailcow.helperUid" -}}10900{{- end -}}
+
 {{- define "mailcow.relaySecurityContext" -}}
 securityContext:
   runAsNonRoot: true
-  runAsUser: 65534
-  runAsGroup: 65534
+  runAsUser: {{ include "mailcow.helperUid" . }}
+  runAsGroup: {{ include "mailcow.helperUid" . }}
   readOnlyRootFilesystem: true
   allowPrivilegeEscalation: false
   capabilities:
     drop: ["ALL"]
 {{- end -}}
 
-{{/* client side: native sidecar (initContainer, restartPolicy Always) + emptyDir `rspamd-sock` */}}
+{{- define "mailcow.rspamdRelayTlsSecret" -}}
+{{- default (printf "%s-rspamd-relay-tls" (include "mailcow.fullname" .)) .Values.rspamd.socketRelay.tls.existingSecret -}}
+{{- end -}}
+
+{{/* relay TLS volume; side "server" (rspamd pod) or "client". Mode 0444: the relay runs as
+mailcow.helperUid and Secret files are root-owned; only the relay container mounts it.
+include "mailcow.rspamdRelayTlsVolume" (dict "root" . "side" "client") */}}
+{{- define "mailcow.rspamdRelayTlsVolume" -}}
+- name: rspamd-relay-tls
+  secret:
+    secretName: {{ include "mailcow.rspamdRelayTlsSecret" .root }}
+    defaultMode: 0444
+    items:
+      - key: ca.crt
+        path: ca.crt
+      {{- if eq .side "server" }}
+      - key: tls.crt
+        path: tls.crt
+      - key: tls.key
+        path: tls.key
+      {{- else }}
+      - key: client.crt
+        path: client.crt
+      - key: client.key
+        path: client.key
+      {{- end }}
+{{- end -}}
+
+{{/* client side: native sidecar (initContainer, restartPolicy Always) + emptyDir `rspamd-sock`.
+socat verifies the server certificate against the relay CA and the Service FQDN (in its SANs). */}}
 {{- define "mailcow.rspamdSockSidecar" -}}
+{{- $t := "/etc/rspamd-relay-tls" -}}
 - name: rspamd-sock
   image: {{ include "mailcow.filesImage" . }}
   imagePullPolicy: {{ .Values.files.image.pullPolicy }}
   restartPolicy: Always
   command: ["socat"]
   args:
+    # -d0: errors only (no per-connection OpenSSL CRL warning)
+    - -d0
     - UNIX-LISTEN:/var/lib/rspamd/rspamd.sock,fork,mode=0666,unlink-early
     # resolved per connection (A and AAAA, tried in order); FQDN works with unbound-only pod DNS too
-    - TCP:{{ include "mailcow.svcFqdn" (list . "rspamd-mailcow") }}:11335
+    - {{ printf "OPENSSL:%s:11335,cert=%s/client.crt,key=%s/client.key,cafile=%s/ca.crt,verify=1" (include "mailcow.svcFqdn" (list . "rspamd-mailcow")) $t $t $t }}
   {{- include "mailcow.relaySecurityContext" . | nindent 2 }}
   startupProbe:
     exec:
@@ -600,6 +774,9 @@ securityContext:
   volumeMounts:
     - name: rspamd-sock
       mountPath: /var/lib/rspamd
+    - name: rspamd-relay-tls
+      mountPath: {{ $t }}
+      readOnly: true
   resources:
     {{- toYaml .Values.rspamd.socketRelay.resources | nindent 4 }}
 {{- end -}}
@@ -607,6 +784,7 @@ securityContext:
 {{- define "mailcow.rspamdSockVolume" -}}
 - name: rspamd-sock
   emptyDir: {}
+{{ include "mailcow.rspamdRelayTlsVolume" (dict "root" . "side" "client") }}
 {{- end -}}
 
 {{/* ---------- probes ---------- */}}
@@ -672,6 +850,9 @@ spec:
           labels:
             {{- include "mailcow.selectorLabels" (dict "root" $root "component" "cron") | nindent 12 }}
             mailcow.email/cron-job: {{ .job }}
+          {{- with include "mailcow.podDefaultAnnotations" $root }}
+          {{- . | nindent 10 }}
+          {{- end }}
         spec:
           serviceAccountName: {{ $fullname }}-cron
           automountServiceAccountToken: true
@@ -704,44 +885,22 @@ spec:
             {{- end }}
 {{- end -}}
 
-{{/* ---------- Deployment update strategies ----------
-component -> spec.strategy.type of every rendered Deployment (JSON). Single source for the templates
-and the strategy-fix pre-upgrade hook. include "mailcow.deploymentStrategies" . | fromJson */}}
-{{- define "mailcow.deploymentStrategies" -}}
-{{- $s := dict "dockerapi" "RollingUpdate" "memcached" "RollingUpdate" "nginx" "RollingUpdate" "unbound" "RollingUpdate"
-  "php-fpm" (toString .Values.phpFpm.updateStrategy) "postfix-tlspol" "Recreate" "rspamd" "Recreate" -}}
-{{- if .Values.acme.enabled }}{{ $_ := set $s "acme" "Recreate" }}{{ end -}}
-{{- if not .Values.skip.clamd }}{{ $_ := set $s "clamd" "Recreate" }}{{ end -}}
-{{- if not .Values.skip.olefy }}{{ $_ := set $s "olefy" "RollingUpdate" }}{{ end -}}
-{{- if not .Values.skip.sogo }}{{ $_ := set $s "sogo" "RollingUpdate" }}{{ end -}}
-{{- if .Values.watchdog.enabled }}{{ $_ := set $s "watchdog" "Recreate" }}{{ end -}}
-{{- toJson $s -}}
-{{- end -}}
-
-{{/* desired spec.strategy object for a type (JSON). RollingUpdate always carries rollingUpdate (the API
-server defaults), so Helm owns it: server-side apply only removes fields it owns, and a later switch to
-Recreate must drop it. include "mailcow.strategySpec" "Recreate" | fromJson */}}
-{{- define "mailcow.strategySpec" -}}
-{{- if eq . "Recreate" -}}
-{{- toJson (dict "type" "Recreate") -}}
-{{- else -}}
-{{- toJson (dict "type" "RollingUpdate" "rollingUpdate" (dict "maxSurge" "25%" "maxUnavailable" "25%")) -}}
-{{- end -}}
-{{- end -}}
-
-{{/* spec.strategy of a Deployment. include "mailcow.strategy" (dict "root" . "component" "nginx") */}}
+{{/* ---------- Deployment update strategy ----------
+spec.strategy of a Deployment. RollingUpdate always carries rollingUpdate (the API server defaults), so
+Helm owns it: server-side apply only removes fields it owns, and a later switch to Recreate drops it.
+include "mailcow.strategy" "Recreate" */}}
 {{- define "mailcow.strategy" -}}
-{{- $type := index (include "mailcow.deploymentStrategies" .root | fromJson) .component -}}
 strategy:
-  {{- include "mailcow.strategySpec" $type | fromJson | toYaml | nindent 2 }}
-{{- end -}}
-
-{{/* strategic merge patch that sets a live Deployment's strategy to the rendered one; $retainKeys drops
-every other strategy field (a defaulted rollingUpdate). Idempotent, no rollout (pod template unchanged).
-include "mailcow.strategyPatch" "Recreate" */}}
-{{- define "mailcow.strategyPatch" -}}
-{{- $want := include "mailcow.strategySpec" . | fromJson -}}
-{{- toJson (dict "spec" (dict "strategy" (merge (dict "$retainKeys" (keys $want | sortAlpha)) $want))) -}}
+{{- if eq . "Recreate" }}
+  type: Recreate
+{{- else if eq . "RollingUpdate" }}
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 25%
+    maxUnavailable: 25%
+{{- else }}
+{{- fail (printf "unknown Deployment strategy %q" .) }}
+{{- end }}
 {{- end -}}
 
 {{/* NetworkPolicy egress rule to the Kubernetes API server (networkPolicy.egress) */}}
@@ -890,17 +1049,19 @@ include "mailcow.backupEnv" (dict "root" . "group" "mail" "first" true) */}}
 {{- end }}
 {{- end -}}
 
-{{/* bash: sets $dir = /backup/mailcow-YYYY-MM-DD-HH-MM-SS (UTC). CronJob Jobs are named
+{{/* bash: sets $dir = /backup/mailcow-YYYY-MM-DD-HH-MM-SS (UTC, mode 700, files 600). CronJob Jobs are named
 <cronjob>-<scheduled time in minutes since the epoch>, so every group of one run picks the same
 directory; any other Job name (kubectl create job --from=cronjob/...) uses the current time. */}}
 {{- define "mailcow.backupPrelude" -}}
 set -euo pipefail
+# archives hold the mail_crypt private keys and the database: owner-only directories and files
+umask 077
 n="${JOB_NAME##*-}"
 if [[ "${n}" =~ ^[0-9]{8,10}$ ]]; then stamp=$(date -u -d "@$(( n * 60 ))" +%Y-%m-%d-%H-%M-%S)
 else stamp=$(date -u +%Y-%m-%d-%H-%M-%S); fi
 dir="/backup/mailcow-${stamp}"
 mkdir -p "${dir}"
-chmod 755 "${dir}"
+chmod 700 "${dir}"
 echo "backup ${BACKUP_GROUP} -> mailcow-${stamp}"
 {{- end -}}
 
@@ -936,8 +1097,13 @@ reloads the daemons through dockerapi. */}}
 {{/* Native sidecar (files image) that hashes the mounted TLS Secret every tls.reload.interval seconds and
 sends SIGHUP to its own pod's master process when cert or key changed (nginx/postfix/dovecot HUP = graceful
 reload, what `nginx -s reload`, `postfix reload` and `doveadm reload` send). Needs shareProcessNamespace.
-The masters run as root: the sidecar runs as uid 0 to be allowed to signal them (same uid, no capability),
-with every capability dropped and a read-only root filesystem.
+The masters run as root: the sidecar runs as uid 0 to be allowed to signal them (same uid, no capability).
+What it can do in the shared process namespace: list every process of the pod and read the world-readable
+/proc/<pid>/{comm,cmdline,status}; signal uid-0 processes. It cannot read another process's environ, memory
+or files through /proc/<pid>/root: with no capabilities its permitted set is not a superset of the root
+daemons' (the kernel's ptrace access check), and other uids (relay 10900, postfix, dovecot, nobody) differ
+from 0 without CAP_SYS_PTRACE. Acceptable: a fixed busybox loop from the chart, no input but the mounted
+Secret, no network listener, read-only root filesystem, no privilege escalation. README "TLS".
 include "mailcow.tlsReloadSidecar" (dict "root" . "comm" "master" "cmdline" "/usr/lib/postfix/sbin/master*") */}}
 {{- define "mailcow.tlsReloadSidecar" -}}
 {{- $root := .root -}}

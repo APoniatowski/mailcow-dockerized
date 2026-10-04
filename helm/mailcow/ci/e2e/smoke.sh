@@ -10,7 +10,7 @@
 # HOST_ADDR (127.0.0.1, where the NodePorts are mapped), SECRET (<release>-secrets, holds API_KEY).
 # Host tools: kubectl, python3, curl, jq, openssl.
 #
-#   1. every release pod Ready (CronJob, TLS bootstrap and strategy-fix Job pods excluded)
+#   1. every release pod Ready (CronJob, backup and TLS bootstrap Job pods excluded)
 #   2. web UI answers on https://$HOST_ADDR:30443 (Host: $MAILCOW_HOSTNAME)
 #   3. API: add domain + mailbox
 #   4. SMTP submission STARTTLS + AUTH via NodePort 30587 from the host, send to self
@@ -64,7 +64,7 @@ K get pods -o wide
 # 1
 # Job pods (CronJobs, backups, hooks) finish and never turn Ready: wait for the long-running ones
 if K wait --for=condition=Ready pod \
-     -l "$SEL,app.kubernetes.io/component notin (cron,tls-bootstrap,strategy-fix,backup)" \
+     -l "$SEL,app.kubernetes.io/component notin (cron,tls-bootstrap,backup)" \
      --field-selector=status.phase!=Succeeded,status.phase!=Failed \
      --timeout=600s >/dev/null 2>&1; then
   ok "all pods Ready"

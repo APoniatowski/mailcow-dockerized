@@ -8,7 +8,7 @@ metadata:
     {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
 spec:
   replicas: 1
-  {{- include "mailcow.strategy" (dict "root" . "component" $c) | nindent 2 }}
+  {{- include "mailcow.strategy" "Recreate" | nindent 2 }}
   selector:
     matchLabels:
       {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
@@ -35,7 +35,7 @@ spec:
               value: {{ .Values.mailcow.devMode | quote }}
             # DNSSEC-validating resolver (compose: Docker's 127.0.0.11 -> unbound)
             - name: TLSPOL_DNS
-              value: {{ printf "%s:53" .Values.unbound.clusterIP | quote }}
+              value: {{ printf (ternary "[%s]:53" "%s:53" (contains ":" (toString .Values.unbound.clusterIP))) .Values.unbound.clusterIP | quote }}
             - name: WAIT_TCP
               value: "y"
           ports:

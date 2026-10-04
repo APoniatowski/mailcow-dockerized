@@ -4,7 +4,7 @@
 {{- $acme := .Values.acme.enabled }}
 {{- $sogo := not .Values.skip.sogo }}
 {{- $reload := include "mailcow.tlsReload" . }}
-{{- $logos := list (list "custom-favicon.ico" "img/sogo.ico") (list "custom-shortlogo.svg" "img/sogo-compact.svg") (list "custom-fulllogo.svg" "img/sogo-full.svg") (list "custom-fulllogo.png" "img/sogo-logo.png") (list "custom-theme.js" "js/theme.js") (list "custom-sogo.js" "js/custom-sogo.js") }}
+{{- $logos := include "mailcow.sogoLogos" . | fromJsonArray }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -15,7 +15,7 @@ spec:
   {{- with include "mailcow.replicas" (dict "v" $v "key" "nginx") }}
   {{- . | nindent 2 }}
   {{- end }}
-  {{- include "mailcow.strategy" (dict "root" . "component" $c) | nindent 2 }}
+  {{- include "mailcow.strategy" "RollingUpdate" | nindent 2 }}
   selector:
     matchLabels:
       {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}

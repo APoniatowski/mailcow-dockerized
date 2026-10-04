@@ -12,10 +12,8 @@ data:
 
     # --- added by the mailcow Helm chart ---
     server:
-    {{- range (splitList "," .Values.mailcow.networks) }}
-    {{- if trim . }}
-      access-control: {{ trim . }} allow
-    {{- end }}
+    {{- range (splitList "," (include "mailcow.networks" .)) }}
+      access-control: {{ . }} allow
     {{- end }}
       domain-insecure: "{{ .Values.clusterDomain }}"
       private-domain: "{{ .Values.clusterDomain }}"
@@ -23,7 +21,8 @@ data:
     {{- /* Docker's embedded DNS answers bare service names; resolvers that ignore resolv.conf
            search domains (rspamd's async resolver, postfix's DNS client, dig) rely on that.
            Answer them here with a CNAME to the Service FQDN, which unbound then follows. */}}
-    {{- range (list "clamd" "dockerapi" "dovecot" "memcached" "mysql" "nginx" "olefy" "phpfpm" "php-fpm" "postfix" "postfix-tlspol" "redis" "rspamd" "sogo" "unbound" "acme" "watchdog") }}
+    {{- /* only names with a Service (acme and watchdog have none); watchdog relies on these */}}
+    {{- range (list "clamd" "dockerapi" "dovecot" "memcached" "mysql" "nginx" "olefy" "phpfpm" "php-fpm" "postfix" "postfix-tlspol" "redis" "rspamd" "sogo" "unbound") }}
     {{- range $n := (list . (printf "%s-mailcow" .)) }}
     {{- if ne $n "phpfpm-mailcow" }}
       local-zone: "{{ $n }}." redirect
@@ -33,7 +32,7 @@ data:
     {{- end }}
     forward-zone:
       name: "{{ .Values.clusterDomain }}"
-      forward-addr: {{ .Values.clusterDNS }}
+      forward-addr: {{ include "mailcow.clusterDNS" . }}
     {{- with .Values.unbound.forwarders }}
     forward-zone:
       name: "."
@@ -41,11 +40,14 @@ data:
       forward-addr: {{ . }}
       {{- end }}
     {{- end }}
-  # Appended to data/conf/dovecot/extra.conf (after extraFiles).
+  # Appended to data/conf/dovecot/extra.conf (after extraFiles). haproxy_trusted_networks only with
+  # mail.proxyProtocol (unset = dovecot accepts no PROXY header, like compose).
   dovecot-k8s.conf: |
 
     # --- added by the mailcow Helm chart ---
-    haproxy_trusted_networks = {{ .Values.mail.proxyTrustedNetworks }}
+    {{- with include "mailcow.proxyTrustedNetworks" . | fromJsonArray }}
+    haproxy_trusted_networks = {{ join " " . }}
+    {{- end }}
   # Appended to data/conf/postfix/extra.cf (after extraFiles). The lmtp client's own DNS
   # lookups skip resolv.conf search domains, so the bare "dovecot" transport host
   # (main.cf virtual_transport) only resolves through getaddrinfo.

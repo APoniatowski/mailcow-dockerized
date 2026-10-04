@@ -1,17 +1,22 @@
 # mailcow Helm chart
 
 Runs [mailcow-dockerized](https://github.com/mailcow/mailcow-dockerized) on Kubernetes with the
-same images as `docker-compose.yml`. Status: **0.1, experimental**. It relies on opt-in environment
+same images as `docker-compose.yml`. Status: **chart 0.1.0, experimental**. It relies on opt-in environment
 variables of the mailcow images (see [Environment contract](#environment-contract)); read
 [Security](#security) before exposing it.
 
 ## Install
 
 ```bash
-# 1. files image: data/web, data/conf, data/assets, data/hooks of this checkout (context = repo root)
-docker build -f helm/mailcow/files-image/Dockerfile \
+# 1. files image: data/web, data/conf, data/assets, data/hooks of this checkout. Not published upstream
+#    (the default files.image.repository is a placeholder): build and push it yourself. For releases build
+#    from a clean export, which holds tracked files only:
+git archive HEAD | docker build -f helm/mailcow/files-image/Dockerfile \
   --build-arg MAILCOW_VERSION=$(git describe --tags --abbrev=0) \
-  -t registry.example.org/mailcow-files:2026-09 .
+  --build-arg MAILCOW_COMMIT=$(git rev-parse HEAD) \
+  -t registry.example.org/mailcow-files:2026-09 -
+#    or from the working tree with BuildKit (docker buildx), which applies Dockerfile.dockerignore:
+#    docker buildx build -f helm/mailcow/files-image/Dockerfile -t registry.example.org/mailcow-files:2026-09 .
 docker push registry.example.org/mailcow-files:2026-09
 
 # 2. release (one release per namespace: Services use the fixed compose names)
@@ -22,15 +27,30 @@ helm install mailcow helm/mailcow -n mailcow --create-namespace \
   --set files.image.repository=registry.example.org/mailcow-files
 ```
 
+The files image holds exactly the tracked files of `data/{web,conf,assets,hooks}` (+ openssl, curl,
+socat): `Dockerfile.dockerignore` mirrors every `data/` entry of `.gitignore` and re-includes the tracked
+files those patterns match, so the generated and secret files a compose installation leaves in the
+working tree (`mailcow.conf`-derived configs, `data/conf/rspamd/override.d/*`, `sogo/plist_ldap`, nginx
+`*.conf`, postfix maps, certificates, hooks) stay out. Only BuildKit reads that file; the legacy
+builder would copy everything, and the Dockerfile then fails on a list of known secret files. Untracked
+files that `.gitignore` does not cover still get in from a working tree: hence `git archive` for
+releases.
+
+GitOps and other client-side renderers (Argo CD, Flux with `helm template`-style rendering, `helm
+template | kubectl apply`) cannot run `lookup`: every render would generate new passwords and a new
+rspamd relay CA. Use `existingSecret` (release passwords) and `rspamd.socketRelay.tls.existingSecret`
+there, and set `clusterDNS` explicitly.
+
 Requires Kubernetes >= 1.29 (native sidecar containers, beta and on by default since 1.29, GA in
 1.33; `kubeVersion` in `Chart.yaml`). Before installing, check these cluster-specific values:
 
 | value | what | how to find it |
 |---|---|---|
 | `unbound.clusterIP` | fixed ClusterIP of the `unbound` Service, nameserver of most mailcow pods | an unused IP inside the **service CIDR** (`kubectl cluster-info dump \| grep service-cluster-ip-range`); default `10.96.53.53` fits kind/kubeadm `10.96.0.0/12` |
-| `clusterDNS` | kube-dns/CoreDNS ClusterIP, unbound forwards `clusterDomain` to it | `kubectl -n kube-system get svc kube-dns` |
+| `clusterDNS` | kube-dns/CoreDNS ClusterIP, unbound forwards `clusterDomain` to it | empty (default): looked up from `kube-system/kube-dns` at install/upgrade (needs `get services` in kube-system; `10.96.0.10` when nothing is found, e.g. offline renders); otherwise `kubectl -n kube-system get svc kube-dns` |
 | `unbound.forwarders` | optional upstream resolvers (`[1.1.1.1, 9.9.9.9]`, `IP@port` allowed) for everything outside `clusterDomain`; empty = full recursion from the root servers like compose | set it when outbound port 53 is filtered or intercepted (recursion from the root then fails: every external lookup SERVFAILs); the forwarders must pass DNSSEC records through, validation stays on |
 | `mailcow.networks` | `MAILCOW_NETWORKS`: CIDRs trusted as internal (postfix `mynetworks`, rspamd, dovecot) | the **pod CIDR** only. Never node or LB ranges: SNAT'd outside clients would become trusted relays |
+| `mail.proxyProtocol`, `mail.proxyTrustedNetworks` | PROXY protocol on the mail ports (default off). On, `proxyTrustedNetworks` is required | the addresses your load balancer connects to the pods from, see [Security](#client-addresses-externaltrafficpolicy-local-or-proxy-protocol-is-required) |
 | `mailcow.sogoTrustedNets` | `SOGO_TRUSTED_NETS`: where SOGo's dovecot logins come from | defaults to `mailcow.networks` with a warning, see [Security](#security) |
 
 Login: `admin` / `moohoo`. API key: `kubectl -n mailcow get secret mailcow-secrets -o jsonpath='{.data.API_KEY}' | base64 -d`
@@ -44,10 +64,10 @@ Login: `admin` / `moohoo`. API key: `kubectl -n mailcow get secret mailcow-secre
 | mysql, redis | StatefulSet (1 replica, PVC), or an external server (`externalDatabase` / `externalRedis`, [External database / Redis](#external-database--redis)). Clients use TCP (`DBHOST=mysql`) |
 | dovecot | StatefulSet (1 replica) |
 | postfix | StatefulSet `<fullname>-postfix`, `postfix.replicas` (default 1; > 1 with a queue PVC per pod in StatefulSet `<fullname>-postfix-spool`, [Scaling](#scaling)) |
-| rspamd | Deployment (1 replica), `hostname: rspamd` (worker-proxy binds `rspamd:9900`), own PVC; controller socket relayed over TCP 11335 ([Storage](#storage)) |
+| rspamd | Deployment (1 replica), `hostname: rspamd` (worker-proxy binds `rspamd:9900`), own PVC; controller socket relayed over TCP 11335 with mutual TLS ([Storage](#storage)) |
 | php-fpm, sogo, nginx | Deployment, `replicas` or an HPA ([Scaling](#scaling)) |
 | clamd, olefy, memcached, postfix-tlspol | Deployment |
-| dockerapi | Deployment + ServiceAccount/Role (pods get/list/delete, pods/exec, metrics.k8s.io pods get), `DOCKERAPI_BACKEND=kubernetes`; Services `dockerapi`/`dockerapi-mailcow`, NetworkPolicy always on |
+| dockerapi | Deployment + ServiceAccount/Role (pods list/delete, pods/exec create/get, replicasets get, deployments/statefulsets patch, metrics.k8s.io pods get), `DOCKERAPI_BACKEND=kubernetes`; restart = rollout restart of the owning Deployment/StatefulSet; Services `dockerapi`/`dockerapi-mailcow`, NetworkPolicy always on. **See [Namespace](#namespace)** |
 | acme | optional (`acme.enabled`), default off → cert-manager / Secret / self-signed |
 | watchdog | optional (`watchdog.enabled`); probes do the self-healing |
 | netfilter | not shipped: fail2ban is not supported on Kubernetes, see [Brute-force protection](#brute-force-protection-no-fail2ban) |
@@ -78,7 +98,16 @@ extraFiles:
 ```
 
 They are copied over the base slice on every pod start (also into the shared dir
-`conf/rspamd/custom`, where they overwrite UI edits).
+`conf/rspamd/custom`, where they overwrite UI edits). Paths are relative to `data/` and may only use
+letters, digits and `. _ - @ +` (the chart fails otherwise). `extraFiles` content ends up in a
+ConfigMap; for credentials (`conf/acme/dns-01.conf`, `conf/sogo/plist_ldap`, ...) reference a Secret
+you manage instead, same semantics, applied after `extraFiles`:
+
+```yaml
+extraSecretFiles:
+  conf/acme/dns-01.conf: {secretName: mailcow-acme-dns, key: dns-01.conf}
+  conf/sogo/plist_ldap: {secretName: mailcow-sogo-ldap, key: plist_ldap}
+```
 
 ### Storage
 
@@ -107,7 +136,9 @@ label `mailcow.email/shared-volume` and a required podAffinity to each other, so
 node holding the volume; every other pod schedules freely. `global-sieve/{before,after}` start as the
 repo's `data/conf/dovecot/global_sieve_*` (or `extraFiles` with those paths) and are only re-seeded
 while missing or empty. Data PVCs and the generated Secret are kept on `helm uninstall`
-(`persistence.keep`).
+(`persistence.keep`). `persistence.storageClass` is the default class of every PVC; each volume
+(`persistence.<volume>.storageClass`, `backup.persistence.storageClass`) may override it (`"-"` =
+`storageClassName: ""`, no dynamic provisioning).
 
 Not shared (compose shares them through bind mounts or named volumes):
 
@@ -120,28 +151,34 @@ Not shared (compose shares them through bind mounts or named volumes):
   entrypoint). With `existingSecret` nothing new is needed: those keys were already required. The
   SOGo CronJobs read the files in the sogo pod.
 - rspamd's controller socket (`/var/lib/rspamd/rspamd.sock`, trusted without password by
-  `worker-controller.inc`): the rspamd pod runs a native sidecar `rspamd-sock-relay` (socat, files
-  image) that forwards TCP 11335 to the socket. php-fpm, dovecot, postfix and watchdog get an
-  `emptyDir` at `/var/lib/rspamd` and a native sidecar `rspamd-sock` that listens on
-  `/var/lib/rspamd/rspamd.sock` (mode 0666, like rspamd's own) and connects to
-  `rspamd-mailcow.<ns>.svc.<clusterDomain>:11335` per connection. Clients and rspamd config are
-  unchanged; rspamd still sees unix-socket clients. `rspamd.socketRelay.resources` sizes the sidecars.
-  The relay listens dual-stack (`TCP6-LISTEN`, `ipv6only=0`) when the pod has IPv6 (non-empty
-  `/proc/net/if_inet6`) and IPv4-only otherwise, decided at container start, so it works on IPv4,
-  IPv6 and dual-stack clusters. The client relays connect by name; socat (1.8) tries every A/AAAA
-  address of the Service in turn.
-
-#### Upgrading from chart < 0.5.0
-
-- rspamd's state (`shared/rspamd-vol`) and UI password (`shared/rspamd-override`) move to the new
-  `rspamd` PVC: rspamd's seed initContainer copies both once (marker `.migrated-from-shared` on the
-  new PVC), so the rspamd UI password keeps working. Only if the old data is not on the `shared` PVC
-  at that point (e.g. a new `shared` claim), set the rspamd UI password again in the admin UI.
-- The `shared` subdirs `rspamd-vol`, `rspamd-override`, `sogo-conf` and `sogo-sso` are unused
-  afterwards and can be deleted. `sogo-conf` held UI-independent copies of `data/conf/sogo`; use
-  `extraFiles` (`conf/sogo/...`) for SOGo customisation, as before.
-- postfix, sogo and nginx (without acme) lose the shared-volume podAffinity and may be rescheduled
-  to other nodes.
+  `worker-controller.inc`: full controller access): the rspamd pod runs a native sidecar
+  `rspamd-sock-relay` (socat, files image) that forwards TCP 11335 to the socket with **mutual TLS**
+  (`OPENSSL-LISTEN ... verify=1`): only clients presenting a certificate signed by the relay CA get a
+  connection. php-fpm, dovecot, postfix and watchdog get an `emptyDir` at `/var/lib/rspamd` and a
+  native sidecar `rspamd-sock` that listens on `/var/lib/rspamd/rspamd.sock` (mode 0666, like rspamd's
+  own) and connects per connection to `rspamd-mailcow.<ns>.svc.<clusterDomain>:11335` with the client
+  certificate, verifying the server certificate against the CA and that name (`OPENSSL ...
+  verify=1`). Clients and rspamd config are unchanged; rspamd still sees unix-socket clients.
+  - Certificates: Secret `<fullname>-rspamd-relay-tls` (`ca.crt`, `tls.crt`/`tls.key` with the SANs
+    `rspamd-mailcow`, `rspamd` and their `.<ns>.svc[.<clusterDomain>]` names, `client.crt`/`client.key`),
+    generated by the chart (`genCA`/`genSignedCert`, `rspamd.socketRelay.tls.days`, default 10 years)
+    and kept on upgrade (`lookup`; regenerated if missing or incomplete). Or bring your own with
+    `rspamd.socketRelay.tls.existingSecret` (required for GitOps renderers). The relay containers
+    mount only their half (server: CA + server pair; clients: CA + client pair) read-only, mode 0444
+    because they run as uid 10900 and Secret files are root-owned; no other container mounts them.
+  - socat loads the server certificate once at start: the rspamd pod carries a checksum annotation of
+    the generated Secret and restarts when the chart regenerates it. With `existingSecret`, restart
+    rspamd yourself after rotating (`kubectl rollout restart deployment/<fullname>-rspamd`); clients
+    read their files per connection once the kubelet has synced the Secret (a minute or two).
+  - The always-on NetworkPolicy for 11335 stays as defense in depth.
+  - Both relays run as uid/gid 10900, which no mailcow image uses (postfix 101, dovecot 401/402/5000,
+    sogo 999; `nobody` 65534 runs the imapsync CronJob inside dovecot), with every capability
+    dropped and a read-only root filesystem: in pods with a shared process namespace (`tls-reload`)
+    they share no uid with any daemon. `rspamd.socketRelay.resources` sizes the sidecars.
+  - The relay listens dual-stack (`pf=ip6,ipv6only=0`) when the pod has IPv6 (non-empty
+    `/proc/net/if_inet6`) and IPv4-only (`pf=ip4`) otherwise, decided at container start, so it works
+    on IPv4, IPv6 and dual-stack clusters. The client relays connect by name; socat (1.8) tries every
+    A/AAAA address of the Service in turn.
 
 ### External database / Redis
 
@@ -215,7 +252,11 @@ high availability of the database are yours.
 1. `acme.enabled`: mailcow ACME client writes to the shared `ssl` dir (snake-oil seeded first).
 2. `tls.certManager.enabled`: Certificate (`issuerRef`) → Secret `<fullname>-tls`.
 3. `tls.existingSecret`.
-4. otherwise a pre-install hook Job creates a self-signed snake-oil Secret once (like `generate_config.sh`).
+4. otherwise a pre-install **and pre-upgrade** hook Job (`tls-bootstrap`) creates a self-signed
+   snake-oil Secret once (like `generate_config.sh`). It is not rendered when the Secret already
+   exists (`lookup`); if it runs anyway it keeps an existing Secret (HTTP 409). It runs as uid 10900
+   with a read-only root filesystem, every capability dropped and an in-memory `emptyDir` for the key;
+   its ServiceAccount (Secret `create` only) and RBAC are deleted once the hook succeeds.
 
 For 2–4 the Secret is mounted as a whole volume at `/etc/ssl/mail-tls` (`cert.pem`/`key.pem`)
 and `/etc/ssl/mail` holds `dhparams.pem` (files image) plus symlinks, so renewed certificates appear
@@ -236,36 +277,52 @@ itself, so every replica is covered, and the new certificate is in use within `i
 kubelet sync delay after a renewal. If no master process is found (container restarting) the sidecar
 retries on the next check; a restarted daemon has read the new files anyway.
 
-The sidecar runs the files image's busybox shell as uid 0 (the masters run as root, and a process
-may signal another of the same uid without any capability) with every capability dropped,
-`allowPrivilegeEscalation: false` and a read-only root filesystem; it mounts only the TLS Secret.
-`shareProcessNamespace: true` is set on those three pods only when the sidecar is rendered. It
-makes the containers of the pod see each other's processes: the main container, the `rspamd-sock`
-relay (uid 65534) and `tls-reload`. Reading another process's environment, memory or root
-filesystem still needs ptrace rights (same uid and no extra capabilities on the target, or
-`CAP_SYS_PTRACE`, which no container has), so the relay and the sidecar cannot look into the
-daemons; the main container (root) can signal the sidecars, which it could disrupt anyway. The
-`seed` initContainer has exited before the main container starts. Side effect: the pause container
-is PID 1 and reaps orphans (postfix's daemonised master is re-parented to it instead of supervisord;
-nothing in the images depends on that).
+`shareProcessNamespace: true` is set on those three pods only when the sidecar is rendered. All
+containers of such a pod then see each other's processes: the main container (root and the daemons'
+own users), the `rspamd-sock` relay (postfix, dovecot; uid 10900) and `tls-reload`. What each can do:
+
+- Every process can list the pod's processes and read the world-readable `/proc/<pid>/{comm,cmdline,status}`
+  (command lines are visible pod-wide, as on any host without `hidepid`).
+- Reading another process's environment or memory, or its files through `/proc/<pid>/root`, needs
+  the kernel's ptrace access check: same uid **and** the caller's capabilities a superset of the
+  target's, or `CAP_SYS_PTRACE`, which no container has. The relay (10900) shares no uid with any
+  daemon, so it cannot look into dovecot's `nobody` imapsync runs (which handle the dovecot master
+  password) or anything else, and no daemon can read the relay's client key.
+- `tls-reload` runs the files image's busybox shell as **uid 0**: the masters run as root, and a
+  process may signal another of the same uid without a capability. It can therefore signal (e.g.
+  kill) root processes of the pod. It cannot read their environment, memory or files: it has no
+  capabilities, so its permitted set is not a superset of the root daemons', and the daemons' other
+  uids differ. It cannot signal the relay (other uid). This is acceptable because it is a fixed loop
+  from the chart (no input but the mounted TLS Secret, the only volume it mounts), opens no network
+  listener, has a read-only root filesystem, `allowPrivilegeEscalation: false` and every capability
+  dropped; the main container already runs as root with more capabilities next to it.
+- The main container (root with the runtime's default capabilities, which include `CAP_KILL`) can
+  signal the sidecars, which it could disrupt anyway. The `seed` initContainer has exited before the
+  main container starts.
+
+Side effect: the pause container is PID 1 and reaps orphans (postfix's daemonised master is
+re-parented to it instead of supervisord; nothing in the images depends on that).
 
 cert-manager renews at 2/3 of the certificate lifetime by default (30 days before expiry for
 90-day Let's Encrypt certificates; `tls.certManager.renewBefore` overrides it). With `acme.enabled`
 no sidecar is rendered: the acme container reloads/restarts the daemons through dockerapi itself.
 
-Upgrading from chart < 0.7.0: the `cert-reload` CronJob is gone (Helm deletes it) and
-`tls.reload.schedule` is ignored.
-
 ### Client IPs and exposure
 
-- Mail: one Service `<fullname>-mail` selects postfix **and** dovecot pods through named target
-  ports (one IP for MX and IMAP). `mail.proxyProtocol: true` (default) maps 25/465/587/143/993/110/995/4190
-  to the PROXY listeners 10025/10465/10587/10143/10993/10110/10995/14190; the load balancer must send
-  PROXY headers, and `mail.proxyTrustedNetworks` becomes dovecot's `haproxy_trusted_networks`.
-  `false`: plain ports with `externalTrafficPolicy: Local`. Either way the client address must reach
-  postfix unchanged, see [Security](#security).
-- HTTP: `<fullname>-http` LoadBalancer/NodePort and/or `http.ingress` (plain HTTP backend; keep
+- Mail: one Service `<fullname>-mail` (`mail.service.type` LoadBalancer, NodePort or ClusterIP)
+  selects postfix **and** dovecot pods through named target ports (one IP for MX and IMAP).
+  `mail.proxyProtocol: false` (default): plain ports with `externalTrafficPolicy: Local`.
+  `true` maps 25/465/587/143/993/110/995/4190 to the PROXY listeners
+  10025/10465/10587/10143/10993/10110/10995/14190; the load balancer must send PROXY headers, and the
+  required `mail.proxyTrustedNetworks` becomes dovecot's `haproxy_trusted_networks` and the only
+  allowed source of the PROXY ports. Either way the client address must reach postfix unchanged, see
+  [Security](#security). `mail.service.allocateLoadBalancerNodePorts` (unset = Kubernetes default
+  `true`) can drop the node ports for load balancers that target pod IPs.
+- HTTP: `<fullname>-http` (`http.service.type` LoadBalancer, NodePort or ClusterIP;
+  `http.service.loadBalancerSourceRanges`) and/or `http.ingress` (plain HTTP backend; keep
   `mailcow.httpRedirect: n`, set `mailcow.trustedProxies` to the controller's pod CIDR if it is not RFC 1918).
+  `externalTrafficPolicy` and the node ports are only rendered for NodePort/LoadBalancer, the
+  `loadBalancer*` fields only for LoadBalancer.
 
 ### CronJobs (ofelia)
 
@@ -282,7 +339,24 @@ All `concurrencyPolicy: Forbid`, time zone `mailcow.tz`; the `MASTER` guards run
 the target container. Override with `cronjobs.jobs.<name>.{enabled,schedule}`. With replicas,
 `kubectl exec deployment/<name>` picks one pod, so each job still runs once per schedule (the
 `MASTER`-guarded SOGo jobs must run once, not per replica). `cronjobs.enabled: false` removes the
-runner's ServiceAccount and Role too.
+runner's ServiceAccount and Role too. The runner's Role can `get` only the targeted workloads
+(`<fullname>-php-fpm`, `-sogo`, `-dovecot`) but `pods/exec` cannot be scoped to them.
+
+Pod churn: unlike ofelia's in-process timer, every run is a pod. The 14 default CronJobs, 6 of them
+every minute, start about 9,300 short-lived pods a day (each with an API token, an image check and
+scheduler/kubelet work; `ttlSecondsAfterFinished` and the history limits clean them up). Disable what
+you do not use and slow down the rest, e.g.:
+
+```yaml
+cronjobs:
+  jobs:
+    phpfpm-keycloak-sync: {enabled: false}       # no Keycloak/LDAP identity provider configured
+    phpfpm-ldap-sync: {enabled: false}
+    dovecot-imapsync-runner: {schedule: "*/5 * * * *"}   # sync jobs start up to 5 min later
+```
+
+`cronjobs.image.tag` (kubectl) should stay within one minor version of the cluster (kubectl's
+version skew policy).
 
 ### Scaling
 
@@ -322,8 +396,8 @@ act on one pod per component.
 `bootstrap-sogo.sh` kills sogod and loops while `nc -z sogo-mailcow 20000` succeeds. The pod sets
 `hostname: sogo-mailcow`, which Kubernetes writes into the pod's `/etc/hosts` with the pod's own IP,
 and the image resolves `files` before `dns`; the check therefore only sees the pod itself, never
-the `sogo-mailcow` Service with older pods behind it. sogo uses `RollingUpdate` (chart < 0.7.0:
-`Recreate`). The `MASTER`-guarded bootstrap step (`DROP TRIGGER IF EXISTS`) is idempotent.
+the `sogo-mailcow` Service with older pods behind it. sogo uses `RollingUpdate`. The
+`MASTER`-guarded bootstrap step (`DROP TRIGGER IF EXISTS`) is idempotent.
 
 #### php-fpm: start-up and upgrades
 
@@ -343,7 +417,7 @@ migrates whenever the stored schema version differs from the one in its own code
 - Upgrades: two mailcow versions must not run side by side. A pod with the older files image sees
   the newer schema version and migrates the schema back to its own definition on its next request
   (dropping columns the new version added); the new pods migrate forward again. So php-fpm uses
-  `Recreate` (`phpFpm.updateStrategy`, chart < 0.7.0: `RollingUpdate`): all old pods stop before
+  `Recreate` (`phpFpm.updateStrategy`): all old pods stop before
   new ones start, as with `docker compose up -d`. While php-fpm restarts, the UI, SOGo (nginx
   authenticates SOGo requests through php-fpm) and password logins to dovecot/postfix (mailcowauth)
   fail; dovecot's auth cache covers recently seen users. `RollingUpdate` avoids the gap but is only
@@ -404,38 +478,6 @@ round: drain every `mailcow-postfix-spool-<n>` pod, upgrade; Helm creates `mailc
 `mailcow-postfix`: a new one, or the kept one with whatever was left on it) and deletes
 `mailcow-postfix-spool`. The `spool-mailcow-postfix-spool-<n>` claims stay until you delete them.
 
-### Upgrading from chart < 0.7.0
-
-0.7.0 switched php-fpm to `Recreate` (`phpFpm.updateStrategy`; chart < 0.7.0 rendered no strategy
-for it). Helm 4 applies server-side and only removes fields it owns. A Deployment
-created without a strategy holds the API server's defaulted `rollingUpdate` (owned by no field
-manager), so the upgrade fails with `spec.strategy.rollingUpdate: Forbidden: may not be specified
-when strategy type is 'Recreate'`.
-
-Since 0.7.1 the `strategy-fix` pre-upgrade hook handles it. It looks up the live Deployments and,
-for each one whose strategy differs from the rendered one (type, or a leftover `rollingUpdate` next
-to `Recreate`), runs a Job (own ServiceAccount and Role limited to `get`/`patch` on exactly those
-Deployments, `cronjobs.image`, field manager `mailcow-strategy-fix`) with one container per
-Deployment sending a strategic merge patch with `$retainKeys`. The patch is idempotent and leaves
-the pod template alone, so nothing rolls out. Nothing is rendered on install, on releases that are
-already consistent, or for Deployments that do not exist yet. With `networkPolicy.egress.enabled`
-the hook brings its own NetworkPolicy to the API server (the live policies are still the previous
-release's). Every `RollingUpdate` Deployment now renders `rollingUpdate` (`maxSurge` and
-`maxUnavailable` 25%, the API server defaults), so Helm owns it and a later switch to `Recreate`
-drops it.
-
-The hook needs `lookup`, i.e. a real `helm upgrade` (`helm template` and tools that render with it,
-such as Argo CD, never run it). Without it, or with `--no-hooks`, patch php-fpm once by hand and
-upgrade again; it is the only Deployment that changed to `Recreate` (repeat for any other Deployment
-the error names):
-
-```bash
-kubectl -n mailcow patch deployment mailcow-php-fpm --type=strategic \
-  -p '{"spec":{"strategy":{"$retainKeys":["type"],"type":"Recreate"}}}'
-```
-
-Also new in 0.7.0: the `cert-reload` CronJob is gone ([TLS](#tls)).
-
 ## Backup and restore
 
 `backup.enabled: true` (off by default) renders the CronJob form of
@@ -447,7 +489,7 @@ self-contained baseline.
 > **Back up `crypt`.** It holds dovecot's mail_crypt key pair. Every stored message is encrypted
 > with it: a vmail backup without the matching `crypt` backup cannot be read by anyone. The
 > archives therefore contain private keys: restrict access to the backup storage and encrypt it at
-> rest.
+> rest. The backup Jobs create every directory with mode 700 and every file with mode 600 (`umask 077`).
 
 ### What is backed up
 
@@ -532,9 +574,11 @@ kubectl -n mailcow get jobs -l app.kubernetes.io/component=backup
 - Multi-node: `backup.persistence.accessMode: ReadWriteMany`, or `backup.persistence.existingClaim`
   on RWX storage (NFS, CephFS, EFS, ...; set `accessMode` to what it is). Each volume group then only
   follows its owner (when the owner's volume is ReadWriteOnce).
-- The Jobs run as root with every capability dropped except `DAC_READ_SEARCH` (read mailboxes of any
-  owner), read-only root filesystem, no service account token. They write as root: an NFS export
-  needs `no_root_squash`, or replace `backup.securityContext` / `backup.podSecurityContext`.
+- The Jobs run as root with every capability dropped except `DAC_OVERRIDE` (read mailboxes of any
+  owner; allowed by the Pod Security `baseline` profile, unlike `DAC_READ_SEARCH`; every source volume
+  is mounted read-only), read-only root filesystem, no service account token. They write as root
+  (directories 700, files 600): an NFS export needs `no_root_squash`, or replace
+  `backup.securityContext` / `backup.podSecurityContext`.
 - Node-local storage (local-path, hostPath) pins the backup PVC to the node of its first Job; if
   dovecot moves, the Jobs cannot follow.
 - ReadWriteOncePod cannot work (the chart fails): the Jobs mount volumes their owners have mounted.
@@ -564,9 +608,25 @@ kept). The database dump and the vmail archive are not taken at the same instant
 
 ### Restore
 
-`scripts/restore.sh` needs `kubectl` access to the namespace (pods, pods/exec, deployments/statefulsets
-scale, PVCs, Secrets read; Secrets patch for a compose MariaDB restore). It prints the kubectl
-context and server it will use and asks you to type the namespace (or `--yes`).
+`scripts/restore.sh` runs on your workstation with `kubectl`. Requirements: bash >= 4.4 and GNU
+coreutils (macOS: `brew install bash coreutils`), and RBAC in the release namespace for:
+
+| resource | verbs | why |
+|---|---|---|
+| pods | create, get, list, watch, delete | inspect and restore pods (`kubectl apply`, `wait`, `delete`) |
+| pods/exec | create | list the backup, extract archives, run `doveadm force-resync` |
+| events | list | scheduling events of a restore pod that does not start (`kubectl describe`) |
+| persistentvolumeclaims | get | backup and target claims |
+| services | get | the `mysql` Service (bundled or external database) |
+| secrets | get; patch | read `DBPASS`; patch `DBPASS`/`DBROOT` only for a compose MariaDB (physical) restore |
+| cronjobs | get, list, patch | find the backup CronJobs and their retention, suspend them during the restore (flag kept in an annotation) |
+| deployments, statefulsets | get, list, patch; `deployments/scale`, `statefulsets/scale` update/patch | scale writers down and back; previous replica counts kept in an annotation |
+| nodes (cluster scope) | get, optional | architecture of the rspamd pod's node for the rspamd archive check (falls back without it) |
+
+It prints the kubectl context and server it will use and asks you to type `<namespace>@<context>`
+(or `--yes`). Suspend Argo CD / Flux self-heal (auto-sync) for the release while restoring: the
+script scales workloads to 0, suspends CronJobs and may patch the Secret, which a GitOps controller
+would revert mid-restore.
 
 ```bash
 # 1. which backups exist, what is in one
@@ -581,23 +641,30 @@ helm/mailcow/scripts/restore.sh --namespace mailcow --release mailcow --backup m
 
 What it does:
 
-1. Starts `<fullname>-restore-inspect` (backup PVC read-only) to list the backup and the node's
-   architecture.
-2. Scales watchdog and the writers of the selected components to 0 and waits for their pods to go:
-   `vmail`/`crypt` dovecot; `redis` redis; `rspamd` rspamd; `postfix` postfix; `sogo` sogo; `mysql`
-   php-fpm, sogo, dovecot, postfix, acme (+ mysql for a physical restore).
-3. Starts `<fullname>-restore`, which mounts the backup PVC read-only and each target PVC at the
+1. Starts `<fullname>-restore-inspect` (backup PVC read-only) to list the backup; checks the
+   architecture of the rspamd pod's node. Refuses to start while a backup run is active, and warns
+   if the next backup run would prune the directory being restored (retention).
+2. `--components all` takes every component found in the directory that this release can take:
+   `redis` is skipped with `externalRedis`, `postfix` with `postfix.spoolPerPod` (with a warning).
+3. Suspends the release's backup CronJobs (no run may write into or prune the backup PVC meanwhile),
+   then scales watchdog and the writers of the selected components to 0 and waits for their pods to
+   go: `vmail`/`crypt` dovecot; `redis` redis; `rspamd` rspamd; `postfix` postfix; `sogo` sogo;
+   `mysql` php-fpm, sogo, dovecot, postfix, acme (+ mysql for a physical restore). The previous
+   replica counts and suspend flags are stored in the annotations `mailcow.email/restore-replicas` /
+   `mailcow.email/restore-suspend`, so a rerun after an interrupted restore still scales back correctly.
+4. Starts `<fullname>-restore`, which mounts the backup PVC read-only and each target PVC at the
    archive's path (`/vmail`, `/crypt`, `/redis`, `/rspamd` + `/rspamd_override`, `/postfix`,
-   `/sogo_backup`), and a `db` container from the mysql client image. It schedules wherever the
-   volumes allow (their owners are stopped); with node-local storage on several nodes it may not fit
-   anywhere, and the script shows the scheduling events.
-4. Extracts the archives over the volumes (`tar --numeric-owner -Pxpf`; nothing is deleted first,
+   `/sogo_backup`), plus a `db` container from the mysql client image only for a logical database
+   restore. It schedules wherever the volumes allow (their owners are stopped); with node-local
+   storage on several nodes it may not fit anywhere, and the script shows the scheduling events.
+5. Extracts the archives over the volumes (`tar --numeric-owner -Pxpf`; nothing is deleted first,
    as in the script) and pipes `backup_mysql.sql.*` into `mariadb` through the `mysql` Service (the
    bundled or the external database). rspamd data from another CPU architecture is skipped (the
    script's check).
-5. Deletes the pod and scales everything back to its previous replica count, also after a failure
-   (the volumes may then be partially restored: rerun the restore). Optionally runs
-   `doveadm force-resync -A '*'` (`--resync`, or asked).
+6. Deletes the pod, scales everything back to its previous replica count and resumes the CronJobs,
+   also after a failure (the volumes may then be partially restored: rerun the restore). Optionally
+   runs `doveadm force-resync -A '*'` (`--resync`, or asked), repeated until the message count is
+   stable (up to 3 passes: one pass may re-add only part of the expunged messages).
 
 Not handled by the script: Redis of `externalRedis` (load `dump.rdb` with the provider's tools) and
 `postfix.spoolPerPod` queues (extract `backup_postfix.tar.zst` into one spool PVC with a pod like
@@ -608,20 +675,28 @@ Disaster recovery into a new cluster:
 1. Recreate the Secret from your export (and `existingSecret: <name>`) or let the chart generate a
    new one; install the chart with the same values and `backup.enabled: true`.
 2. Make the backups visible: `backup.persistence.existingClaim` on the restored NFS export, or copy
-   a backup directory into the new backup PVC (e.g. `kubectl cp` into a pod that mounts it).
+   a backup directory into the new backup PVC (e.g. `kubectl cp` into a pod that mounts it). Copy it
+   under a name the retention ignores, e.g. `restore-2026-10-04` (retention only touches
+   `mailcow-YYYY-MM-DD-HH-MM-SS`), or raise `backup.retentionDays` / `backup.keep` first: an old
+   `mailcow-...` directory is otherwise pruned by the next backup run.
 3. `restore.sh --backup <dir>` (all components), then log in, check a few mailboxes and open an
    older message (proves the crypt keys match).
 
 #### Migrating from compose
 
 `restore.sh` restores a directory written by `backup_and_restore.sh backup all`: vmail, crypt,
-redis, rspamd and postfix archives are identical. The MariaDB part is a physical
-`backup_mariadb.tar.zst`: with the bundled database the script stops mysql and its clients, empties
-the mysql PVC, extracts it (`chown 999:999`) and, if the passwords in the directory's `mailcow.conf`
-differ from the release Secret, offers to set `DBPASS`/`DBROOT` in the Secret (the restored data
-directory carries the compose users). Set `mailcow.dbName`/`mailcow.dbUser` to the compose values
-first, and keep the MariaDB major version (`mysql.image`) the same. It cannot go into an external
-database (load a `mariadb-dump` there instead).
+redis, rspamd and postfix archives are identical. Copy the compose directory into the backup PVC
+under a name the retention ignores (e.g. `restore-2026-10-04`, see above). The MariaDB part is a
+physical `backup_mariadb.tar.zst`: with the bundled database the script stops mysql and its clients,
+empties the mysql PVC, extracts it (`chown 999:999`) and, if the passwords in the directory's
+`mailcow.conf` differ from the release Secret, offers to set `DBPASS`/`DBROOT` in the Secret (the
+restored data directory carries the compose users). With `existingSecret` or a Secret managed
+elsewhere (external-secrets, sealed-secrets, GitOps) that patch may be reverted: update the source
+instead. Set `mailcow.dbName`/`mailcow.dbUser` to the compose values first (a mismatch stops the
+script before any change), and keep the MariaDB major version (`mysql.image`) the same. It cannot go
+into an external database (load a `mariadb-dump` there instead). After the migration set the rspamd
+UI password again in the admin UI: compose keeps it in `data/conf/rspamd/override.d`, which is not
+part of a compose backup.
 
 ### Volume snapshots and off-site copies
 
@@ -657,15 +732,20 @@ The chart sets them; images at the tags pinned in `docker-compose.yml` support a
 | `SOGOHOST`, `PHPFPMHOST`, `RSPAMDHOST` | nginx | `sogo-mailcow`, `php-fpm-mailcow`, `rspamd-mailcow` |
 | `NGINXHOST` | acme | `nginx` |
 | `WAIT_TCP=y` | nginx, acme, postfix-tlspol | wait for dependencies with TCP connects instead of `ping` |
-| `TLSPOL_DNS` | postfix-tlspol | `<unbound.clusterIP>:53` |
-| `MAILCOW_NETWORKS` | rspamd, postfix, php-fpm | `mailcow.networks` |
+| `TLSPOL_DNS` | postfix-tlspol | `<unbound.clusterIP>:53` (`[<IPv6>]:53` for an IPv6 ClusterIP) |
+| `MAILCOW_NETWORKS` | rspamd, postfix, php-fpm | `mailcow.networks` (in rspamd it replaces **both** compose defaults, the IPv4 and the IPv6 network) |
 | `SOGO_TRUSTED_NETS` | dovecot, php-fpm | `mailcow.sogoTrustedNets` (empty = `mailcow.networks`) |
 | `DOVECOT_TRUSTED_NETS`, `RSPAMD_TRUSTED_NETS` | rspamd | `mailcow.dovecotTrustedNets` / `rspamdTrustedNets` (empty = `mailcow.networks`); unset, rspamd waits forever for `dig dovecot` |
-| `SOGO_SSO_PASS`, `DOVECOT_MASTER_USER/PASS` | dovecot (+ seed initContainers of sogo, php-fpm) | release Secret (stable SOGo SSO, sieve.creds, cron.creds; sogo/php-fpm derive the same files, see [Storage](#storage)) |
-| `SOGO_ENCRYPTION_KEY` | sogo | release Secret (alphanumeric) |
-| `DOCKERAPI_BACKEND=kubernetes`, `COMPOSE_PROJECT_NAME`, `K8S_POD_SELECTOR` | dockerapi | pods matched by `app.kubernetes.io/name=mailcow,app.kubernetes.io/instance=<release>` in the ServiceAccount's namespace |
+| `SOGO_SSO_PASS`, `DOVECOT_MASTER_USER/PASS` | dovecot (+ seed initContainers of sogo, php-fpm) | release Secret (stable SOGo SSO, sieve.creds, cron.creds; sogo/php-fpm derive the same files, see [Storage](#storage)). `SOGO_SSO_PASS` `[A-Za-z0-9]` only: dovecot exits otherwise, and the sogo/php-fpm seed initContainers fail with a message |
+| `SOGO_ENCRYPTION_KEY` | sogo | release Secret, `[A-Za-z0-9_-]` only (sogo exits otherwise; checked by sogo's seed initContainer) |
+| `DOCKERAPI_BACKEND=kubernetes`, `COMPOSE_PROJECT_NAME`, `K8S_POD_SELECTOR` | dockerapi | pods matched by `app.kubernetes.io/name=mailcow,app.kubernetes.io/instance=<release>,app.kubernetes.io/component notin (cron,backup,tls-bootstrap)` in the ServiceAccount's namespace |
 
-Comma-separated CIDR lists, IPv6 without brackets (`10.244.0.0/16,fd00:10:244::/56`).
+List values (`MAILCOW_NETWORKS`, `*_TRUSTED_NETS`) are comma-separated without spaces (a space breaks
+dovecot's `/source_env.sh` export), IPv6 without brackets (`10.244.0.0/16,fd00:10:244::/56`). The
+images drop `/0` entries and anything that is not an address/CIDR with only a warning; the chart
+fails the render for them instead (`mailcow.networks`, `sogoTrustedNets`, `dovecotTrustedNets`,
+`rspamdTrustedNets`, `mail.proxyTrustedNetworks`) and strips spaces around entries. The external
+database and Redis are reached without TLS (mailcow's clients have no TLS settings).
 
 ## Security
 
@@ -690,16 +770,41 @@ With `externalTrafficPolicy: Cluster` kube-proxy SNATs incoming connections to a
 some CNI setups masquerade to an address inside the pod CIDR (a node's bridge/gateway IP). An outside client
 then appears to postfix as a member of `MAILCOW_NETWORKS`: **open relay**, DKIM-signed spoofing. So:
 
-- `mail.proxyProtocol: true` (default): the load balancer passes the real address in a PROXY header to
-  the PROXY listeners; the Service may then use `Cluster`.
-- `mail.proxyProtocol: false`: the chart sets `externalTrafficPolicy: Local` (only nodes running the pod
-  answer, the source address stays intact). Do not override it with `Cluster`; NOTES.txt warns if you do.
+- `mail.proxyProtocol: false` (default): the chart sets `externalTrafficPolicy: Local` (only nodes
+  running the pod answer, the source address stays intact). Do not override it with `Cluster`;
+  NOTES.txt warns if you do.
+- `mail.proxyProtocol: true`: the load balancer passes the real address in a PROXY header to the
+  PROXY listeners; the Service may then use `Cluster`.
 
-PROXY headers are trusted by source: dovecot only from `mail.proxyTrustedNetworks`
-(`haproxy_trusted_networks`; must cover the LB, node or SNAT addresses the connections come from),
-while postfix's PROXY listeners (10025/10465/10587, like in compose) accept a PROXY header from
-**anyone** who can connect. Anything able to reach them can claim any client address, including one
-in `MAILCOW_NETWORKS`. Limit who can reach them with `networkPolicy.publicMailFrom`.
+#### PROXY protocol: who may send PROXY headers
+
+postfix's PROXY listeners (10025/10465/10587, as in compose) have no trusted-source setting: they
+believe the client address in **any** PROXY header. Whoever can open a connection to them can claim
+any address, including one in `MAILCOW_NETWORKS` (relay without authentication, DKIM signing,
+exempt from rate limits). dovecot has `haproxy_trusted_networks`, but its usual RFC 1918 examples
+include the pod CIDR. So with `mail.proxyProtocol: true` the chart requires
+`mail.proxyTrustedNetworks` (the render fails without it) and uses it for both:
+
+- dovecot `haproxy_trusted_networks` (nothing else is trusted; without PROXY protocol the setting
+  stays unset, so dovecot accepts no PROXY header, as in compose);
+- the **only** allowed source (`ipBlock`s) of the PROXY ports in the postfix/dovecot NetworkPolicies,
+  which are then rendered even with `networkPolicy.enabled: false` (the other ports stay open to
+  anyone in that case). Pods of the release still reach every port.
+
+What to put there: the addresses the PROXY connections arrive from at the pod, and nothing wider.
+
+| load balancer | source the pod sees | `proxyTrustedNetworks` |
+|---|---|---|
+| targets pod IPs (AWS NLB `ip` targets, MetalLB L2/BGP with a PROXY-capable proxy in front, ...) | the LB's own private addresses | the LB subnets / addresses. Consider `mail.service.allocateLoadBalancerNodePorts: false` (no node ports at all) |
+| targets node ports, `externalTrafficPolicy: Local` | the LB's address (proxy-mode LBs) | the LB addresses |
+| targets node ports, `externalTrafficPolicy: Cluster` | the address of the node that received it (SNAT) | the node addresses, **and** firewall the node ports so that only the LB reaches them: otherwise any client that reaches a node port directly is SNAT'd to a trusted node address |
+
+Never the pod CIDR (every pod in the cluster could then forge addresses). NOTES.txt warns about the
+node-port cases (`NodePort`, or `LoadBalancer` with node ports allocated). NetworkPolicy semantics for
+SNAT'd and node-originated traffic differ per CNI (many always admit traffic from the local node):
+treat the node-port firewall as the real boundary, and use `loadBalancerSourceRanges` where the cloud
+supports it. `allocateLoadBalancerNodePorts` is not turned off by default because instance-mode cloud
+load balancers need the node ports.
 
 ### SOGo
 
@@ -712,22 +817,31 @@ IPPool selected by namespace/pod annotation), set `mailcow.sogoTrustedNets` to t
 Requires a CNI that enforces NetworkPolicy (Calico, Cilium, ...); otherwise the
 objects are ignored silently.
 
-- Always: dockerapi :443 only from php-fpm, watchdog, acme and dovecot pods. dockerapi is an
-  unauthenticated API that runs commands in every mailcow container.
-- Always: rspamd's controller relay :11335 only from php-fpm, dovecot, postfix and watchdog pods.
-  It forwards to the controller's unix socket, which rspamd trusts like localhost: no password,
-  full controller access (learn, fuzzy add/delete, settings, maps, history). The same policy opens
-  rspamd's other ports (11333, 11334, 9900, 11445) to release pods with `networkPolicy.enabled`, and
-  to anyone without it (a policy selecting the pod would block them otherwise). No other rule
-  mentions 11335. Without an enforcing CNI every pod in the cluster can reach 11335; so can traffic
-  from the node itself (kubelet, hostNetwork pods), which most CNIs never filter.
-- `networkPolicy.enabled` (default `true`, in both mail modes; only `false` turns it off, the old
-  `""` auto mode now counts as on): every port of mysql, redis (unless external), memcached, clamd, olefy,
-  php-fpm, sogo, postfix-tlspol, unbound, postfix and dovecot (rspamd: every port but 11335) only from pods of this release;
-  postfix/dovecot client ports (PROXY listeners, or the plain ports without PROXY protocol) from
-  `networkPolicy.publicMailFrom`; nginx http/https from anywhere. Without it, any pod in the cluster
-  can relay through postfix, since it connects from the pod CIDR.
-- `networkPolicy.publicMailFrom` empty (default): the client ports allow `0.0.0.0/0` except every
+> **dockerapi without NetworkPolicy enforcement.** dockerapi is an unauthenticated HTTPS API that
+> executes commands in, and restarts, every mailcow container. The chart limits it with an always-on
+> NetworkPolicy, but on a CNI that does not enforce NetworkPolicy (e.g. plain flannel) **every pod in
+> the cluster can reach it**. Use an enforcing CNI, and run mailcow in a dedicated namespace
+> ([Namespace](#namespace)).
+
+- Always: dockerapi :443 only from php-fpm, watchdog, acme and dovecot pods.
+- Always: rspamd's controller relay :11335 only from php-fpm, dovecot, postfix and watchdog pods, in
+  addition to its mutual TLS ([Storage](#storage)). It forwards to the controller's unix socket,
+  which rspamd trusts like localhost: no password, full controller access (learn, fuzzy add/delete,
+  settings, maps, history). The same policy opens rspamd's other ports (11333, 11334, 9900, 11445)
+  to release pods with `networkPolicy.enabled`, and to anyone without it (a policy selecting the pod
+  would block them otherwise). No other rule mentions 11335. Without an enforcing CNI, or from the
+  node itself (kubelet, hostNetwork pods, which most CNIs never filter), 11335 is reachable, but
+  only with a client certificate from the relay CA.
+- With `mail.proxyProtocol: true`, always: the postfix/dovecot PROXY ports only from
+  `mail.proxyTrustedNetworks` (above).
+- `networkPolicy.enabled` (default `true`): every port of mysql, redis (unless external), memcached,
+  clamd, olefy, php-fpm, sogo, postfix-tlspol, unbound, postfix and dovecot (rspamd: every port but
+  11335) only from pods of this release; the PROXY listeners from `mail.proxyTrustedNetworks`, or
+  without PROXY protocol the plain client ports from `networkPolicy.publicMailFrom`; nginx
+  http/https from anywhere. Without it, any pod in the cluster can relay through postfix, since it
+  connects from the pod CIDR.
+- `networkPolicy.publicMailFrom` (plain client ports only, `mail.proxyProtocol: false`) empty
+  (default): the client ports allow `0.0.0.0/0` except every
   IPv4 entry of `mailcow.networks`, and `::/0` except every IPv6 entry (bare addresses become /32 or
   /128). Pods of this release still reach every port through the pod selector. Every other source
   inside the pod CIDR is one mailcow trusts (relay without auth), so it must not reach the client
@@ -735,11 +849,8 @@ objects are ignored silently.
   - Calico applies `ipBlock` to pod addresses, so `except` blocks other pods;
   - Cilium never matches pods with CIDR rules, so other pods are blocked either way;
   - ingress traffic SNAT'd into the pod CIDR (e.g. flannel's `cni0`/`flannel.1` address with
-    `externalTrafficPolicy: Cluster`) is blocked too. Without PROXY protocol that traffic would
-    otherwise be an open relay, so blocking is the safe outcome. With PROXY protocol on such a CNI,
-    clients that reach the pod through another node are blocked: set
-    `mail.service.externalTrafficPolicy: Local`, or set `publicMailFrom` to the source range you
-    accept.
+    `externalTrafficPolicy: Cluster`) is blocked too. That traffic would otherwise be an open relay,
+    so blocking is the safe outcome.
 
   Set `publicMailFrom` to your load balancer / node ranges where you can, to narrow it further.
 - The policies above are ingress only. Kubelet probes come from the node, which NetworkPolicy does
@@ -759,7 +870,7 @@ every pod of the release may reach:
 | `0.0.0.0/0` and `::/0` except `networkPolicy.egress.clusterCIDRs` (empty = the `mailcow.networks` entries + `networkPolicy.egress.serviceCIDR`, default `10.96.0.0/12`) | the internet: postfix outbound 25, unbound recursion / `unbound.forwarders`, clamd freshclam, rspamd fuzzy and DNS lists, `sa-rules` download, Keycloak/LDAP sync, imapsync, SOGo remote calendars, acme |
 | `networkPolicy.egress.extraTo` (raw peers, all ports) | in-cluster targets you need |
 
-plus, for dockerapi, the CronJob runner and the TLS bootstrap and strategy-fix hook Jobs only, the Kubernetes API server:
+plus, for dockerapi, the CronJob runner and the TLS bootstrap hook Job only, the Kubernetes API server:
 `networkPolicy.egress.apiServerCIDRs` on `apiServerPorts` (443, 6443). `apiServerCIDRs` is required
 when egress is on (the chart fails without it): use the **endpoint** addresses from
 `kubectl get endpoints kubernetes -n default` (e.g. `172.18.0.2` on kind), not the `kubernetes`
@@ -785,13 +896,14 @@ are additive, so `apiServerCIDRs` and `extraTo` get through even inside `cluster
 ### Namespace
 
 Install mailcow into a namespace of its own. RBAC cannot be scoped to labels: dockerapi's Role allows
-exec into and deletion of **every** pod in the namespace, and the CronJob runner can exec into every
-pod too.
+exec into and deletion of **every** pod in the namespace and a rolling restart (restartedAt
+annotation patch) of **every** Deployment and StatefulSet in it (without the apps rules it would fall
+back to deleting single pods), and the CronJob runner can exec into every pod too.
 
 ## Brute-force protection (no fail2ban)
 
 compose's netfilter container (fail2ban-style bans written to the host's iptables/nftables) is not
-part of the chart, and chart 0.3.0 removed the opt-in DaemonSet:
+part of the chart:
 
 - it needs a privileged (or NET_ADMIN/NET_RAW) hostNetwork pod on every node that rewrites the
   node's firewall, next to the rules kube-proxy and the CNI own;
@@ -801,9 +913,6 @@ part of the chart, and chart 0.3.0 removed the opt-in DaemonSet:
   logs does nothing, banning the TCP source blocks all mail;
 - the load balancer, cloud firewall or ingress in front of the cluster can drop traffic before it
   reaches any node.
-
-Values that still set `netfilter:` (or `networkPolicy.nodeCIDRs`) render nothing and print a NOTES
-warning.
 
 ### What the chart does
 
@@ -830,7 +939,7 @@ an `extraFiles` `extra.cf`; set `bruteForce.enabled: false` to manage them there
   banned and gets through again once the window has passed.
 - With PROXY protocol the client address is the one from the PROXY header (smtpd's
   `smtpd_upstream_proxy_protocol`, or postscreen passing it on), so the limits hit the real client,
-  not the load balancer. Without PROXY protocol they rely on `externalTrafficPolicy: Local`; with
+  not the load balancer (which is why only `mail.proxyTrustedNetworks` may send such headers). Without PROXY protocol they rely on `externalTrafficPolicy: Local`; with
   SNAT every client would share the node's address and its limits.
 - Many users behind one NAT share a client address. Raise `authRateLimit` / `connectionCountLimit`
   if such sites log in to SMTP at the same time.
@@ -858,7 +967,7 @@ drop traffic meet. Options:
 - Cloud firewall or security group rules on the load balancer for static allow/deny lists (e.g.
   limit submission/IMAP to known ranges where that is possible).
 
-## Limitations (0.1)
+## Limitations (chart 0.1.0)
 
 - dovecot and rspamd run a single replica; postfix replicas each have their own queue (UI queue view
   shows one pod), php-fpm restarts with `Recreate` (short UI/login gap on upgrades), see
@@ -879,22 +988,47 @@ drop traffic meet. Options:
 - The rspamd socket relay listens dual-stack when the pod has IPv6, IPv4-only otherwise; IPv6-only
   and dual-stack clusters work. Other IPv6 caveats (nginx `mailcow.enableIpv6`, watchdog's IPv4-only
   checks) are unchanged.
+- The files image is not published upstream: build it yourself ([Install](#install)).
+- `lookup`-based generation (release Secret, rspamd relay TLS, `clusterDNS`, skipping the TLS
+  bootstrap Job) needs a real `helm install/upgrade`; GitOps renderers must use the `existingSecret`
+  values and an explicit `clusterDNS`.
+- No TLS to an external database or Redis.
+- Ofelia's schedules become CronJobs: ~9,300 short-lived pods a day by default ([CronJobs](#cronjobs-ofelia)).
 
 ## Development
 
-- `helm/mailcow/scripts/check-tags.sh [--fix]`: chart image tags must equal `docker-compose.yml`.
-- `ci/*-values.yaml`: kind (NodePorts 30080/30443/30025/30465/30587/30143/30993/32190, RWO shared,
-  self-signed TLS, clamd skipped), cert-manager + Ingress, HA (RWX, LB + PROXY,
-  watchdog, NetworkPolicy), acme + extraFiles + watchdog (postfix limits off, NetworkPolicy off), NetworkPolicy without PROXY protocol,
-  external MySQL/Redis by DNS name (ExternalName, DBPORT 3307) and by IPv4/IPv6 address (EndpointSlices, Redis 6379 → 6380),
-  egress policies on a dual-stack cluster with an in-cluster external database in `extraTo`,
-  scaling (nginx HPA, sogo/php-fpm 2 replicas, postfix 2 with a queue per pod, watchdog without the
-  queue mount, 60 s TLS reload checks; layer it on kind-values.yaml for the local kind cluster).
-  kind and cert-manager: NetworkPolicy on with the default `publicMailFrom`; cert-manager has the
-  ofelia CronJobs off (no CronJob runner at all).
-  backup: the defaults (ReadWriteOnce backup PVC, every group incl. sogo, retention by age and count;
-  layer it on kind-values.yaml) and a multi-node variant (RWX existingClaim and mail volumes, external
-  database and Redis, newer client image, postfix queue per pod = not backed up).
-  `check-tags.sh` skips the compose services the chart does not ship (ofelia, netfilter) and checks
-  `backup.image` against `DEBIAN_DOCKER_IMAGE` of `helper-scripts/backup_and_restore.sh`.
+- `helm/mailcow/scripts/check-tags.sh [--fix]`: chart image tags must equal `docker-compose.yml`;
+  `backup.image` must equal `DEBIAN_DOCKER_IMAGE` of `helper-scripts/backup_and_restore.sh`, and the
+  fallback image of `scripts/restore.sh` (`DEFAULT_IMAGE`, incl. digest) must equal `backup.image`.
+  `--fix` rewrites repository and tag of the compose-mapped components; the backup image and digest
+  are fixed by hand. It skips the compose services the chart does not ship (ofelia, netfilter).
+- `ci/*-values.yaml` (each rendered and schema-checked by the chart workflow):
+  - `kind`: local kind cluster (NodePorts 30080/30443/30025/30465/30587/30143/30993/32190, RWO shared,
+    self-signed TLS, clamd skipped, no PROXY protocol, NetworkPolicy on with the default `publicMailFrom`);
+  - `certmanager`: cert-manager + Ingress, ofelia CronJobs off (no CronJob runner at all);
+  - `ha`: RWX shared, NLB with PROXY protocol (ip targets, `proxyTrustedNetworks` = VPC,
+    `allocateLoadBalancerNodePorts: false`), watchdog, NetworkPolicy;
+  - `acme`: acme + extraFiles + watchdog, postfix limits off, NetworkPolicy off with PROXY protocol
+    (the PROXY-port policies are still rendered), `http.service.loadBalancerSourceRanges`;
+  - `proxy-nodeport`: PROXY protocol on a NodePort Service behind an external LB (bare-address
+    `proxyTrustedNetworks`), HTTP as ClusterIP, `extraSecretFiles`, an existing rspamd relay TLS
+    Secret, `podDefaults.annotations`, `clusterDNS` lookup, backups;
+  - `netpol`: NetworkPolicy without PROXY protocol, custom `publicMailFrom`, dual-stack networks;
+  - `external-dns` / `external-ip`: external MySQL/Redis by DNS name (ExternalName, DBPORT 3307) and
+    by IPv4/IPv6 address (EndpointSlices, Redis 6379 -> 6380);
+  - `egress`: egress policies on a dual-stack cluster with an in-cluster external database in `extraTo`;
+  - `scale`: nginx HPA, sogo/php-fpm 2 replicas, postfix 2 with a queue per pod, watchdog without the
+    queue mount, 60 s TLS reload checks (layer it on `kind-values.yaml`);
+  - `backup`: the defaults (ReadWriteOnce backup PVC, every group incl. sogo, retention by age and
+    count; layer it on `kind-values.yaml`) and `backup-rwx`, a multi-node variant (RWX existingClaim
+    and mail volumes, external database and Redis, newer client image, postfix queue per pod = not
+    backed up).
+- `ci/e2e/`: `kind-config.yaml` (the kind cluster: host ports to the NodePorts), `smoke.sh` (checks
+  against a running release: pods Ready, UI/API, SMTP/IMAP through the NodePorts, NetworkPolicy relay
+  protection with a foreign pod, ...), `collect-logs.sh` (diagnostics on failure), `lib.sh` (shared
+  helpers).
+- Workflows: `.github/workflows/helm_chart.yml` (lint, render of every `ci/*-values.yaml`,
+  kubeconform against Kubernetes 1.29 and 1.33, `check-tags.sh`) and `.github/workflows/helm_e2e.yml`
+  (builds the images, installs the chart on kind with `kind-values.yaml`, plus the scale leg and a
+  "kind + backup" leg that runs a backup -> restore round trip, then `smoke.sh`).
 - `scripts/restore.sh`: restore a backup directory ([Backup and restore](#restore)); `KUBECTL` selects the binary.

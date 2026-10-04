@@ -9,7 +9,7 @@ metadata:
     {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
 spec:
   replicas: 1
-  {{- include "mailcow.strategy" (dict "root" . "component" $c) | nindent 2 }}
+  {{- include "mailcow.strategy" "RollingUpdate" | nindent 2 }}
   selector:
     matchLabels:
       {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
@@ -17,6 +17,9 @@ spec:
     metadata:
       labels:
         {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+      {{- with include "mailcow.podDefaultAnnotations" . }}
+      {{- . | nindent 6 }}
+      {{- end }}
     spec:
       automountServiceAccountToken: false
       {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}

@@ -11,7 +11,9 @@ persistence:
 
 mail:
   proxyProtocol: true
-  proxyTrustedNetworks: "10.0.0.0/16"
+  # NLB in ip-target mode connects from its private addresses in the VPC subnets: only those may send
+  # PROXY headers (dovecot haproxy_trusted_networks + the postfix/dovecot PROXY-port NetworkPolicy)
+  proxyTrustedNetworks: [10.0.0.0/16]
   service:
     type: LoadBalancer
     annotations:
@@ -19,6 +21,8 @@ mail:
       service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
       service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: "*"
       service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    # ip targets: the NLB reaches pod IPs directly, no node ports needed
+    allocateLoadBalancerNodePorts: false
 
 http:
   service:
@@ -35,7 +39,3 @@ watchdog:
 
 networkPolicy:
   enabled: true
-  # NLB (IP targets) sources: only the VPC may send PROXY headers to postfix/dovecot
-  publicMailFrom:
-    - ipBlock:
-        cidr: 10.0.0.0/16

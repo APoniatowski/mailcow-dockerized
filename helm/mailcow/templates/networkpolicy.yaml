@@ -1,10 +1,12 @@
 {{- /*
 Ingress NetworkPolicies. Only effective with a CNI that enforces NetworkPolicy.
 dockerapi (unauthenticated exec API on :443) is always restricted to the pods that call it, and so is
-the rspamd controller relay :11335 (the controller's unix socket, trusted without password).
+the rspamd controller relay :11335 (the controller's unix socket, trusted without password; mutual
+TLS on top), and with mail.proxyProtocol so are the postfix/dovecot PROXY listeners.
 With networkPolicy on (default): every mailcow port only from pods of this release, except
-  - the client-facing mail ports (PROXY listeners with mail.proxyProtocol, plain ports otherwise),
-    from networkPolicy.publicMailFrom (empty = anywhere outside mailcow.networks),
+  - the client-facing mail ports: with mail.proxyProtocol the PROXY listeners only from
+    mail.proxyTrustedNetworks (postfix trusts every PROXY header it receives); otherwise the plain
+    ports from networkPolicy.publicMailFrom (empty = anywhere outside mailcow.networks),
   - nginx http/https, from anywhere.
 Pods of this release sit in mailcow.networks (MAILCOW_NETWORKS): anything else in the cluster
 that could reach postfix/dovecot from the pod CIDR would be trusted as internal.
@@ -36,7 +38,7 @@ spec:
         - port: 443
           protocol: TCP
 ---
-{{- /* rspamd: always rendered. 11335 only from the socket's users; the other ports from release pods
+{{- /* rspamd: always rendered. 11335 (mutual TLS relay) only from the socket's users; the other ports from release pods
 (networkPolicy on) or anywhere (off: this policy selecting rspamd would otherwise block them).
 11335 must stay out of every other rule: NetworkPolicies are additive. */}}
 apiVersion: networking.k8s.io/v1
@@ -95,14 +97,44 @@ spec:
         {{- include "mailcow.releasePeer" $root | nindent 8 }}
 {{- end }}
 {{- end }}
-{{- /* postfix/dovecot: release pods on every port, clients on the exposed ones */}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-nginx
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" "nginx") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" "nginx") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        {{- include "mailcow.releasePeer" . | nindent 8 }}
+    - ports:
+        - port: {{ int .Values.mailcow.httpPort }}
+          protocol: TCP
+        - port: {{ int .Values.mailcow.httpsPort }}
+          protocol: TCP
+{{- end }}
+{{- /* postfix/dovecot: release pods on every port, clients on the exposed ones. With mail.proxyProtocol
+always rendered (like dockerapi/rspamd): the PROXY listeners accept any client address claimed by
+whoever connects, so they only admit mail.proxyTrustedNetworks; with networkPolicy off the other
+ports stay open to anyone. */}}
 {{- $pp := .Values.mail.proxyProtocol }}
+{{- $np := include "mailcow.networkPolicy" . }}
+{{- if or $np $pp }}
 {{- $mailPorts := dict
   "postfix" (ternary (list 10025 10465 10587) (list 25 465 587) $pp)
   "dovecot" (ternary (list 10143 10993 14190) (list 143 993 4190) $pp) }}
 {{- if .Values.mail.pop3 }}
 {{- $_ := set $mailPorts "dovecot" (concat (get $mailPorts "dovecot") (ternary (list 10110 10995) (list 110 995) $pp)) }}
 {{- end }}
+{{- /* the non-PROXY ports of the pod, opened to anyone with networkPolicy off (then $pp is true) */}}
+{{- $otherPorts := dict
+  "postfix" (list 25 465 587 588 589 590 591)
+  "dovecot" (list 143 993 110 995 4190 24 10001 12345) }}
 {{- range $c := list "postfix" "dovecot" }}
 ---
 apiVersion: networking.k8s.io/v1
@@ -125,28 +157,19 @@ spec:
           protocol: TCP
         {{- end }}
       from:
+        {{- if $pp }}
+        {{- include "mailcow.ipBlocks" (include "mailcow.proxyTrustedNetworks" $root | fromJsonArray) | trim | nindent 8 }}
+        {{- else }}
         {{- include "mailcow.publicMailPeers" $root | nindent 8 }}
-{{- end }}
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: {{ $fullname }}-nginx
-  labels:
-    {{- include "mailcow.labels" (dict "root" . "component" "nginx") | nindent 4 }}
-spec:
-  podSelector:
-    matchLabels:
-      {{- include "mailcow.selectorLabels" (dict "root" . "component" "nginx") | nindent 6 }}
-  policyTypes: ["Ingress"]
-  ingress:
-    - from:
-        {{- include "mailcow.releasePeer" . | nindent 8 }}
+        {{- end }}
+    {{- if not $np }}
     - ports:
-        - port: {{ int .Values.mailcow.httpPort }}
+        {{- range get $otherPorts $c }}
+        - port: {{ . }}
           protocol: TCP
-        - port: {{ int .Values.mailcow.httpsPort }}
-          protocol: TCP
+        {{- end }}
+    {{- end }}
+{{- end }}
 {{- end }}
 {{- with .Values.networkPolicy.egress }}
 {{- if .enabled }}
@@ -192,9 +215,8 @@ spec:
         {{- toYaml . | nindent 8 }}
     {{- end }}
 ---
-{{- /* Kubernetes API server: dockerapi (pods, exec, metrics), CronJob runner (exec), TLS bootstrap and
-strategy-fix hook Jobs (strategy-fix also brings its own hook NetworkPolicy: on an upgrade the live policy
-is still the previous release's) */}}
+{{- /* Kubernetes API server: dockerapi (pods, exec, rollout restarts, metrics), CronJob runner (exec),
+TLS bootstrap hook Job (Secret create) */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -209,7 +231,7 @@ spec:
     matchExpressions:
       - key: app.kubernetes.io/component
         operator: In
-        values: ["dockerapi", "cron", "tls-bootstrap", "strategy-fix"]
+        values: ["dockerapi", "cron", "tls-bootstrap"]
   policyTypes: ["Egress"]
   egress:
     {{- include "mailcow.apiServerEgress" . | nindent 4 }}

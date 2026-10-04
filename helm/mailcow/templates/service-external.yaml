@@ -6,6 +6,11 @@ just the right pod and both protocols share one load balancer IP.
 {{- $root := . }}
 {{- $pp := .Values.mail.proxyProtocol }}
 {{- $ms := .Values.mail.service }}
+{{- range $k, $t := dict "mail.service.type" $ms.type "http.service.type" .Values.http.service.type }}
+{{- if not (has $t (list "LoadBalancer" "NodePort" "ClusterIP")) }}
+{{- fail (printf "%s must be LoadBalancer, NodePort or ClusterIP (got %q)" $k $t) }}
+{{- end }}
+{{- end }}
 {{- $ports := list
   (list "smtp" 25 "smtp" "smtp-pp")
   (list "smtps" 465 "smtps" "smtps-pp")
@@ -28,7 +33,10 @@ metadata:
   {{- end }}
 spec:
   type: {{ $ms.type }}
+  {{- if ne $ms.type "ClusterIP" }}
   externalTrafficPolicy: {{ $ms.externalTrafficPolicy | default (ternary "Cluster" "Local" $pp) }}
+  {{- end }}
+  {{- if eq $ms.type "LoadBalancer" }}
   {{- with $ms.loadBalancerClass }}
   loadBalancerClass: {{ . }}
   {{- end }}
@@ -38,6 +46,10 @@ spec:
   {{- with $ms.loadBalancerSourceRanges }}
   loadBalancerSourceRanges:
     {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if kindIs "bool" $ms.allocateLoadBalancerNodePorts }}
+  allocateLoadBalancerNodePorts: {{ $ms.allocateLoadBalancerNodePorts }}
+  {{- end }}
   {{- end }}
   selector:
     app.kubernetes.io/name: {{ include "mailcow.name" . }}
@@ -49,8 +61,10 @@ spec:
       port: {{ index . 1 }}
       targetPort: {{ ternary (index . 3) (index . 2) $pp }}
       protocol: TCP
+      {{- if ne $ms.type "ClusterIP" }}
       {{- with (get $ms.nodePorts (index . 0)) }}
       nodePort: {{ . }}
+      {{- end }}
       {{- end }}
     {{- end }}
 {{- if .Values.http.service.enabled }}
@@ -68,14 +82,22 @@ metadata:
   {{- end }}
 spec:
   type: {{ $hs.type }}
+  {{- if ne $hs.type "ClusterIP" }}
   {{- with $hs.externalTrafficPolicy }}
   externalTrafficPolicy: {{ . }}
   {{- end }}
+  {{- end }}
+  {{- if eq $hs.type "LoadBalancer" }}
   {{- with $hs.loadBalancerClass }}
   loadBalancerClass: {{ . }}
   {{- end }}
   {{- with $hs.loadBalancerIP }}
   loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- with $hs.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- end }}
   selector:
     {{- include "mailcow.selectorLabels" (dict "root" . "component" "nginx") | nindent 4 }}
@@ -84,15 +106,19 @@ spec:
       port: 80
       targetPort: http
       protocol: TCP
+      {{- if ne $hs.type "ClusterIP" }}
       {{- with $hs.nodePorts.http }}
       nodePort: {{ . }}
+      {{- end }}
       {{- end }}
     - name: https
       port: 443
       targetPort: https
       protocol: TCP
+      {{- if ne $hs.type "ClusterIP" }}
       {{- with $hs.nodePorts.https }}
       nodePort: {{ . }}
+      {{- end }}
       {{- end }}
 {{- end }}
 {{- if .Values.http.ingress.enabled }}

@@ -16,7 +16,7 @@ spec:
   {{- end }}
   # bootstrap-sogo.sh kills sogod while `nc -z sogo-mailcow 20000` succeeds. `sogo-mailcow` is the pod's
   # own hostname (/etc/hosts -> own pod IP, not the Service), so old pods do not block a new one.
-  {{- include "mailcow.strategy" (dict "root" . "component" $c) | nindent 2 }}
+  {{- include "mailcow.strategy" "RollingUpdate" | nindent 2 }}
   selector:
     matchLabels:
       {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
@@ -94,7 +94,7 @@ spec:
             - name: seed
               subPath: web/inc/init_db.inc.php
               mountPath: /init_db.inc.php
-            {{- range list (list "custom-favicon.ico" "img/sogo.ico") (list "custom-shortlogo.svg" "img/sogo-compact.svg") (list "custom-fulllogo.svg" "img/sogo-full.svg") (list "custom-fulllogo.png" "img/sogo-logo.png") (list "custom-theme.js" "js/theme.js") (list "custom-sogo.js" "js/custom-sogo.js") }}
+            {{- range include "mailcow.sogoLogos" . | fromJsonArray }}
             - name: seed
               subPath: conf/sogo/{{ index . 0 }}
               mountPath: {{ $res }}/{{ index . 1 }}

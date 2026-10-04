@@ -40,8 +40,18 @@ metadata:
 rules:
   # `kubectl exec deployment/x` resolves the workload's selector, then picks a pod
   - apiGroups: ["apps"]
-    resources: ["deployments", "statefulsets"]
+    resources: ["deployments"]
     verbs: ["get"]
+    resourceNames:
+      - {{ $fullname }}-php-fpm
+      {{- if not .Values.skip.sogo }}
+      - {{ $fullname }}-sogo
+      {{- end }}
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get"]
+    resourceNames:
+      - {{ $fullname }}-dovecot
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]

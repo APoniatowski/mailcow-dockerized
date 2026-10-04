@@ -25,11 +25,12 @@ spec:
     rotationPolicy: Always
   issuerRef:
     {{- toYaml $cm.issuerRef | nindent 4 }}
-{{- else if include "mailcow.tlsSelfSigned" . }}
+{{- else if and (include "mailcow.tlsSelfSigned" .) (not (lookup "v1" "Secret" .Release.Namespace (include "mailcow.tlsSecretName" .))) }}
 {{- /*
 Self-signed bootstrap (like generate_config.sh's snake-oil): a pre-install/pre-upgrade hook Job
 creates <fullname>-tls once. openssl + curl from the files image; POSTs the Secret to the API
-and treats 409 (already exists) as success, so upgrades never replace it.
+and treats 409 (already exists) as success, so upgrades never replace it. Not rendered when the
+Secret already exists (lookup; offline renders such as helm template always show it).
 */}}
 apiVersion: v1
 kind: ServiceAccount
@@ -40,7 +41,7 @@ metadata:
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-10"
-    helm.sh/hook-delete-policy: before-hook-creation
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -51,7 +52,7 @@ metadata:
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-10"
-    helm.sh/hook-delete-policy: before-hook-creation
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
@@ -66,7 +67,7 @@ metadata:
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-9"
-    helm.sh/hook-delete-policy: before-hook-creation
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -93,11 +94,18 @@ spec:
     metadata:
       labels:
         {{- include "mailcow.selectorLabels" (dict "root" . "component" "tls-bootstrap") | nindent 8 }}
+      {{- with include "mailcow.podDefaultAnnotations" . }}
+      {{- . | nindent 6 }}
+      {{- end }}
     spec:
       restartPolicy: Never
       serviceAccountName: {{ $fullname }}-tls-bootstrap
       # POSTs the Secret to the API with its token
       automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ include "mailcow.helperUid" . }}
+        runAsGroup: {{ include "mailcow.helperUid" . }}
       {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
       containers:
         - name: tls-bootstrap
@@ -132,6 +140,20 @@ spec:
                 409) echo "Secret ${SECRET_NAME} exists, keeping it" ;;
                 *) echo "API returned ${code}"; cat resp.json; exit 1 ;;
               esac
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # key, certificate and request body; the root filesystem is read-only
+            - name: work
+              mountPath: /tmp
           resources:
             requests: {cpu: 10m, memory: 16Mi}
+      volumes:
+        - name: work
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
 {{- end }}

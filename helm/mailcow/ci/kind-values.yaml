@@ -1,6 +1,6 @@
 # local kind cluster: single node, podSubnet 10.244.0.0/16,
 # serviceSubnet 10.96.0.0/16, host ports 127.0.0.1:30080..32190 -> NodePorts of the same number.
-# Images built from the working tree are kind-loaded (build-load.sh), hence IfNotPresent.
+# Images built from the working tree are loaded into the cluster nodes beforehand, hence IfNotPresent.
 mailcow:
   hostname: mail.example.org
   networks: 10.244.0.0/16
@@ -13,6 +13,7 @@ mailcow:
 skip:
   clamd: true
 
+# explicit: no lookup of kube-system/kube-dns needed
 clusterDNS: 10.96.0.10
 unbound:
   clusterIP: 10.96.53.53

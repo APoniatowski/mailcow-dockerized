@@ -8,10 +8,12 @@ metadata:
   labels:
     {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
 ---
-# DOCKERAPI_BACKEND=kubernetes: list/inspect pods by app.kubernetes.io/component, exec via
-# pods/exec (websocket exec needs get), restart = delete pod, stats from metrics.k8s.io.
-# A Role cannot be limited to labels: dockerapi can exec into and delete every pod of the
-# namespace, so run mailcow in a namespace of its own.
+# DOCKERAPI_BACKEND=kubernetes: list pods by K8S_POD_SELECTOR, exec via pods/exec (websocket exec
+# needs get), restart = rollout restart of the owning Deployment/StatefulSet (pod -> ReplicaSet ->
+# Deployment owner lookup, then a restartedAt annotation patch; the patch response is used, no get),
+# falling back to deleting the pod without the apps rules; stats from metrics.k8s.io.
+# A Role cannot be limited to labels: dockerapi can exec into and delete every pod of the namespace and
+# trigger a rolling restart of any Deployment/StatefulSet in it, so run mailcow in a namespace of its own.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -21,10 +23,16 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "delete"]
+    verbs: ["list", "delete"]
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create", "get"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["patch"]
   - apiGroups: ["metrics.k8s.io"]
     resources: ["pods"]
     verbs: ["get"]
@@ -52,7 +60,7 @@ metadata:
     {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
 spec:
   replicas: 1
-  {{- include "mailcow.strategy" (dict "root" . "component" $c) | nindent 2 }}
+  {{- include "mailcow.strategy" "RollingUpdate" | nindent 2 }}
   selector:
     matchLabels:
       {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
@@ -60,6 +68,9 @@ spec:
     metadata:
       labels:
         {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+      {{- with include "mailcow.podDefaultAnnotations" . }}
+      {{- . | nindent 6 }}
+      {{- end }}
     spec:
       serviceAccountName: {{ $name }}
       automountServiceAccountToken: true
@@ -88,9 +99,9 @@ spec:
             # must equal php-fpm's value (php-fpm filters containers by project label)
             - name: COMPOSE_PROJECT_NAME
               value: {{ .Values.mailcow.composeProjectName | quote }}
-            # namespace: the ServiceAccount's own
+            # namespace: the ServiceAccount's own; Job pods (CronJob runner, backups, TLS bootstrap) are no containers
             - name: K8S_POD_SELECTOR
-              value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s" (include "mailcow.name" .) .Release.Name | quote }}
+              value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component notin (cron,backup,tls-bootstrap)" (include "mailcow.name" .) .Release.Name | quote }}
           ports:
             - name: https
               containerPort: 443

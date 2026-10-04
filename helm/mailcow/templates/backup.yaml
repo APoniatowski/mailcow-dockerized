@@ -94,9 +94,8 @@ spec:
           labels:
             {{- include "mailcow.selectorLabels" (dict "root" $root "component" "backup") | nindent 12 }}
             mailcow.email/backup-group: {{ $g.name }}
-          {{- with $root.Values.podDefaults.annotations }}
-          annotations:
-            {{- toYaml . | nindent 12 }}
+          {{- with include "mailcow.podDefaultAnnotations" $root }}
+          {{- . | nindent 10 }}
           {{- end }}
         spec:
           automountServiceAccountToken: false
