@@ -1,0 +1,20 @@
+# External MySQL and Redis over TLS without certificate checks (ProxySQL verify: false, relay
+# insecureSkipVerify) by IPv4 address; Redis relay with 2 replicas + PDB, NetworkPolicy off (the TLS
+# proxy policies stay on).
+externalDatabase:
+  enabled: true
+  host: 192.0.2.10
+  tls:
+    enabled: true
+    verify: false
+
+externalRedis:
+  enabled: true
+  host: 192.0.2.11
+  tls:
+    enabled: true
+    insecureSkipVerify: true
+    replicas: 2
+
+networkPolicy:
+  enabled: false

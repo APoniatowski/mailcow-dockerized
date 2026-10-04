@@ -1,0 +1,36 @@
+{{- $c := "memcached" }}
+{{- $v := .Values.memcached }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mailcow.fullname" . }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  replicas: 1
+  {{- include "mailcow.strategy" "RollingUpdate" | nindent 2 }}
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+      {{- with include "mailcow.podDefaultAnnotations" . }}
+      {{- . | nindent 6 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
+      containers:
+        - name: memcached-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          env:
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+          ports:
+            - name: memcached
+              containerPort: 11211
+          {{- include "mailcow.tcpProbes" (dict "port" 11211 "startup" 30) | nindent 10 }}
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}

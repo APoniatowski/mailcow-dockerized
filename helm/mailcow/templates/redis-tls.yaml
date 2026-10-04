@@ -1,0 +1,122 @@
+{{- /*
+externalRedis.tls: mailcow's Redis clients (PHP, Python, Lua, redis-cli) speak plain TCP. A socat relay
+(files image) listens plain on 6379 for release pods and opens a verified TLS connection to the external
+server per client connection; the `redis` / `redis-mailcow` Services select it. The TLS files are read per
+connection (socat opens the OPENSSL address in the forked child), so rotated Secrets apply without a restart.
+Each connection is a forked process of ~5 MiB: max-children caps them below the memory limit, further
+connections wait in the listen backlog until a child exits.
+*/ -}}
+{{- if include "mailcow.redisTls" . }}
+{{- $c := "redis-tls" }}
+{{- $r := .Values.externalRedis }}
+{{- $v := $r.tls }}
+{{- $family := include "mailcow.externalHost" (dict "what" "externalRedis" "host" $r.host "port" $r.port) }}
+{{- $host := trim (toString $r.host) | trimPrefix "[" | trimSuffix "]" }}
+{{- $addr := ternary (printf "[%s]" $host) $host (eq $family "IPv6") }}
+{{- $name := $v.serverName | default (ternary "" $host (ne $family "")) }}
+{{- $ca := ternary "/etc/redis-tls/ca/ca.crt" "/etc/ssl/certs/ca-certificates.crt" (ne $v.caSecret "") }}
+{{- $opts := list "nodelay" "keepalive" }}
+{{- if $v.insecureSkipVerify }}
+{{- $opts = append $opts "verify=0" }}
+{{- else }}
+{{- $opts = concat $opts (list (printf "cafile=%s" $ca) "verify=1") }}
+{{- if $name }}{{ $opts = append $opts (printf "commonname=%s" $name) }}{{ end }}
+{{- end }}
+{{- if $name }}{{ $opts = append $opts (printf "snihost=%s" $name) }}{{ end }}
+{{- if $v.clientCertSecret }}
+{{- $opts = concat $opts (list "cert=/etc/redis-tls/client/tls.crt" "key=/etc/redis-tls/client/tls.key") }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mailcow.fullname" . }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  {{- include "mailcow.replicas" (dict "v" $v "key" "externalRedis.tls") | nindent 2 }}
+  {{- include "mailcow.strategy" "RollingUpdate" | nindent 2 }}
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+      {{- with include "mailcow.podDefaultAnnotations" . }}
+      {{- . | nindent 6 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      # cluster DNS, not unbound: also resolves in-cluster Service names and private zones kube-dns knows
+      dnsPolicy: ClusterFirst
+      {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
+      {{- if include "mailcow.multi" $v }}
+      {{- include "mailcow.spread" (dict "root" . "component" $c) | nindent 6 }}
+      {{- end }}
+      containers:
+        # Logs the verification result of one TLS handshake at start (never fails on it: the server may come
+        # later), then relays. Dual-stack listener when the pod has IPv6, IPv4 only otherwise. -d0: errors only
+        # (socat warns about unchecked CRLs on every connection otherwise).
+        - name: redis-tls
+          image: {{ include "mailcow.filesImage" . }}
+          imagePullPolicy: {{ .Values.files.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              check="-connect ${UPSTREAM_ADDR}:${UPSTREAM_PORT} -brief"
+              {{- if not $v.insecureSkipVerify }}
+              check="${check} -CAfile {{ $ca }} -verify_return_error{{ if $name }} -verify_hostname {{ $name }}{{ else }} -verify_ip {{ $host }}{{ end }}"
+              {{- end }}
+              {{- with $name }}
+              check="${check} -servername {{ . }}"
+              {{- end }}
+              {{- if $v.clientCertSecret }}
+              check="${check} -cert /etc/redis-tls/client/tls.crt -key /etc/redis-tls/client/tls.key"
+              {{- end }}
+              # shellcheck disable=SC2086
+              if r=$(timeout 10 openssl s_client ${check} </dev/null 2>&1); then
+                echo "TLS check ${UPSTREAM_ADDR}:${UPSTREAM_PORT}: ok ($(echo "${r}" | grep -m1 -E '^(Protocol version|Ciphersuite)'))"
+              else
+                echo "TLS check ${UPSTREAM_ADDR}:${UPSTREAM_PORT} FAILED, relaying anyway:"; echo "${r:-no TLS answer within 10s}" | grep -iE 'error|refused|unknown|no TLS answer' | head -n 3
+              fi
+              if grep -qs . /proc/net/if_inet6; then pf="pf=ip6,ipv6only=0"; else pf="pf=ip4"; fi
+              exec socat -d0 "TCP-LISTEN:6379,${pf},fork,max-children={{ int $v.maxChildren }},reuseaddr,nodelay,keepalive" "OPENSSL:${UPSTREAM_ADDR}:${UPSTREAM_PORT},${UPSTREAM_OPTS}"
+          env:
+            - name: UPSTREAM_ADDR
+              value: {{ $addr | quote }}
+            - name: UPSTREAM_PORT
+              value: {{ int $r.port | quote }}
+            - name: UPSTREAM_OPTS
+              value: {{ join "," $opts | quote }}
+          {{- include "mailcow.relaySecurityContext" . | nindent 10 }}
+          ports:
+            - name: redis
+              containerPort: 6379
+          # listening check: a TCP connect would open a TLS connection to the server per probe
+          {{- include "mailcow.probes" (dict "handler" (dict "exec" (dict "command" (list "sh" "-c" "netstat -ltn | grep -q ':6379 '"))) "startup" 6) | nindent 10 }}
+          volumeMounts:
+            {{- if and $v.caSecret (not $v.insecureSkipVerify) }}
+            - name: ca
+              mountPath: /etc/redis-tls/ca
+              readOnly: true
+            {{- end }}
+            {{- if $v.clientCertSecret }}
+            - name: client-cert
+              mountPath: /etc/redis-tls/client
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      {{- if or (and $v.caSecret (not $v.insecureSkipVerify)) $v.clientCertSecret }}
+      volumes:
+        {{- if and $v.caSecret (not $v.insecureSkipVerify) }}
+        {{- include "mailcow.keysVolume" (dict "name" "ca" "secret" $v.caSecret "keys" (list "ca.crt")) | nindent 8 }}
+        {{- end }}
+        {{- if $v.clientCertSecret }}
+        {{- include "mailcow.keysVolume" (dict "name" "client-cert" "secret" $v.clientCertSecret "keys" (list "tls.crt" "tls.key")) | nindent 8 }}
+        {{- end }}
+      {{- end }}
+{{- include "mailcow.pdb" (dict "root" . "v" $v "component" $c) }}
+---
+{{ include "mailcow.tlsProxyPolicy" (dict "root" . "component" $c "port" 6379) }}
+{{- end }}

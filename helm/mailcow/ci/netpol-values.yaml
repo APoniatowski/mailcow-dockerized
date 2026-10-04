@@ -1,0 +1,21 @@
+# NetworkPolicy without PROXY protocol: plain client mail ports, restricted to load balancer ranges.
+mailcow:
+  hostname: mail.example.org
+  networks: 10.42.0.0/16,fd00:10:42::/56
+  sogoTrustedNets: 10.42.250.0/24
+
+mail:
+  proxyProtocol: false
+  pop3: false
+
+networkPolicy:
+  enabled: true
+  publicMailFrom:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+          - 10.42.0.0/16
+    - ipBlock:
+        cidr: ::/0
+        except:
+          - fd00:10:42::/56

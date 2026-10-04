@@ -37,8 +37,18 @@ if [[ ! -p /tmp/com_pipe ]]; then
   mkfifo /tmp/com_pipe
 fi
 
+if [[ -n "${DBHOST}" ]]; then
+  DB_CONN_ARGS="--protocol=tcp --host=${DBHOST} --port=${DBPORT:-3306}"
+  NAGIOS_MYSQL_ARGS="-H ${DBHOST} -P ${DBPORT:-3306}"
+  NAGIOS_SLAVE_ARGS="${NAGIOS_MYSQL_ARGS}"
+else
+  DB_CONN_ARGS="--socket=/var/run/mysqld/mysqld.sock"
+  NAGIOS_MYSQL_ARGS="-s /var/run/mysqld/mysqld.sock"
+  NAGIOS_SLAVE_ARGS="-S /var/run/mysqld/mysqld.sock"
+fi
+
 # Wait for containers
-while ! mariadb-admin status --skip-ssl --socket=/var/run/mysqld/mysqld.sock -u${DBUSER} -p${DBPASS} --silent; do
+while ! mariadb-admin status --skip-ssl ${DB_CONN_ARGS} -u${DBUSER} -p${DBPASS} --silent; do
   echo "Waiting for SQL..."
   sleep 2
 done
@@ -196,16 +206,16 @@ get_container_ip() {
   LOOP_C=1
   until [[ ${CONTAINER_IP} =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || [[ ${LOOP_C} -gt 5 ]]; do
     if [ ${IP_BY_DOCKER_API} -eq 0 ]; then
-      CONTAINER_IP=$(dig a "${1}" +short)
+      CONTAINER_IP=$(dig a "${1}" +short | grep -m1 -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$')
     else
       sleep 0.5
       # get long container id for exact match
-      CONTAINER_ID=($(curl --silent --insecure https://dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network/containers/json | jq -r ".[] | {name: .Config.Labels[\"com.docker.compose.service\"], project: .Config.Labels[\"com.docker.compose.project\"], id: .Id}" | jq -rc "select( .name | tostring == \"${1}\") | select( .project | tostring | contains(\"${COMPOSE_PROJECT_NAME,,}\")) | .id"))
+      CONTAINER_ID=($(curl --silent --insecure https://${DOCKERAPIHOST:-dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network}/containers/json | jq -r ".[] | {name: .Config.Labels[\"com.docker.compose.service\"], project: .Config.Labels[\"com.docker.compose.project\"], id: .Id}" | jq -rc "select( .name | tostring == \"${1}\") | select( .project | tostring | contains(\"${COMPOSE_PROJECT_NAME,,}\")) | .id"))
       # returned id can have multiple elements (if scaled), shuffle for random test
       CONTAINER_ID=($(printf "%s\n" "${CONTAINER_ID[@]}" | shuf))
       if [[ ! -z ${CONTAINER_ID} ]]; then
         for matched_container in "${CONTAINER_ID[@]}"; do
-          CONTAINER_IPS=($(curl --silent --insecure https://dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network/containers/${matched_container}/json | jq -r '.NetworkSettings.Networks[].IPAddress'))
+          CONTAINER_IPS=($(curl --silent --insecure https://${DOCKERAPIHOST:-dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network}/containers/${matched_container}/json | jq -r '.NetworkSettings.Networks[].IPAddress'))
           for ip_match in "${CONTAINER_IPS[@]}"; do
             # grep will do nothing if one of these vars is empty
             [[ -z ${ip_match} ]] && continue
@@ -239,7 +249,7 @@ external_checks() {
   diff_c=0
   THRESHOLD=${EXTERNAL_CHECKS_THRESHOLD}
   # Reduce error count by 2 after restarting an unhealthy container
-  GUID=$(mariadb --skip-ssl -u${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT version FROM versions WHERE application = 'GUID'" -BN)
+  GUID=$(mariadb --skip-ssl ${DB_CONN_ARGS} -u${DBUSER} -p${DBPASS} ${DBNAME} -e "SELECT version FROM versions WHERE application = 'GUID'" -BN)
   trap "[ ${err_count} -gt 1 ] && err_count=$(( ${err_count} - 2 ))" USR1
   while [ ${err_count} -lt ${THRESHOLD} ]; do
     err_c_cur=${err_count}
@@ -359,8 +369,8 @@ mysql_checks() {
   while [ ${err_count} -lt ${THRESHOLD} ]; do
     touch /tmp/mysql-mailcow; echo "$(tail -50 /tmp/mysql-mailcow)" > /tmp/mysql-mailcow
     err_c_cur=${err_count}
-    /usr/lib/nagios/plugins/check_mysql -f /etc/my.cnf.d/client.cnf -s /var/run/mysqld/mysqld.sock -u ${DBUSER} -p ${DBPASS} -d ${DBNAME} 2>> /tmp/mysql-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
-    /usr/lib/nagios/plugins/check_mysql_query -f /etc/my.cnf.d/client.cnf -s /var/run/mysqld/mysqld.sock -u ${DBUSER} -p ${DBPASS} -d ${DBNAME} -q "SELECT COUNT(*) FROM information_schema.tables" 2>> /tmp/mysql-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
+    /usr/lib/nagios/plugins/check_mysql -f /etc/my.cnf.d/client.cnf ${NAGIOS_MYSQL_ARGS} -u ${DBUSER} -p ${DBPASS} -d ${DBNAME} 2>> /tmp/mysql-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
+    /usr/lib/nagios/plugins/check_mysql_query -f /etc/my.cnf.d/client.cnf ${NAGIOS_MYSQL_ARGS} -u ${DBUSER} -p ${DBPASS} -d ${DBNAME} -q "SELECT COUNT(*) FROM information_schema.tables" 2>> /tmp/mysql-mailcow 1>&2; err_count=$(( ${err_count} + $? ))
     [ ${err_c_cur} -eq ${err_count} ] && [ ! $((${err_count} - 1)) -lt 0 ] && err_count=$((${err_count} - 1)) diff_c=1
     [ ${err_c_cur} -ne ${err_count} ] && diff_c=$(( ${err_c_cur} - ${err_count} ))
     progress "MySQL/MariaDB" ${THRESHOLD} $(( ${THRESHOLD} - ${err_count} )) ${diff_c}
@@ -384,7 +394,7 @@ mysql_repl_checks() {
   while [ ${err_count} -lt ${THRESHOLD} ]; do
     touch /tmp/mysql_repl_checks; echo "$(tail -50 /tmp/mysql_repl_checks)" > /tmp/mysql_repl_checks
     err_c_cur=${err_count}
-    /usr/lib/nagios/plugins/check_mysql_slavestatus.sh -o /etc/my.cnf.d/client.cnf -S /var/run/mysqld/mysqld.sock -u root -p ${DBROOT} 2>> /tmp/mysql_repl_checks 1>&2; err_count=$(( ${err_count} + $? ))
+    /usr/lib/nagios/plugins/check_mysql_slavestatus.sh -o /etc/my.cnf.d/client.cnf ${NAGIOS_SLAVE_ARGS} -u root -p ${DBROOT} 2>> /tmp/mysql_repl_checks 1>&2; err_count=$(( ${err_count} + $? ))
     [ ${err_c_cur} -eq ${err_count} ] && [ ! $((${err_count} - 1)) -lt 0 ] && err_count=$((${err_count} - 1)) diff_c=1
     [ ${err_c_cur} -ne ${err_count} ] && diff_c=$(( ${err_c_cur} - ${err_count} ))
     progress "MySQL/MariaDB replication" ${THRESHOLD} $(( ${THRESHOLD} - ${err_count} )) ${diff_c}
@@ -1078,12 +1088,12 @@ done
 # Monitor dockerapi
 (
 while true; do
-  while nc -z dockerapi 443; do
+  while nc -z ${DOCKERAPIHOST:-dockerapi} 443; do
     sleep 3
   done
   log_msg "Cannot find dockerapi-mailcow, waiting to recover..."
   kill -STOP ${BACKGROUND_TASKS[*]}
-  until nc -z dockerapi 443; do
+  until nc -z ${DOCKERAPIHOST:-dockerapi} 443; do
     sleep 3
   done
   kill -CONT ${BACKGROUND_TASKS[*]}
@@ -1143,20 +1153,24 @@ while true; do
   elif [[ ${com_pipe_answer} =~ .+-mailcow ]]; then
     kill -STOP ${BACKGROUND_TASKS[*]}
     sleep 10
-    CONTAINER_ID=$(curl --silent --insecure https://dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network/containers/json | jq -r ".[] | {name: .Config.Labels[\"com.docker.compose.service\"], project: .Config.Labels[\"com.docker.compose.project\"], id: .Id}" | jq -rc "select( .name | tostring | contains(\"${com_pipe_answer}\")) | select( .project | tostring | contains(\"${COMPOSE_PROJECT_NAME,,}\")) | .id")
+    CONTAINER_ID=$(curl --silent --insecure https://${DOCKERAPIHOST:-dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network}/containers/json | jq -r ".[] | {name: .Config.Labels[\"com.docker.compose.service\"], project: .Config.Labels[\"com.docker.compose.project\"], id: .Id}" | jq -rc "select( .name | tostring | contains(\"${com_pipe_answer}\")) | select( .project | tostring | contains(\"${COMPOSE_PROJECT_NAME,,}\")) | .id" | head -n1)
     if [[ ! -z ${CONTAINER_ID} ]]; then
       if [[ "${com_pipe_answer}" == "php-fpm-mailcow" ]]; then
-        HAS_INITDB=$(curl --silent --insecure -XPOST https://dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network/containers/${CONTAINER_ID}/top | jq '.msg.Processes[] | contains(["php -c /usr/local/etc/php -f /web/inc/init_db.inc.php"])' | grep true)
+        HAS_INITDB=$(curl --silent --insecure -XPOST https://${DOCKERAPIHOST:-dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network}/containers/${CONTAINER_ID}/top | jq '.msg.Processes[] | contains(["php -c /usr/local/etc/php -f /web/inc/init_db.inc.php"])' | grep true)
       fi
-      S_RUNNING=$(($(date +%s) - $(curl --silent --insecure https://dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network/containers/${CONTAINER_ID}/json | jq .State.StartedAt | xargs -n1 date +%s -d)))
-      if [ ${S_RUNNING} -lt 360 ]; then
+      S_STARTED=$(curl --silent --insecure https://${DOCKERAPIHOST:-dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network}/containers/${CONTAINER_ID}/json | jq -r '.State.StartedAt // empty' | xargs -r -n1 date +%s -d)
+      S_RUNNING=
+      [[ ${S_STARTED} =~ ^-?[0-9]+$ ]] && S_RUNNING=$(($(date +%s) - S_STARTED))
+      if [[ -z ${S_RUNNING} ]]; then
+        log_msg "Cannot determine start time of ${CONTAINER_ID}, skipping action..."
+      elif [ ${S_RUNNING} -lt 360 ]; then
         log_msg "Container is running for less than 360 seconds, skipping action..."
       elif [[ ! -z ${HAS_INITDB} ]]; then
         log_msg "Database is being initialized by php-fpm-mailcow, not restarting but delaying checks for a minute..."
         sleep 60
       else
         log_msg "Sending restart command to ${CONTAINER_ID}..."
-        curl --silent --insecure -XPOST https://dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network/containers/${CONTAINER_ID}/restart
+        curl --silent --insecure -XPOST https://${DOCKERAPIHOST:-dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network}/containers/${CONTAINER_ID}/restart
         notify_error "${com_pipe_answer}"
         log_msg "Wait for restarted container to settle and continue watching..."
         sleep 35

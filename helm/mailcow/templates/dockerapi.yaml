@@ -1,0 +1,110 @@
+{{- $c := "dockerapi" }}
+{{- $v := .Values.dockerapi }}
+{{- $name := printf "%s-%s" (include "mailcow.fullname" .) $c }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+---
+# DOCKERAPI_BACKEND=kubernetes: list pods by K8S_POD_SELECTOR, exec via pods/exec (websocket exec
+# needs get), restart = rollout restart of the owning Deployment/StatefulSet (pod -> ReplicaSet ->
+# Deployment owner lookup, then a restartedAt annotation patch; the patch response is used, no get),
+# falling back to deleting the pod without the apps rules; stats from metrics.k8s.io.
+# A Role cannot be limited to labels: dockerapi can exec into and delete every pod of the namespace and
+# trigger a rolling restart of any Deployment/StatefulSet in it, so run mailcow in a namespace of its own.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["patch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  replicas: 1
+  {{- include "mailcow.strategy" "RollingUpdate" | nindent 2 }}
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+      {{- with include "mailcow.podDefaultAnnotations" . }}
+      {{- . | nindent 6 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: true
+      {{- include "mailcow.dnsUnbound" . | nindent 6 }}
+      {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
+      initContainers:
+        # dockerapi exits while redis is unreachable; its name resolves through unbound
+        - name: wait
+          image: {{ include "mailcow.filesImage" . }}
+          imagePullPolicy: {{ .Values.files.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - until getent hosts redis-mailcow >/dev/null && nc -z -w 2 redis-mailcow 6379; do echo "waiting for unbound and redis-mailcow:6379"; sleep 2; done
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+      containers:
+        - name: dockerapi-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          env:
+            {{- include "mailcow.secretEnv" (list . "DBROOT" "DBROOT") | nindent 12 }}
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+            {{- include "mailcow.env.redis" . | nindent 12 }}
+            - name: DOCKERAPI_BACKEND
+              value: kubernetes
+            # must equal php-fpm's value (php-fpm filters containers by project label)
+            - name: COMPOSE_PROJECT_NAME
+              value: {{ .Values.mailcow.composeProjectName | quote }}
+            # namespace: the ServiceAccount's own; Job pods (CronJob runner, backups, TLS bootstrap) are no containers
+            - name: K8S_POD_SELECTOR
+              value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component notin (cron,backup,tls-bootstrap,redis-tls,db-tls)" (include "mailcow.name" .) .Release.Name | quote }}
+          ports:
+            - name: https
+              containerPort: 443
+          {{- include "mailcow.tcpProbes" (dict "port" 443 "startup" 30) | nindent 10 }}
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}

@@ -1,0 +1,193 @@
+{{- $c := "rspamd" }}
+{{- $v := .Values.rspamd }}
+{{- $fullname := include "mailcow.fullname" . }}
+{{- /* controller relay mutual TLS: kept across upgrades (lookup), generated when missing or incomplete */}}
+{{- $tlsName := include "mailcow.rspamdRelayTlsSecret" . }}
+{{- $tls := dict }}
+{{- if not $v.socketRelay.tls.existingSecret }}
+{{- $old := (lookup "v1" "Secret" .Release.Namespace $tlsName).data | default dict }}
+{{- if and (get $old "ca.crt") (get $old "tls.crt") (get $old "tls.key") (get $old "client.crt") (get $old "client.key") }}
+{{- $tls = $old }}
+{{- else }}
+{{- $days := int $v.socketRelay.tls.days }}
+{{- $ca := genCA (printf "%s rspamd relay CA" $fullname) $days }}
+{{- $sans := list "rspamd-mailcow" "rspamd" (include "mailcow.svcFqdn" (list . "rspamd-mailcow")) (include "mailcow.svcFqdn" (list . "rspamd")) (printf "rspamd-mailcow.%s.svc" .Release.Namespace) (printf "rspamd.%s.svc" .Release.Namespace) }}
+{{- $srv := genSignedCert "rspamd-mailcow" nil $sans $days $ca }}
+{{- $cli := genSignedCert "rspamd-relay-client" nil nil $days $ca }}
+{{- $tls = dict "ca.crt" ($ca.Cert | b64enc) "tls.crt" ($srv.Cert | b64enc) "tls.key" ($srv.Key | b64enc) "client.crt" ($cli.Cert | b64enc) "client.key" ($cli.Key | b64enc) }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $tlsName }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+type: Opaque
+data:
+  {{- range $k := list "ca.crt" "tls.crt" "tls.key" "client.crt" "client.key" }}
+  {{ $k }}: {{ get $tls $k }}
+  {{- end }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  {{- with include "mailcow.replicas" (dict "v" $v "key" "rspamd") }}
+  {{- . | nindent 2 }}
+  {{- end }}
+  # /var/lib/rspamd (controller socket, per-pod stats and caches) is a per-pod emptyDir; Bayes, fuzzy hashes,
+  # history, ratelimits, greylisting and reputation live in Redis. README "Scaling"
+  {{- include "mailcow.strategy" "RollingUpdate" | nindent 2 }}
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+        {{- include "mailcow.sharedLabel" . | nindent 8 }}
+      annotations:
+        {{- include "mailcow.podAnnotations" . | nindent 8 }}
+        {{- with $tls }}
+        # socat loads the relay certificates once: restart when the chart generates new ones
+        checksum/rspamd-relay-tls: {{ toJson . | sha256sum | trunc 16 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      # worker-proxy binds "rspamd:9900": the hostname maps to the pod IP in /etc/hosts
+      hostname: rspamd
+      terminationGracePeriodSeconds: {{ $v.terminationGracePeriodSeconds }}
+      {{- include "mailcow.dnsUnbound" . | nindent 6 }}
+      {{- include "mailcow.podCommon" (dict "root" . "shared" true) | nindent 6 }}
+      {{- if and (include "mailcow.multi" $v) (not (include "mailcow.sharedColocate" .)) }}
+      {{- include "mailcow.spread" (dict "root" . "component" $c) | nindent 6 }}
+      {{- end }}
+      initContainers:
+        {{- $slices := list "hooks/rspamd" "conf/rspamd/override.d" "conf/rspamd/local.d" "conf/rspamd/plugins.d" "conf/rspamd/lua" "conf/rspamd/rspamd.conf.local" "conf/rspamd/rspamd.conf.override" }}
+        {{- $shared := list (dict "dir" "rspamd-custom" "src" "conf/rspamd/custom") }}
+        {{- /* UI password (dockerapi rspamd/worker_password writes it in one pod, then restarts the Deployment) */}}
+        {{- $appends := list }}
+        {{- if .Values.skip.clamd }}
+        {{- $appends = append $appends (dict "key" "rspamd-antivirus.conf" "dst" "conf/rspamd/override.d/antivirus.conf") }}
+        {{- end }}
+        {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "touch" (list "rspamd-override/worker-controller-password.inc") "appends" $appends) | nindent 8 }}
+        # controller unix socket -> TCP 11335 with mutual TLS, for the rspamd-sock sidecars of php-fpm,
+        # dovecot, postfix (and watchdog): clients need a certificate signed by the relay CA. Probe without
+        # connecting: every connection reaches the controller, which logs an EOF error for a bare connect.
+        # Dual-stack listener (IPv4-mapped) when the pod has IPv6, IPv4 only when IPv6 is disabled
+        # (if_inet6 empty) or absent (ipv6.disable=1). -d0: errors only.
+        - name: rspamd-sock-relay
+          image: {{ include "mailcow.filesImage" . }}
+          imagePullPolicy: {{ .Values.files.image.pullPolicy }}
+          restartPolicy: Always
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              tls=cert=/etc/rspamd-relay-tls/tls.crt,key=/etc/rspamd-relay-tls/tls.key,cafile=/etc/rspamd-relay-tls/ca.crt,verify=1
+              if grep -qs . /proc/net/if_inet6; then
+                exec socat -d0 "OPENSSL-LISTEN:11335,pf=ip6,ipv6only=0,fork,reuseaddr,${tls}" UNIX-CONNECT:/var/lib/rspamd/rspamd.sock
+              else
+                exec socat -d0 "OPENSSL-LISTEN:11335,pf=ip4,fork,reuseaddr,${tls}" UNIX-CONNECT:/var/lib/rspamd/rspamd.sock
+              fi
+          {{- include "mailcow.relaySecurityContext" . | nindent 10 }}
+          ports:
+            - name: ctrl-relay
+              containerPort: 11335
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "netstat -ltn | grep -q ':11335 '"]
+            periodSeconds: 2
+            failureThreshold: 30
+          volumeMounts:
+            - name: rspamd-data
+              mountPath: /var/lib/rspamd
+              readOnly: true
+            - name: rspamd-relay-tls
+              mountPath: /etc/rspamd-relay-tls
+              readOnly: true
+          resources:
+            {{- toYaml $v.socketRelay.resources | nindent 12 }}
+      containers:
+        - name: rspamd-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          env:
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+            - name: IPV4_NETWORK
+              value: {{ .Values.mailcow.ipv4Network | quote }}
+            - name: IPV6_NETWORK
+              value: {{ .Values.mailcow.ipv6Network | quote }}
+            {{- include "mailcow.env.redis" . | nindent 12 }}
+            - name: SPAMHAUS_DQS_KEY
+              value: {{ .Values.mailcow.spamhausDqsKey | quote }}
+            # read by the entrypoint (external_services.conf), not passed by compose: without it rspamd keeps
+            # scanning Office parts through the endpoint-less olefy Service (timeout 20 s, 1 retransmit)
+            - name: SKIP_OLEFY
+              value: {{ include "mailcow.yn" .Values.skip.olefy | quote }}
+            - name: MAILCOW_NETWORKS
+              value: {{ include "mailcow.networks" . | quote }}
+            # unset, the entrypoint resolves `dovecot`/`rspamd` with dig in a loop (no search domains)
+            - name: DOVECOT_TRUSTED_NETS
+              value: {{ include "mailcow.dovecotTrustedNets" . | quote }}
+            - name: RSPAMD_TRUSTED_NETS
+              value: {{ include "mailcow.rspamdTrustedNets" . | quote }}
+            # BCC delivery: rspamd's resolver ignores search domains, so the FQDN
+            - name: POSTFIXHOST
+              value: {{ include "mailcow.svcFqdn" (list . "postfix") | quote }}
+          ports:
+            - name: normal
+              containerPort: 11333
+            - name: controller
+              containerPort: 11334
+            - name: proxy
+              containerPort: 9900
+            - name: fuzzy
+              containerPort: 11445
+          # controller /ping answers "pong" without auth (a bare TCP connect logs an EOF error per probe)
+          {{- include "mailcow.probes" (dict "handler" (dict "httpGet" (dict "path" "/ping" "port" 11334)) "startup" 90 "timeout" 5) | nindent 10 }}
+          volumeMounts:
+            {{- include "mailcow.hooksMount" "rspamd" | nindent 12 }}
+            - name: shared
+              subPath: rspamd-custom
+              mountPath: /etc/rspamd/custom
+            - name: seed
+              subPath: conf/rspamd/override.d
+              mountPath: /etc/rspamd/override.d
+            # rspamd UI password, the same file for every replica (dockerapi rspamd/worker_password writes it in
+            # one pod, then rolls the whole Deployment)
+            - name: shared
+              subPath: rspamd-override/worker-controller-password.inc
+              mountPath: /etc/rspamd/override.d/worker-controller-password.inc
+            - name: seed
+              subPath: conf/rspamd/local.d
+              mountPath: /etc/rspamd/local.d
+            - name: seed
+              subPath: conf/rspamd/plugins.d
+              mountPath: /etc/rspamd/plugins.d
+            - name: seed
+              subPath: conf/rspamd/lua
+              mountPath: /etc/rspamd/lua/
+              readOnly: true
+            - name: seed
+              subPath: conf/rspamd/rspamd.conf.local
+              mountPath: /etc/rspamd/rspamd.conf.local
+            - name: seed
+              subPath: conf/rspamd/rspamd.conf.override
+              mountPath: /etc/rspamd/rspamd.conf.override
+            # rspamd-vol-1: per pod (controller socket for rspamd-sock-relay, stats, caches)
+            - name: rspamd-data
+              mountPath: /var/lib/rspamd
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      volumes:
+        {{- include "mailcow.seedVolumes" (dict "root" . "shared" true) | nindent 8 }}
+        - name: rspamd-data
+          emptyDir:
+            sizeLimit: 1Gi
+        {{- include "mailcow.rspamdRelayTlsVolume" (dict "root" . "side" "server") | nindent 8 }}
+{{- include "mailcow.pdb" (dict "root" . "v" $v "component" $c) }}
+{{- include "mailcow.hpa" (dict "root" . "v" $v "component" $c) }}

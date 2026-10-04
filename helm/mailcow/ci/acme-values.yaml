@@ -1,0 +1,50 @@
+# mailcow ACME client instead of cert-manager, plus extraFiles, skipped components, no postfix rate limits
+# and NetworkPolicy off. watchdog on: with acme it mounts the shared ssl dir (RWO here) next to postfix.
+# PROXY protocol with networkPolicy off: the postfix/dovecot policies are still rendered and admit the PROXY
+# ports from proxyTrustedNetworks only (node addresses: LB -> node ports, externalTrafficPolicy Cluster).
+mailcow:
+  hostname: mail.example.org
+
+acme:
+  enabled: true
+  accountEmail: postmaster@example.org
+
+skip:
+  sogo: true
+  olefy: true
+  fts: false
+
+extraFiles:
+  conf/postfix/extra.cf: |
+    smtpd_banner = $myhostname ESMTP
+  conf/dovecot/extra.conf: |
+    mail_max_userip_connections = 50
+  conf/sogo/sogo.conf: |
+    // replaced sogo.conf (unused while skip.sogo)
+  conf/rspamd/custom/ip_wl.map: |
+    192.0.2.1
+  hooks/postfix/10-hello.sh: |
+    #!/bin/sh
+    echo hello from hook
+
+mail:
+  proxyProtocol: true
+  proxyTrustedNetworks: [192.168.10.0/24, "2001:db8:10::/64"]
+
+http:
+  service:
+    type: LoadBalancer
+    loadBalancerSourceRanges: [203.0.113.0/24]
+
+persistence:
+  shared:
+    accessMode: ReadWriteOnce
+
+watchdog:
+  enabled: true
+
+bruteForce:
+  enabled: false
+
+networkPolicy:
+  enabled: false

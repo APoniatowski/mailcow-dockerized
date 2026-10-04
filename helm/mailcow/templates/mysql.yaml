@@ -1,0 +1,65 @@
+{{- if not .Values.externalDatabase.enabled }}
+{{- $c := "mysql" }}
+{{- $v := .Values.mysql }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "mailcow.fullname" . }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  replicas: 1
+  serviceName: mysql-mailcow
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+      annotations:
+        {{- include "mailcow.podAnnotations" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ $v.terminationGracePeriodSeconds }}
+      {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
+      initContainers:
+        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "conf/mysql")) | nindent 8 }}
+      containers:
+        - name: mysql-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          env:
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+            {{- include "mailcow.secretEnv" (list . "MYSQL_ROOT_PASSWORD" "DBROOT") | nindent 12 }}
+            - name: MYSQL_DATABASE
+              value: {{ .Values.mailcow.dbName | quote }}
+            - name: MYSQL_USER
+              value: {{ .Values.mailcow.dbUser | quote }}
+            {{- include "mailcow.secretEnv" (list . "MYSQL_PASSWORD" "DBPASS") | nindent 12 }}
+            - name: MYSQL_INITDB_SKIP_TZINFO
+              value: "1"
+          ports:
+            - name: mysql
+              containerPort: 3306
+          {{- include "mailcow.tcpProbes" (dict "port" 3306 "startup" 60) | nindent 10 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql/
+            # compose mysql-socket-vol-1: clients use TCP (DBHOST=mysql), the socket stays pod-local
+            - name: socket
+              mountPath: /var/run/mysqld/
+            - name: seed
+              subPath: conf/mysql
+              mountPath: /etc/mysql/conf.d/
+              readOnly: true
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      volumes:
+        {{- include "mailcow.seedVolumes" (dict "root" .) | nindent 8 }}
+        - name: socket
+          emptyDir: {}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "mailcow.claimName" (list . "mysql" "mysql") }}
+{{- end }}

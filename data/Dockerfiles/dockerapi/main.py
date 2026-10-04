@@ -34,13 +34,22 @@ async def lifespan(app: FastAPI):
 
   # Init redis client
   if os.environ['REDIS_SLAVEOF_IP'] != "":
-    redis_client = redis = await aioredis.from_url(f"redis://{os.environ['REDIS_SLAVEOF_IP']}:{os.environ['REDIS_SLAVEOF_PORT']}/0", password=os.environ['REDISPASS'])
+    redis_client = redis = await aioredis.from_url(f"redis://{os.environ['REDIS_SLAVEOF_IP']}:{os.environ['REDIS_SLAVEOF_PORT']}/0", password=os.environ['REDISPASS'], health_check_interval=30)
   else:
-    redis_client = redis = await aioredis.from_url("redis://redis-mailcow:6379/0", password=os.environ['REDISPASS'])
+    redis_client = redis = await aioredis.from_url("redis://redis-mailcow:6379/0", password=os.environ['REDISPASS'], health_check_interval=30)
 
   # Init docker clients
-  sync_docker_client = docker.DockerClient(base_url='unix://var/run/docker.sock', version='auto')
-  async_docker_client = aiodocker.Docker(url='unix:///var/run/docker.sock')
+  if os.environ.get('DOCKERAPI_BACKEND', '') == 'kubernetes':
+    from modules.KubernetesClient import KubernetesClient, AsyncKubernetesClient
+    logger.info("Using kubernetes backend")
+    sync_docker_client = KubernetesClient(logger)
+    async_docker_client = AsyncKubernetesClient(sync_docker_client)
+  elif os.environ.get('DOCKERAPI_BACKEND', '') != '':
+    logger.error("Unknown DOCKERAPI_BACKEND '%s', use 'kubernetes' or leave it unset for docker" % os.environ['DOCKERAPI_BACKEND'])
+    sys.exit(1)
+  else:
+    sync_docker_client = docker.DockerClient(base_url='unix://var/run/docker.sock', version='auto')
+    async_docker_client = aiodocker.Docker(url='unix:///var/run/docker.sock')
 
   dockerapi = DockerApi(redis_client, sync_docker_client, async_docker_client, logger)
 
@@ -196,9 +205,17 @@ async def post_container_update_stats(container_id : str):
 # PubSub Handler
 async def handle_pubsub_messages(channel: aioredis.client.PubSub):
   global dockerapi
+  retry_delay = 1
 
   while True:
     try:
+      if channel is None:
+        channel = dockerapi.redis_client.pubsub()
+        await channel.subscribe("MC_CHANNEL")
+        dockerapi.pubsub = channel
+        dockerapi.logger.info("PubSub resubscribed to MC_CHANNEL")
+        retry_delay = 1
+
       async with async_timeout.timeout(60):
         message = await channel.get_message(ignore_subscribe_messages=True, timeout=30)
         if message is not None:
@@ -248,6 +265,19 @@ async def handle_pubsub_messages(channel: aioredis.client.PubSub):
         await asyncio.sleep(0.0)
     except asyncio.TimeoutError:
       pass
+    except (aioredis.RedisError, OSError) as e:
+      dockerapi.logger.warning("PubSub redis error: %s - resubscribing in %ss" % (str(e), retry_delay))
+      if channel is not None:
+        try:
+          await channel.aclose()
+        except Exception:
+          pass
+        channel = None
+      await asyncio.sleep(retry_delay)
+      retry_delay = min(retry_delay * 2, 10)
+    except Exception as e:
+      dockerapi.logger.error("PubSub handler error: %s" % str(e))
+      await asyncio.sleep(1)
 
 if __name__ == '__main__':
   uvicorn.run(

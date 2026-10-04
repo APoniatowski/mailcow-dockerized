@@ -86,6 +86,15 @@ function normalize_cors_origin($origin) {
   }
   return valid_origin($origin) ? strtolower($origin) : false;
 }
+// Space- or comma-separated list from an env var (e.g. MAILCOW_NETWORKS)
+function env_list($name) {
+  return preg_split('/[\s,]+/', (string)getenv($name), -1, PREG_SPLIT_NO_EMPTY);
+}
+// Valid networks/IPs from env_list(), IPv6 brackets stripped, invalid entries dropped
+function env_networks($name) {
+  $networks = preg_replace('/^\[([^\]]+)\]/', '$1', env_list($name));
+  return array_values(array_filter($networks, 'valid_network'));
+}
 // Thanks to https://stackoverflow.com/a/49373789
 // Validates exact ip matches and ip-in-cidr, ipv4 and ipv6
 function ip_acl($ip, $networks) {

@@ -585,9 +585,13 @@ rspamd_config:register_symbol({
       -- send mail
       local from_smtp = task:get_from('smtp')
       local from_addr = (from_smtp and from_smtp[1] and from_smtp[1].addr) or 'mailer-daemon@localhost'
+      local smtp_host = os.getenv("POSTFIXHOST")
+      if not smtp_host or smtp_host == '' then
+        smtp_host = os.getenv("IPV4_NETWORK") .. '.253'
+      end
       lua_smtp.sendmail({
         task = task,
-        host = os.getenv("IPV4_NETWORK") .. '.253',
+        host = smtp_host,
         port = 591,
         from = from_addr,
         recipients = bcc_dest,

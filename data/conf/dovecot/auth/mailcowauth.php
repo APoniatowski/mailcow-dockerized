@@ -42,7 +42,8 @@ catch (Exception $e) {
 }
 
 // Init database
-$dsn = $database_type . ":unix_socket=" . $database_sock . ";dbname=" . $database_name;
+$dsn = $database_tcp_host ? $database_type . ":host=" . $database_tcp_host . ";port=" . $database_tcp_port . ";dbname=" . $database_name
+                      : $database_type . ":unix_socket=" . $database_sock . ";dbname=" . $database_name;
 $opt = [
     PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
     PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
@@ -67,7 +68,9 @@ require_once 'functions.ratelimit.inc.php';
 require_once 'functions.acl.inc.php';
 
 
-$isSOGoRequest = $post['real_rip'] == getenv('IPV4_NETWORK') . '.248';
+$sogo_trusted_nets = env_networks('SOGO_TRUSTED_NETS');
+$isSOGoRequest = $sogo_trusted_nets ? ip_acl($post['real_rip'], $sogo_trusted_nets)
+                                    : $post['real_rip'] == getenv('IPV4_NETWORK') . '.248';
 $result = false;
 if ($isSOGoRequest) {
   // This is a SOGo Auth request. First check for SSO password.

@@ -1,0 +1,48 @@
+# Multi-node cluster: RWX shared volume, cloud LoadBalancer with PROXY protocol, rspamd HPA (spread over
+# nodes), opt-in extras.
+mailcow:
+  hostname: mail.example.org
+  networks: 100.64.0.0/16
+  nginxUseProxyProtocol: "n"
+
+persistence:
+  shared:
+    accessMode: ReadWriteMany
+    storageClass: efs-sc
+
+mail:
+  proxyProtocol: true
+  # NLB in ip-target mode connects from its private addresses in the VPC subnets: only those may send
+  # PROXY headers (dovecot haproxy_trusted_networks + the postfix/dovecot PROXY-port NetworkPolicy)
+  proxyTrustedNetworks: [10.0.0.0/16]
+  service:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: external
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+      service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: "*"
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    # ip targets: the NLB reaches pod IPs directly, no node ports needed
+    allocateLoadBalancerNodePorts: false
+
+http:
+  service:
+    enabled: true
+    type: LoadBalancer
+    externalTrafficPolicy: Local
+
+tls:
+  certManager:
+    enabled: true
+
+watchdog:
+  enabled: true
+
+networkPolicy:
+  enabled: true
+
+rspamd:
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4

@@ -1,0 +1,166 @@
+{{- $c := "postfix" }}
+{{- $v := .Values.postfix }}
+{{- $m := .Values.mailcow }}
+{{- /* the shared PVC only carries /etc/ssl/mail with acme */}}
+{{- $acme := .Values.acme.enabled }}
+{{- $reload := include "mailcow.tlsReload" . }}
+{{- $perPod := $v.spoolPerPod }}
+{{- if lt (int $v.replicas) 0 }}{{ fail "postfix.replicas must be >= 0" }}{{ end }}
+{{- if and (gt (int $v.replicas) 1) (not $perPod) }}
+{{- fail "postfix.replicas > 1 needs postfix.spoolPerPod: true (one queue PVC per pod). On an existing release this replaces the StatefulSet and its single queue PVC: drain the queue first, README \"Scaling\"." }}
+{{- end }}
+{{- if and $perPod .Values.persistence.postfix.existingClaim }}
+{{- fail "postfix.spoolPerPod creates one PVC per pod (volumeClaimTemplates) and cannot use persistence.postfix.existingClaim" }}
+{{- end }}
+{{- /* <fullname>-postfix, or <fullname>-postfix-spool with spoolPerPod (mailcow.postfixName) */}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "mailcow.postfixName" . }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  replicas: {{ int $v.replicas }}
+  serviceName: postfix-mailcow
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+        {{- if $acme }}
+        {{- include "mailcow.sharedLabel" . | nindent 8 }}
+        {{- end }}
+        mailcow.email/mail-ingress: "true"
+      annotations:
+        {{- include "mailcow.podAnnotations" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- if $reload }}
+      # tls-reload signals postfix's master process
+      shareProcessNamespace: true
+      {{- end }}
+      {{- include "mailcow.dnsUnbound" . | nindent 6 }}
+      {{- include "mailcow.podCommon" (dict "root" . "shared" $acme) | nindent 6 }}
+      {{- if and (gt (int $v.replicas) 1) (not (and $acme (include "mailcow.sharedColocate" .))) }}
+      {{- include "mailcow.spread" (dict "root" . "component" $c) | nindent 6 }}
+      {{- end }}
+      initContainers:
+        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/postfix" "conf/postfix") "appends" (list (dict "key" "postfix-k8s.cf" "dst" "conf/postfix/extra.cf")) "ssl" true) | nindent 8 }}
+        # postfix's trivial-rewrite keeps answering "table lookup problem" when its first lookups hit a
+        # database whose tables php-fpm (init_db) has not created yet, until it is restarted: on a fresh
+        # install wait for init_db to record the schema version (compose has the same race, usually won
+        # by php-fpm)
+        - name: wait-schema
+          image: {{ include "mailcow.image" .Values.mysql.image }}
+          imagePullPolicy: {{ .Values.mysql.image.pullPolicy | default "IfNotPresent" }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until mariadb --skip-ssl -h "$DBHOST" -P "$DBPORT" -u "$DBUSER" -N "$DBNAME" \
+                  -e "SELECT version FROM versions WHERE application = 'db_schema'" 2>/dev/null | grep -q .; do
+                echo "waiting for the mailcow schema (php-fpm init_db)"; sleep 5
+              done
+          env:
+            {{- include "mailcow.env.db" . | nindent 12 }}
+            - name: MYSQL_PWD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mailcow.secretName" . }}
+                  key: DBPASS
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 5m, memory: 16Mi}
+            limits: {memory: 64Mi}
+        {{- include "mailcow.rspamdSockSidecar" . | nindent 8 }}
+        {{- if $reload }}
+        {{- /* `postfix start` runs /usr/lib/postfix/sbin/master -w (comm "master"); HUP = postfix reload */}}
+        {{- include "mailcow.tlsReloadSidecar" (dict "root" . "comm" "master" "cmdline" "/usr/lib/postfix/sbin/master*") | nindent 8 }}
+        {{- end }}
+      containers:
+        - name: postfix-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          securityContext:
+            capabilities:
+              add: ["NET_BIND_SERVICE"]
+          env:
+            - name: LOG_LINES
+              value: {{ $m.logLines | quote }}
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+            {{- include "mailcow.env.db" . | nindent 12 }}
+            {{- include "mailcow.env.redis" . | nindent 12 }}
+            - name: MAILCOW_HOSTNAME
+              value: {{ $m.hostname | quote }}
+            - name: SPAMHAUS_DQS_KEY
+              value: {{ $m.spamhausDqsKey | quote }}
+            - name: MAILCOW_NETWORKS
+              value: {{ include "mailcow.networks" . | quote }}
+          ports:
+            - {name: smtp, containerPort: 25}
+            - {name: smtps, containerPort: 465}
+            - {name: submission, containerPort: 587}
+            - {name: smtp-588, containerPort: 588}
+            - {name: smtp-589, containerPort: 589}
+            - {name: smtp-590, containerPort: 590}
+            - {name: smtp-591, containerPort: 591}
+            - {name: smtp-pp, containerPort: 10025}
+            - {name: smtps-pp, containerPort: 10465}
+            - {name: subm-pp, containerPort: 10587}
+          {{- include "mailcow.tcpProbes" (dict "port" 589 "startup" 90) | nindent 10 }}
+          volumeMounts:
+            {{- include "mailcow.hooksMount" "postfix" | nindent 12 }}
+            - name: seed
+              subPath: conf/postfix
+              mountPath: /opt/postfix/conf
+            {{- include "mailcow.tlsMounts" . | nindent 12 }}
+            - name: spool
+              mountPath: /var/spool/postfix
+            # compose also mounts crypt-vol-1 at /var/lib/zeyple: legacy (zeyple unused), not mounted here
+            # rspamd.sock from the rspamd-sock sidecar (rspamd-pipe-ham/spam)
+            - name: rspamd-sock
+              mountPath: /var/lib/rspamd
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      volumes:
+        {{- include "mailcow.seedVolumes" (dict "root" . "shared" $acme) | nindent 8 }}
+        {{- include "mailcow.tlsVolumes" . | nindent 8 }}
+        {{- include "mailcow.rspamdSockVolume" . | nindent 8 }}
+        {{- if not $perPod }}
+        - name: spool
+          persistentVolumeClaim:
+            claimName: {{ include "mailcow.claimName" (list . "postfix" "postfix") }}
+        {{- end }}
+  {{- if $perPod }}
+  {{- $p := .Values.persistence.postfix }}
+  # one queue per pod: spool-<fullname>-postfix-spool-<n> (kept when scaling down or uninstalling)
+  volumeClaimTemplates:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: spool
+        # immutable (StatefulSet volumeClaimTemplates): no chart/version labels
+        labels:
+          app.kubernetes.io/name: {{ include "mailcow.name" . }}
+          app.kubernetes.io/instance: {{ .Release.Name }}
+          app.kubernetes.io/part-of: mailcow
+          mailcow.email/volume: postfix-spool
+      spec:
+        accessModes:
+          - {{ $p.accessMode }}
+        {{- $sc := default .Values.persistence.storageClass $p.storageClass }}
+        {{- if $sc }}
+        storageClassName: {{ if eq $sc "-" }}""{{ else }}{{ $sc }}{{ end }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $p.size }}
+  {{- end }}
+{{- include "mailcow.pdb" (dict "root" . "v" (dict "replicas" $v.replicas) "component" $c) }}

@@ -1,0 +1,16 @@
+# ofelia jobs as one CronJob per job (cronjobs.mode cronjob) instead of the scheduler Deployment, with
+# per-job overrides, SOGo skipped (its jobs and Role rule disappear) and pod annotations on the Job pods.
+skip:
+  sogo: true
+
+cronjobs:
+  mode: cronjob
+  jobs:
+    phpfpm-keycloak-sync: {enabled: false}
+    phpfpm-ldap-sync: {enabled: false}
+    dovecot-imapsync-runner: {schedule: "*/5 * * * *"}
+    dovecot-sarules: {schedule: "@daily"}
+
+podDefaults:
+  annotations:
+    example.org/team: mail

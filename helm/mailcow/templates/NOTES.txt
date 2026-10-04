@@ -1,0 +1,126 @@
+mailcow {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Hostname: {{ .Values.mailcow.hostname }}
+Default UI login: admin / moohoo  -- change it right away.
+
+Secrets: {{ include "mailcow.secretName" . }}
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "mailcow.secretName" . }} -o jsonpath='{.data.API_KEY}' | base64 -d
+
+Files image: {{ include "mailcow.filesImage" . }}
+{{- if eq .Values.files.image.repository "ghcr.io/mailcow/mailcow-files" }}
+  WARNING: this default is a placeholder, no such image is published. Build and push the files image from
+  your checkout (helm/mailcow/files-image/Dockerfile, README "Install") and set files.image.repository/tag,
+  or every pod stays in Init:ImagePullBackOff.
+{{- end }}
+
+TLS (/etc/ssl/mail):
+{{- if .Values.acme.enabled }}
+  mailcow ACME client on the shared PVC (snake-oil until the first certificate is issued).
+{{- else if .Values.tls.certManager.enabled }}
+  cert-manager Certificate {{ include "mailcow.fullname" . }} -> Secret {{ include "mailcow.tlsSecretName" . }}.
+{{- else if .Values.tls.existingSecret }}
+  Secret {{ .Values.tls.existingSecret }}.
+{{- else }}
+  self-signed snake-oil Secret {{ include "mailcow.tlsSecretName" . }} (bootstrap Job). Use cert-manager for production.
+{{- end }}
+
+Mail:  kubectl -n {{ .Release.Namespace }} get svc {{ include "mailcow.fullname" . }}-mail
+       ({{ .Values.mail.service.type }}, PROXY protocol {{ ternary "ON: your load balancer must send PROXY headers" "off" .Values.mail.proxyProtocol }})
+{{- if .Values.mail.proxyProtocol }}
+       PROXY headers accepted only from: {{ include "mailcow.proxyTrustedNetworks" . | fromJsonArray | join ", " }}
+{{- end }}
+{{- if .Values.http.service.enabled }}
+Web:   kubectl -n {{ .Release.Namespace }} get svc {{ include "mailcow.fullname" . }}-http
+{{- end }}
+{{- if .Values.http.ingress.enabled }}
+Web:   Ingress {{ include "mailcow.fullname" . }}
+{{- end }}
+
+Checks:
+  - unbound Service clusterIP {{ .Values.unbound.clusterIP }} must lie in the cluster service CIDR.
+  - mailcow.networks ({{ .Values.mailcow.networks }}) must be the pod CIDR and nothing wider.
+{{- if eq .Values.persistence.shared.accessMode "ReadWriteOnce" }}
+  - shared PVC is ReadWriteOnce: php-fpm, dovecot and rspamd{{ if .Values.acme.enabled }} (+ acme, nginx, postfix, watchdog){{ end }} are pinned to one node.
+{{- end }}
+{{- if .Values.postfix.spoolPerPod }}
+  - postfix: StatefulSet {{ include "mailcow.postfixName" . }}, {{ int .Values.postfix.replicas }} pod(s), one queue PVC each (spool-{{ include "mailcow.postfixName" . }}-<n>,
+    kept on scale-down). The admin UI queue view and flush act on one pod only{{ if .Values.watchdog.enabled }}, watchdog's queue check counts nothing{{ end }}.
+    A pre-existing single queue PVC {{ include "mailcow.fullname" . }}-postfix is no longer used: delete it once its queue is drained. README "Scaling".
+{{- end }}
+  - rspamd's controller socket reaches php-fpm, dovecot, postfix{{ if .Values.watchdog.enabled }}, watchdog{{ end }} over TCP 11335 with mutual TLS (socat
+    relays, native sidecars: Kubernetes >= 1.29; Secret {{ include "mailcow.rspamdRelayTlsSecret" . }}). Its NetworkPolicy is always on.
+{{- with .Values.externalDatabase }}{{ if .enabled }}
+  - External database {{ .host }}:{{ .port }} (Services mysql, mysql-mailcow{{ if .tls.enabled }} -> ProxySQL {{ include "mailcow.fullname" $ }}-db-tls, TLS{{ if .tls.verify }} with the
+    chain verified against Secret {{ .tls.caSecret }} (not the server name){{ else }} WITHOUT certificate verification{{ end }}{{ end }}): database {{ $.Values.mailcow.dbName }}, user
+    {{ $.Values.mailcow.dbUser }} (DBPASS from the Secret) must exist with ALL PRIVILEGES on {{ $.Values.mailcow.dbName }}.*, event_scheduler=ON,
+    time zone tables loaded. php-fpm skips mysql_upgrade (SKIP_MYSQL_UPGRADE=y); backups and upgrades are yours.
+{{- end }}{{ end }}
+{{- with .Values.externalRedis }}{{ if .enabled }}
+  - External Redis {{ .host }}:{{ .port }} (Services redis, redis-mailcow): its password must equal REDISPASS from the
+    Secret; {{ if .tls.enabled }}TLS through the relay {{ include "mailcow.fullname" $ }}-redis-tls{{ if .tls.insecureSkipVerify }} WITHOUT certificate verification{{ end }} (its log shows a TLS check at start){{ else }}plain TCP{{ end }}. rspamd sends SLAVEOF NO ONE on start: point it at a primary.
+{{- end }}{{ end }}
+{{- if .Values.networkPolicy.egress.enabled }}
+  - Egress NetworkPolicies: release pods, kube-dns, the API server ({{ join ", " .Values.networkPolicy.egress.apiServerCIDRs }}) and
+    everything outside {{ include "mailcow.egressClusterCIDRs" . | fromJsonArray | join "," }}. Other in-cluster targets need networkPolicy.egress.extraTo.
+{{- end }}
+{{- with .Values.backup }}{{ if .enabled }}
+  - Backups: CronJobs {{ include "mailcow.fullname" $ }}-backup-* at "{{ .schedule }}" ({{ $.Values.mailcow.tz }}) into PVC {{ .persistence.existingClaim | default (printf "%s-backup" (include "mailcow.fullname" $)) }}
+    (mailcow-<UTC time>/backup_*.tar.zst, backup_mysql.sql.zst; {{ if .retentionDays }}retention {{ .retentionDays }} days{{ else }}no age limit{{ end }}{{ if .keep }}, keep {{ .keep }}{{ end }}).
+    {{- if eq (toString .persistence.accessMode) "ReadWriteOnce" }}
+    {{- /* owners not already pinned to dovecot's node by an RWO shared PVC */}}
+    {{- $colo := include "mailcow.sharedColocate" $ }}
+    {{- $loose := list }}
+    {{- if and .components.postfix (not $.Values.postfix.spoolPerPod) (not (and $colo $.Values.acme.enabled)) }}{{ $loose = append $loose "postfix" }}{{ end }}
+    {{- if and .components.sogo (not $.Values.skip.sogo) }}{{ $loose = append $loose "sogo" }}{{ end }}
+    The backup PVC is ReadWriteOnce: every backup Job requires the dovecot pod's node.
+    {{- with $loose }}
+    {{ join ", " . }} must run there too, or their backup Jobs stay Pending (multi-node: backup.persistence.accessMode ReadWriteMany).
+    {{- end }}
+    {{- end }}
+    {{- if and .components.postfix $.Values.postfix.spoolPerPod }}
+    The postfix queue is not backed up (postfix.spoolPerPod: one queue per pod).
+    {{- end }}
+    {{- if not .components.crypt }}
+    WARNING: backup.components.crypt is off. Without the mail_crypt keys (crypt PVC) restored mail is unreadable.
+    {{- end }}
+    The release Secret {{ include "mailcow.secretName" $ }} is not part of the backups: export and keep it separately.
+    Restore: helm/mailcow/scripts/restore.sh (README "Backup and restore"). Test your restores.
+{{- end }}{{ end }}
+  - dockerapi can exec into and delete every pod and rolling-restart every Deployment/StatefulSet in
+    namespace {{ .Release.Namespace }}: keep mailcow alone in it.
+  - NetworkPolicies only protect anything if your CNI enforces them. Without enforcement dockerapi
+    (unauthenticated exec/restart API) is reachable from every pod in the cluster.
+{{- if not (include "mailcow.networkPolicy" .) }}
+  - networkPolicy is off (only dockerapi, the rspamd relay{{ if .Values.mail.proxyProtocol }} and the PROXY ports{{ end }} are restricted): any pod in
+    the cluster can reach postfix and dovecot from the pod CIDR, which mailcow trusts (relay without auth).
+    See README "Security".
+{{- end }}
+
+{{- $etp := .Values.mail.service.externalTrafficPolicy | default "Local" }}
+{{- if and (not .Values.mail.proxyProtocol) (eq $etp "Cluster") (ne .Values.mail.service.type "ClusterIP") }}
+
+WARNING: mail.proxyProtocol is false and the mail Service uses externalTrafficPolicy Cluster.
+  Client connections may be SNAT'd to node or pod-CIDR addresses; if those fall into mailcow.networks,
+  postfix relays for everyone (open relay). Use externalTrafficPolicy Local or PROXY protocol.
+{{- end }}
+{{- if and .Values.mail.proxyProtocol (or (eq .Values.mail.service.type "NodePort") (and (eq .Values.mail.service.type "LoadBalancer") (ne (toString .Values.mail.service.allocateLoadBalancerNodePorts) "false"))) }}
+
+WARNING: PROXY protocol on a {{ .Values.mail.service.type }} Service with node ports. postfix believes the client address in
+  any PROXY header it receives, so whoever reaches a node port from inside mail.proxyTrustedNetworks can
+  relay as an internal client.
+  {{- if eq ($.Values.mail.service.externalTrafficPolicy | default "Local") "Cluster" }}
+  With externalTrafficPolicy Cluster kube-proxy SNATs node-port traffic to the node's address or, with
+  many CNIs, to its bridge/tunnel address inside the pod CIDR: if proxyTrustedNetworks holds those
+  addresses, ANY client that reaches a node port directly is trusted.
+  {{- end }}
+  Firewall the node ports (cloud security group / host firewall) so only the load balancer reaches them,
+  prefer externalTrafficPolicy Local with the LB's own addresses in proxyTrustedNetworks, or an LB that
+  targets pod IPs (mail.service.allocateLoadBalancerNodePorts: false). README "Security".
+{{- end }}
+{{- if not .Values.mailcow.sogoTrustedNets }}
+
+WARNING: mailcow.sogoTrustedNets is empty, so SOGO_TRUSTED_NETS = mailcow.networks ({{ .Values.mailcow.networks }}).
+  Every address in it may log in to dovecot with SOGo's plaintext/SSO privileges, bypassing protocol
+  ACLs. Narrow it to the sogo pod's range if your CNI can pin one. See README "Security".
+{{- end }}
+

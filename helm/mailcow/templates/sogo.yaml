@@ -1,0 +1,118 @@
+{{- if not .Values.skip.sogo }}
+{{- $c := "sogo" }}
+{{- $v := .Values.sogo }}
+{{- $m := .Values.mailcow }}
+{{- $res := "/usr/local/lib/GNUstep/SOGo/WebServerResources" }}
+{{- $backupRwo := eq .Values.persistence.sogoBackup.accessMode "ReadWriteOnce" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mailcow.fullname" . }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  {{- with include "mailcow.replicas" (dict "v" $v "key" "sogo") }}
+  {{- . | nindent 2 }}
+  {{- end }}
+  # bootstrap-sogo.sh kills sogod while `nc -z sogo-mailcow 20000` succeeds. `sogo-mailcow` is the pod's
+  # own hostname (/etc/hosts -> own pod IP, not the Service), so old pods do not block a new one.
+  {{- include "mailcow.strategy" "RollingUpdate" | nindent 2 }}
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+      annotations:
+        {{- include "mailcow.podAnnotations" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      # bootstrap-sogo.sh checks its own port as `nc -z sogo-mailcow 20000`
+      hostname: sogo-mailcow
+      {{- include "mailcow.dnsUnbound" . | nindent 6 }}
+      {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
+      {{- if $backupRwo }}
+      # RWO sogo-backup volume: replicas and the surge pod of a rolling update must share its node
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 18 }}
+      {{- else if include "mailcow.multi" $v }}
+      {{- include "mailcow.spread" (dict "root" . "component" $c) | nindent 6 }}
+      {{- end }}
+      initContainers:
+        {{- /* /etc/sogo: repo slice + sieve.creds/cron.creds derived from the Secret (dovecot writes the same
+        bytes into its own pod-local copy); writable, bootstrap-sogo.sh renames a custom logo in it */}}
+        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/sogo" "web/inc/init_db.inc.php" "conf/sogo") "env" (include "mailcow.sogoCredsEnv" .) "script" (include "mailcow.sogoCredsScript" .)) | nindent 8 }}
+      containers:
+        - name: sogo-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          env:
+            {{- include "mailcow.env.db" . | nindent 12 }}
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+            - name: LOG_LINES
+              value: {{ $m.logLines | quote }}
+            - name: MAILCOW_HOSTNAME
+              value: {{ $m.hostname | quote }}
+            - name: MAILCOW_PASS_SCHEME
+              value: {{ $m.passScheme | quote }}
+            - name: ACL_ANYONE
+              value: {{ $m.aclAnyone | quote }}
+            - name: ALLOW_ADMIN_EMAIL_LOGIN
+              value: {{ $m.allowAdminEmailLogin | quote }}
+            - name: IPV4_NETWORK
+              value: {{ $m.ipv4Network | quote }}
+            - name: SOGO_EXPIRE_SESSION
+              value: {{ $m.sogoExpireSession | quote }}
+            {{- include "mailcow.secretEnv" (list . "SOGO_URL_ENCRYPTION_KEY" "SOGO_URL_ENCRYPTION_KEY") | nindent 12 }}
+            - name: SKIP_SOGO
+              value: "n"
+            - name: MASTER
+              value: {{ $m.master | quote }}
+            {{- include "mailcow.env.redis" . | nindent 12 }}
+            - name: DOVECOTHOST
+              value: dovecot
+            - name: POSTFIXHOST
+              value: postfix
+            {{- include "mailcow.secretEnv" (list . "SOGO_ENCRYPTION_KEY" "SOGO_ENCRYPTION_KEY") | nindent 12 }}
+          ports:
+            - name: sogo
+              containerPort: 20000
+          # watchdog's check (check_http /SOGo.index/): one access log line per probe, where a bare TCP
+          # connect logs "http server caught: (null)" as an error
+          {{- include "mailcow.probes" (dict "handler" (dict "httpGet" (dict "path" "/SOGo.index/" "port" 20000)) "startup" 90 "ready" 20 "live" 30 "timeout" 5) | nindent 10 }}
+          volumeMounts:
+            {{- include "mailcow.hooksMount" "sogo" | nindent 12 }}
+            - name: seed
+              subPath: conf/sogo
+              mountPath: /etc/sogo/
+            - name: seed
+              subPath: web/inc/init_db.inc.php
+              mountPath: /init_db.inc.php
+            {{- range include "mailcow.sogoLogos" . | fromJsonArray }}
+            - name: seed
+              subPath: conf/sogo/{{ index . 0 }}
+              mountPath: {{ $res }}/{{ index . 1 }}
+            {{- end }}
+            # sogo-web-vol-1: nginx copies the web assets from the sogo image itself (initContainer)
+            - name: sogo-web
+              mountPath: /sogo_web
+            - name: backup
+              mountPath: /sogo_backup
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      volumes:
+        {{- include "mailcow.seedVolumes" (dict "root" .) | nindent 8 }}
+        - name: sogo-web
+          emptyDir: {}
+        - name: backup
+          persistentVolumeClaim:
+            claimName: {{ include "mailcow.claimName" (list . "sogoBackup" "sogo-backup") }}
+{{- include "mailcow.pdb" (dict "root" . "v" $v "component" $c) }}
+{{- include "mailcow.hpa" (dict "root" . "v" $v "component" $c) }}
+{{- end }}

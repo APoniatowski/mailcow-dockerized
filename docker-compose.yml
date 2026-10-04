@@ -84,7 +84,7 @@ services:
             - clamd
 
     rspamd-mailcow:
-      image: ghcr.io/mailcow/rspamd:4.1.4-1
+      image: ghcr.io/mailcow/rspamd:4.1.4-2
       stop_grace_period: 30s
       depends_on:
         - dovecot-mailcow
@@ -93,10 +93,14 @@ services:
         - TZ=${TZ}
         - IPV4_NETWORK=${IPV4_NETWORK:-172.22.1}
         - IPV6_NETWORK=${IPV6_NETWORK:-fd4d:6169:6c63:6f77::/64}
+        - MAILCOW_NETWORKS=${MAILCOW_NETWORKS:-}
+        - DOVECOT_TRUSTED_NETS=${DOVECOT_TRUSTED_NETS:-}
+        - RSPAMD_TRUSTED_NETS=${RSPAMD_TRUSTED_NETS:-}
         - REDIS_SLAVEOF_IP=${REDIS_SLAVEOF_IP:-}
         - REDIS_SLAVEOF_PORT=${REDIS_SLAVEOF_PORT:-}
         - REDISPASS=${REDISPASS}
         - SPAMHAUS_DQS_KEY=${SPAMHAUS_DQS_KEY:-}
+        - POSTFIXHOST=${POSTFIXHOST:-}
       volumes:
         - ./data/hooks/rspamd:/hooks:Z
         - ./data/conf/rspamd/custom/:/etc/rspamd/custom:z
@@ -117,7 +121,7 @@ services:
             - rspamd
 
     php-fpm-mailcow:
-      image: ghcr.io/mailcow/phpfpm:8.2.29-3
+      image: ghcr.io/mailcow/phpfpm:8.2.29-4
       command: "php-fpm -d date.timezone=${TZ} -d expose_php=0"
       depends_on:
         - redis-mailcow
@@ -156,6 +160,8 @@ services:
         - LOG_LINES=${LOG_LINES:-9999}
         - TZ=${TZ}
         - DBNAME=${DBNAME}
+        - DBHOST=${DBHOST:-}
+        - DBPORT=${DBPORT:-}
         - DBUSER=${DBUSER}
         - DBPASS=${DBPASS}
         - MAILCOW_HOSTNAME=${MAILCOW_HOSTNAME}
@@ -167,6 +173,8 @@ services:
         - SIEVE_PORT=${SIEVE_PORT:-4190}
         - IPV4_NETWORK=${IPV4_NETWORK:-172.22.1}
         - IPV6_NETWORK=${IPV6_NETWORK:-fd4d:6169:6c63:6f77::/64}
+        - MAILCOW_NETWORKS=${MAILCOW_NETWORKS:-}
+        - SOGO_TRUSTED_NETS=${SOGO_TRUSTED_NETS:-}
         - SUBMISSION_PORT=${SUBMISSION_PORT:-587}
         - SMTPS_PORT=${SMTPS_PORT:-465}
         - SMTP_PORT=${SMTP_PORT:-25}
@@ -178,6 +186,7 @@ services:
         - SKIP_CLAMD=${SKIP_CLAMD:-n}
         - SKIP_OLEFY=${SKIP_OLEFY:-n}
         - SKIP_SOGO=${SKIP_SOGO:-n}
+        - SKIP_MYSQL_UPGRADE=${SKIP_MYSQL_UPGRADE:-}
         - ALLOW_ADMIN_EMAIL_LOGIN=${ALLOW_ADMIN_EMAIL_LOGIN:-n}
         - MASTER=${MASTER:-y}
         - DEV_MODE=${DEV_MODE:-n}
@@ -185,6 +194,7 @@ services:
         - WEBAUTHN_ONLY_TRUSTED_VENDORS=${WEBAUTHN_ONLY_TRUSTED_VENDORS:-n}
         - CLUSTERMODE=${CLUSTERMODE:-}
         - ADDITIONAL_SERVER_NAMES=${ADDITIONAL_SERVER_NAMES:-}
+        - DOCKERAPIHOST=${DOCKERAPIHOST:-}
       restart: always
       labels:
         ofelia.enabled: "true"
@@ -200,9 +210,11 @@ services:
             - phpfpm
 
     sogo-mailcow:
-      image: ghcr.io/mailcow/sogo:5.12.11-1
+      image: ghcr.io/mailcow/sogo:5.12.11-2
       environment:
         - DBNAME=${DBNAME}
+        - DBHOST=${DBHOST:-}
+        - DBPORT=${DBPORT:-}
         - DBUSER=${DBUSER}
         - DBPASS=${DBPASS}
         - TZ=${TZ}
@@ -214,11 +226,14 @@ services:
         - IPV4_NETWORK=${IPV4_NETWORK:-172.22.1}
         - SOGO_EXPIRE_SESSION=${SOGO_EXPIRE_SESSION:-480}
         - SOGO_URL_ENCRYPTION_KEY=${SOGO_URL_ENCRYPTION_KEY:-SOGoSuperSecret0}
+        - SOGO_ENCRYPTION_KEY=${SOGO_ENCRYPTION_KEY:-}
         - SKIP_SOGO=${SKIP_SOGO:-n}
         - MASTER=${MASTER:-y}
         - REDIS_SLAVEOF_IP=${REDIS_SLAVEOF_IP:-}
         - REDIS_SLAVEOF_PORT=${REDIS_SLAVEOF_PORT:-}
         - REDISPASS=${REDISPASS}
+        - DOVECOTHOST=${DOVECOTHOST:-}
+        - POSTFIXHOST=${POSTFIXHOST:-}
       dns:
         - ${IPV4_NETWORK:-172.22.1}.254
       volumes:
@@ -252,7 +267,7 @@ services:
             - sogo
 
     dovecot-mailcow:
-      image: ghcr.io/mailcow/dovecot:2.3.21.1-2
+      image: ghcr.io/mailcow/dovecot:2.3.21.1-3
       depends_on:
         - mysql-mailcow
         - netfilter-mailcow
@@ -281,12 +296,16 @@ services:
         - DOVEADM_REPLICA_PORT=${DOVEADM_REPLICA_PORT:-}
         - LOG_LINES=${LOG_LINES:-9999}
         - DBNAME=${DBNAME}
+        - DBHOST=${DBHOST:-}
+        - DBPORT=${DBPORT:-}
         - DBUSER=${DBUSER}
         - DBPASS=${DBPASS}
         - TZ=${TZ}
         - MAILCOW_HOSTNAME=${MAILCOW_HOSTNAME}
         - MAILCOW_PASS_SCHEME=${MAILCOW_PASS_SCHEME:-BLF-CRYPT}
         - IPV4_NETWORK=${IPV4_NETWORK:-172.22.1}
+        - SOGO_TRUSTED_NETS=${SOGO_TRUSTED_NETS:-}
+        - SOGO_SSO_PASS=${SOGO_SSO_PASS:-}
         - ALLOW_ADMIN_EMAIL_LOGIN=${ALLOW_ADMIN_EMAIL_LOGIN:-n}
         - MAILDIR_GC_TIME=${MAILDIR_GC_TIME:-7200}
         - ACL_ANYONE=${ACL_ANYONE:-disallow}
@@ -299,6 +318,7 @@ services:
         - REDIS_SLAVEOF_PORT=${REDIS_SLAVEOF_PORT:-}
         - REDISPASS=${REDISPASS}
         - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-mailcow-dockerized}
+        - DOCKERAPIHOST=${DOCKERAPIHOST:-}
       ports:
         - "${DOVEADM_PORT:-127.0.0.1:19991}:12345"
         - "${IMAP_PORT:-143}:143"
@@ -339,7 +359,7 @@ services:
             - dovecot
 
     postfix-mailcow:
-      image: ghcr.io/mailcow/postfix:3.10.12-1
+      image: ghcr.io/mailcow/postfix:3.10.12-2
       depends_on:
         mysql-mailcow:
           condition: service_started
@@ -359,6 +379,8 @@ services:
         - LOG_LINES=${LOG_LINES:-9999}
         - TZ=${TZ}
         - DBNAME=${DBNAME}
+        - DBHOST=${DBHOST:-}
+        - DBPORT=${DBPORT:-}
         - DBUSER=${DBUSER}
         - DBPASS=${DBPASS}
         - REDIS_SLAVEOF_IP=${REDIS_SLAVEOF_IP:-}
@@ -366,6 +388,7 @@ services:
         - REDISPASS=${REDISPASS}
         - MAILCOW_HOSTNAME=${MAILCOW_HOSTNAME}
         - SPAMHAUS_DQS_KEY=${SPAMHAUS_DQS_KEY:-}
+        - MAILCOW_NETWORKS=${MAILCOW_NETWORKS:-}
       cap_add:
         - NET_BIND_SERVICE
       ports:
@@ -382,7 +405,7 @@ services:
             - postfix
 
     postfix-tlspol-mailcow:
-      image: ghcr.io/mailcow/postfix-tlspol:1.11.0
+      image: ghcr.io/mailcow/postfix-tlspol:1.11.0-1
       depends_on:
         unbound-mailcow:
           condition: service_healthy
@@ -395,6 +418,8 @@ services:
         - REDIS_SLAVEOF_PORT=${REDIS_SLAVEOF_PORT:-}
         - REDISPASS=${REDISPASS}
         - DEV_MODE=${DEV_MODE:-n}
+        - TLSPOL_DNS=${TLSPOL_DNS:-}
+        - WAIT_TCP=${WAIT_TCP:-}
       restart: always
       dns:
         - ${IPV4_NETWORK:-172.22.1}.254
@@ -419,7 +444,7 @@ services:
         - php-fpm-mailcow
         - sogo-mailcow
         - rspamd-mailcow
-      image: ghcr.io/mailcow/nginx:1.30.4-1
+      image: ghcr.io/mailcow/nginx:1.30.4-2
       dns:
         - ${IPV4_NETWORK:-172.22.1}.254
       environment:
@@ -439,6 +464,7 @@ services:
         - IPV4_NETWORK=${IPV4_NETWORK:-172.22.1}
         - NGINX_USE_PROXY_PROTOCOL=${NGINX_USE_PROXY_PROTOCOL:-n}
         - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
+        - WAIT_TCP=${WAIT_TCP:-}
       volumes:
         - ./data/web:/web:ro,z
         - ./data/conf/rspamd/dynmaps:/dynmaps:ro,z
@@ -465,7 +491,7 @@ services:
           condition: service_started
         unbound-mailcow:
           condition: service_healthy
-      image: ghcr.io/mailcow/acme:1.98
+      image: ghcr.io/mailcow/acme:1.99
       dns:
         - ${IPV4_NETWORK:-172.22.1}.254
       environment:
@@ -474,6 +500,8 @@ services:
         - AUTODISCOVER_SAN=${AUTODISCOVER_SAN:-y}
         - MAILCOW_HOSTNAME=${MAILCOW_HOSTNAME}
         - DBNAME=${DBNAME}
+        - DBHOST=${DBHOST:-}
+        - DBPORT=${DBPORT:-}
         - DBUSER=${DBUSER}
         - DBPASS=${DBPASS}
         - SKIP_LETS_ENCRYPT=${SKIP_LETS_ENCRYPT:-n}
@@ -493,6 +521,9 @@ services:
         - ACME_DNS_CHALLENGE=${ACME_DNS_CHALLENGE:-n}
         - ACME_DNS_PROVIDER=${ACME_DNS_PROVIDER:-dns_xxx}
         - ACME_ACCOUNT_EMAIL=${ACME_ACCOUNT_EMAIL:-me@example.com}
+        - DOCKERAPIHOST=${DOCKERAPIHOST:-}
+        - NGINXHOST=${NGINXHOST:-}
+        - WAIT_TCP=${WAIT_TCP:-}
       volumes:
         - ./data/web/.well-known/acme-challenge:/var/www/acme:z
         - ./data/assets/ssl:/var/lib/acme/:z
@@ -526,7 +557,7 @@ services:
         - /lib/modules:/lib/modules:ro
 
     watchdog-mailcow:
-      image: ghcr.io/mailcow/watchdog:2.11
+      image: ghcr.io/mailcow/watchdog:2.12
       dns:
         - ${IPV4_NETWORK:-172.22.1}.254
       tmpfs:
@@ -548,6 +579,8 @@ services:
         - LOG_LINES=${LOG_LINES:-9999}
         - TZ=${TZ}
         - DBNAME=${DBNAME}
+        - DBHOST=${DBHOST:-}
+        - DBPORT=${DBPORT:-}
         - DBUSER=${DBUSER}
         - DBPASS=${DBPASS}
         - DBROOT=${DBROOT}
@@ -595,13 +628,14 @@ services:
         - MAILQ_THRESHOLD=${MAILQ_THRESHOLD:-20}
         - MAILQ_CRIT=${MAILQ_CRIT:-30}
         - DEV_MODE=${DEV_MODE:-n}
+        - DOCKERAPIHOST=${DOCKERAPIHOST:-}
       networks:
         mailcow-network:
           aliases:
             - watchdog
 
     dockerapi-mailcow:
-      image: ghcr.io/mailcow/dockerapi:2.12
+      image: ghcr.io/mailcow/dockerapi:2.13
       security_opt:
         - label=disable
       restart: always

@@ -1,0 +1,40 @@
+{{- $root := . }}
+{{- $vols := list
+  (list "vmail" "vmail" true)
+  (list "vmailIndex" "vmail-index" true)
+  (list "mysql" "mysql" (not .Values.externalDatabase.enabled))
+  (list "redis" "redis" (not .Values.externalRedis.enabled))
+  (list "postfix" "postfix" (not .Values.postfix.spoolPerPod))
+  (list "postfixTlspol" "postfix-tlspol" true)
+  (list "crypt" "crypt" true)
+  (list "clamdDb" "clamd-db" (not .Values.skip.clamd))
+  (list "sogoBackup" "sogo-backup" (not .Values.skip.sogo))
+  (list "shared" "shared" true) }}
+{{- range $vols }}
+{{- $key := index . 0 }}{{ $suffix := index . 1 }}{{ $on := index . 2 }}
+{{- $p := index $root.Values.persistence $key }}
+{{- if and $on (not $p.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "mailcow.fullname" $root }}-{{ $suffix }}
+  labels:
+    {{- include "mailcow.commonLabels" $root | nindent 4 }}
+    mailcow.email/volume: {{ $suffix }}
+  {{- if $root.Values.persistence.keep }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  accessModes:
+    - {{ $p.accessMode }}
+  {{- $sc := default $root.Values.persistence.storageClass $p.storageClass }}
+  {{- if $sc }}
+  storageClassName: {{ if eq $sc "-" }}""{{ else }}{{ $sc }}{{ end }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $p.size }}
+{{- end }}
+{{- end }}

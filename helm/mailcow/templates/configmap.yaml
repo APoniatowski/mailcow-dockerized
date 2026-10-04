@@ -1,0 +1,91 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mailcow.fullname" . }}-k8s
+  labels:
+    {{- include "mailcow.commonLabels" . | nindent 4 }}
+data:
+  # Appended to data/conf/unbound/unbound.conf (unbound has no include in the repo config).
+  # DNSSEC validation stays on for the internet; the cluster zone is unsigned -> domain-insecure.
+  # unbound.forwarders set: everything outside the cluster zone goes to them instead of the root servers.
+  unbound-k8s.conf: |
+
+    # --- added by the mailcow Helm chart ---
+    server:
+    {{- range (splitList "," (include "mailcow.networks" .)) }}
+      access-control: {{ . }} allow
+    {{- end }}
+      domain-insecure: "{{ .Values.clusterDomain }}"
+      private-domain: "{{ .Values.clusterDomain }}"
+      local-zone: "{{ .Values.clusterDomain }}." transparent
+    {{- /* Docker's embedded DNS answers bare service names; resolvers that ignore resolv.conf
+           search domains (rspamd's async resolver, postfix's DNS client, dig) rely on that.
+           Answer them here with a CNAME to the Service FQDN, which unbound then follows. */}}
+    {{- /* only names with a Service (acme and watchdog have none); watchdog relies on these */}}
+    {{- range (list "clamd" "dockerapi" "dovecot" "memcached" "mysql" "nginx" "olefy" "phpfpm" "php-fpm" "postfix" "postfix-tlspol" "redis" "rspamd" "sogo" "unbound") }}
+    {{- range $n := (list . (printf "%s-mailcow" .)) }}
+    {{- if ne $n "phpfpm-mailcow" }}
+      local-zone: "{{ $n }}." redirect
+      local-data: "{{ $n }}. 30 IN CNAME {{ $n }}.{{ $.Release.Namespace }}.svc.{{ $.Values.clusterDomain }}."
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    forward-zone:
+      name: "{{ .Values.clusterDomain }}"
+      forward-addr: {{ include "mailcow.clusterDNS" . }}
+    {{- with .Values.unbound.forwarders }}
+    forward-zone:
+      name: "."
+      {{- range . }}
+      forward-addr: {{ . }}
+      {{- end }}
+    {{- end }}
+  # Appended to data/conf/dovecot/extra.conf (after extraFiles). haproxy_trusted_networks only with
+  # mail.proxyProtocol (unset = dovecot accepts no PROXY header, like compose).
+  dovecot-k8s.conf: |
+
+    # --- added by the mailcow Helm chart ---
+    {{- with include "mailcow.proxyTrustedNetworks" . | fromJsonArray }}
+    haproxy_trusted_networks = {{ join " " . }}
+    {{- end }}
+  # Appended to data/conf/postfix/extra.cf (after extraFiles). The lmtp client's own DNS
+  # lookups skip resolv.conf search domains, so the bare "dovecot" transport host
+  # (main.cf virtual_transport) only resolves through getaddrinfo.
+  # bruteForce: anvil per-client limits for every smtpd service (no master.cf -o overrides them).
+  postfix-k8s.cf: |
+
+    # --- added by the mailcow Helm chart ---
+    lmtp_host_lookup = native
+    {{- with .Values.bruteForce }}
+    {{- if .enabled }}
+    anvil_rate_time_unit = {{ .rateTimeUnit }}
+    smtpd_client_auth_rate_limit = {{ int .authRateLimit }}
+    smtpd_client_connection_rate_limit = {{ int .connectionRateLimit }}
+    smtpd_client_connection_count_limit = {{ int .connectionCountLimit }}
+    smtpd_client_event_limit_exceptions = {{ .limitExceptions }}
+    {{- end }}
+    {{- end }}
+  {{- if .Values.skip.clamd }}
+  # Appended to (or creates) data/conf/rspamd/override.d/antivirus.conf with skip.clamd: without the
+  # module rspamd never connects to the endpoint-less clamd Service. Under egress policies that
+  # connection is dropped, not rejected, and every message waits for the scan timeout. The composite
+  # VIRUS_FOUND (CLAM_VIRUS & ...) then never matches, like the CLAM_SECI_* composites without symbols.
+  rspamd-antivirus.conf: |
+
+    # --- added by the mailcow Helm chart ---
+    enabled = false;
+  {{- end }}
+{{- if .Values.extraFiles }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mailcow.fullname" . }}-extra-files
+  labels:
+    {{- include "mailcow.commonLabels" . | nindent 4 }}
+data:
+  {{- range $path, $content := .Values.extraFiles }}
+  # {{ $path }}
+  {{ printf "f-%s" (sha256sum $path | trunc 16) }}: {{ $content | toString | quote }}
+  {{- end }}
+{{- end }}

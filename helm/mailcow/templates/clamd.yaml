@@ -1,0 +1,54 @@
+{{- if not .Values.skip.clamd }}
+{{- $c := "clamd" }}
+{{- $v := .Values.clamd }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mailcow.fullname" . }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  replicas: 1
+  {{- include "mailcow.strategy" "Recreate" | nindent 2 }}
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+      annotations:
+        {{- include "mailcow.podAnnotations" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "mailcow.dnsUnbound" . | nindent 6 }}
+      {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
+      initContainers:
+        {{- include "mailcow.seedInit" (dict "root" . "slices" (list "conf/clamav")) | nindent 8 }}
+      containers:
+        - name: clamd-mailcow
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          env:
+            {{- include "mailcow.env.tz" . | nindent 12 }}
+            - name: SKIP_CLAMD
+              value: "n"
+          ports:
+            - name: clamd
+              containerPort: 3310
+          # first start downloads signatures (freshclam) before clamd listens: up to 30 min
+          {{- include "mailcow.tcpProbes" (dict "port" 3310 "startup" 180) | nindent 10 }}
+          volumeMounts:
+            - name: seed
+              subPath: conf/clamav
+              mountPath: /etc/clamav/
+            - name: db
+              mountPath: /var/lib/clamav
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      volumes:
+        {{- include "mailcow.seedVolumes" (dict "root" .) | nindent 8 }}
+        - name: db
+          persistentVolumeClaim:
+            claimName: {{ include "mailcow.claimName" (list . "clamdDb" "clamd-db") }}
+{{- end }}

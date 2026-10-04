@@ -1,0 +1,38 @@
+# Backups on a multi-node cluster: existing ReadWriteMany backup claim (NFS) and RWX mail volumes, so
+# no backup Job needs a podAffinity (and dovecot does not mount the backup claim); external database and Redis by
+# DNS name (network dumps with a newer client image); postfix with a queue per pod (not backed up).
+backup:
+  enabled: true
+  retentionDays: 0
+  keep: 14
+  persistence:
+    existingClaim: mailcow-backup-nfs
+    accessMode: ReadWriteMany
+  mysql:
+    image:
+      repository: mariadb
+      tag: "11.4"
+  podSecurityContext:
+    supplementalGroups: [1000]
+
+persistence:
+  vmail:
+    accessMode: ReadWriteMany
+  crypt:
+    accessMode: ReadWriteMany
+  shared:
+    accessMode: ReadWriteMany
+
+externalDatabase:
+  enabled: true
+  host: db.example.org
+  port: 3306
+
+externalRedis:
+  enabled: true
+  host: redis.example.org
+  port: 6379
+
+postfix:
+  replicas: 2
+  spoolPerPod: true

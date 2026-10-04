@@ -1,0 +1,94 @@
+name: Helm chart
+
+on:
+  pull_request:
+    paths:
+      - "helm/**"
+      - "docker-compose.yml"
+      # check-tags.sh compares backup.image with its DEBIAN_DOCKER_IMAGE
+      - "helper-scripts/backup_and_restore.sh"
+      - ".github/workflows/helm_chart.yml"
+  push:
+    branches: [ "master", "staging" ]
+    paths:
+      - "helm/**"
+      - "docker-compose.yml"
+      - "helper-scripts/backup_and_restore.sh"
+      - ".github/workflows/helm_chart.yml"
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+env:
+  CHART: helm/mailcow
+  HELM_VERSION: v4.3.0
+  HELM_SHA256: 86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb
+  KUBECONFORM_VERSION: v0.8.0
+  KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+  # Kubernetes API versions the rendered manifests are validated against: the chart's kubeVersion
+  # lower bound (Chart.yaml) and a current release
+  KUBERNETES_VERSIONS: 1.29.0 1.33.0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install helm and kubeconform
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP"
+          curl -fsSLo helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tar.gz" | sha256sum -c -
+          tar -xzf helm.tar.gz -C bin --strip-components=1 linux-amd64/helm
+          curl -fsSLo kubeconform.tar.gz "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform.tar.gz" | sha256sum -c -
+          tar -xzf kubeconform.tar.gz -C bin kubeconform
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/helm" version
+          "$RUNNER_TEMP/bin/kubeconform" -v
+
+      - name: Check image tags against docker-compose.yml
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q python3-yaml; }
+          helm/mailcow/scripts/check-tags.sh
+
+      - name: Lint chart
+        run: helm lint "$CHART" --strict
+
+      - name: Render and validate manifests
+        run: |
+          out="$RUNNER_TEMP/rendered"
+          mkdir -p "$out"
+          validate() {
+            local v
+            for v in $KUBERNETES_VERSIONS; do
+              echo "-- Kubernetes $v"
+              kubeconform -strict -summary -kubernetes-version "$v" \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+                "$1"
+            done
+          }
+          sets=("")
+          for f in "$CHART"/ci/*-values.yaml; do
+            [ -f "$f" ] && sets+=("$f")
+          done
+          for s in "${sets[@]}"; do
+            name=$(basename "${s:-default}" .yaml)
+            args=()
+            [ -n "$s" ] && args=(-f "$s")
+            helm template mailcow "$CHART" -n mailcow "${args[@]}" > "$out/$name.yaml"
+            echo "== $name: $(grep -c '^kind:' "$out/$name.yaml") objects"
+            validate "$out/$name.yaml"
+          done
+          # upgrade-only templates (pre-upgrade hooks) render only with --is-upgrade
+          helm template mailcow "$CHART" -n mailcow --is-upgrade > "$out/upgrade.yaml"
+          echo "== upgrade (defaults, --is-upgrade): $(grep -c '^kind:' "$out/upgrade.yaml") objects"
+          validate "$out/upgrade.yaml"

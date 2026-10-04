@@ -6,6 +6,7 @@ import time
 import json
 import asyncio
 import platform
+import traceback
 from datetime import datetime
 from fastapi import FastAPI, Response, Request
 
@@ -603,6 +604,10 @@ class DockerApi:
       return ''.join(total_data)
 
     try :
+      # kubernetes backend only: its containers have no attachable exec socket and provide exec_stdin, docker containers do not
+      exec_stdin = getattr(container, 'exec_stdin', None)
+      if exec_stdin:
+        return exec_stdin(cmd, user, timeout, shell_cmd)
       socket = container.exec_run([shell_cmd], stdin=True, socket=True, user=user).output._sock
       if not cmd.endswith("\n"):
         cmd = cmd + "\n"

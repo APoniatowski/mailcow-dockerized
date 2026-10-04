@@ -1,0 +1,76 @@
+# local kind cluster: single node, podSubnet 10.244.0.0/16,
+# serviceSubnet 10.96.0.0/16, host ports 127.0.0.1:30080..32190 -> NodePorts of the same number.
+# Images built from the working tree are loaded into the cluster nodes beforehand, hence IfNotPresent.
+mailcow:
+  hostname: mail.example.org
+  networks: 10.244.0.0/16
+  # test cluster: SOGo may authenticate from anywhere in the pod CIDR
+  sogoTrustedNets: 10.244.0.0/16
+  # the smoke test calls the API from the host through the NodePort; the source address nginx sees is
+  # the kind docker bridge / node address (SNAT), so allow the private ranges
+  apiAllowFrom: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1"
+
+skip:
+  clamd: true
+
+# explicit: no lookup of kube-system/kube-dns needed
+clusterDNS: 10.96.0.10
+unbound:
+  clusterIP: 10.96.53.53
+  # some networks intercept or block outbound :53, so recursion from the root servers fails there
+  forwarders: [1.1.1.1, 9.9.9.9]
+
+files:
+  image:
+    repository: localhost/mailcow-files
+    tag: dev
+    pullPolicy: IfNotPresent
+
+persistence:
+  storageClass: standard
+  shared:
+    # kind's local-path provisioner has no RWX; RWO + the chart's podAffinity keeps every pod on the node
+    accessMode: ReadWriteOnce
+  vmail:
+    size: 1Gi
+  vmailIndex:
+    size: 512Mi
+  mysql:
+    size: 1Gi
+  postfix:
+    size: 512Mi
+
+mail:
+  proxyProtocol: false
+  service:
+    type: NodePort
+    externalTrafficPolicy: Local
+    nodePorts:
+      smtp: 30025
+      smtps: 30465
+      submission: 30587
+      imap: 30143
+      imaps: 30993
+      sieve: 32190
+
+http:
+  service:
+    enabled: true
+    type: NodePort
+    externalTrafficPolicy: Cluster
+    nodePorts:
+      http: 30080
+      https: 30443
+
+# no tls.* set -> self-signed bootstrap Job (snake-oil for mail.example.org)
+
+cronjobs:
+  # finished Job pods never turn Ready: wait on `-l app.kubernetes.io/component!=cron`. TTL 0 / history 0
+  # delete a Job before the CronJob controller records it finished -> "MissingJob" warnings
+  successfulJobsHistoryLimit: 1
+  ttlSecondsAfterFinished: 120
+
+networkPolicy:
+  # kindnet (kind >= 0.24) enforces NetworkPolicy. The smoke test reaches the mail NodePorts from the
+  # host (docker bridge gateway, outside 10.244.0.0/16), so the publicMailFrom default admits it.
+  enabled: true

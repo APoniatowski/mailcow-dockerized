@@ -50,7 +50,10 @@ try:
   def query_mysql(query, params = None, headers = True, update = False):
     while True:
       try:
-        cnx = MySQLdb.connect(user=os.environ.get('DBUSER'), password=os.environ.get('DBPASS'), database=os.environ.get('DBNAME'), charset="utf8mb4", collation="utf8mb4_general_ci")
+        if os.environ.get('DBHOST'):
+          cnx = MySQLdb.connect(host=os.environ.get('DBHOST'), port=int(os.environ.get('DBPORT') or 3306), user=os.environ.get('DBUSER'), password=os.environ.get('DBPASS'), database=os.environ.get('DBNAME'), charset="utf8mb4", collation="utf8mb4_general_ci")
+        else:
+          cnx = MySQLdb.connect(user=os.environ.get('DBUSER'), password=os.environ.get('DBPASS'), database=os.environ.get('DBNAME'), charset="utf8mb4", collation="utf8mb4_general_ci")
       except Exception as ex:
         print('%s - trying again...'  % (ex))
         time.sleep(3)

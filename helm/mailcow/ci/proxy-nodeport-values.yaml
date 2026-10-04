@@ -1,0 +1,38 @@
+# PROXY protocol behind an external load balancer that targets NodePorts (e.g. haproxy or a hardware LB in
+# front of the nodes), externalTrafficPolicy Local so the pod sees the LB's address; the web UI only as a
+# ClusterIP (exposed by something else). Extra files from existing Secrets, own relay TLS Secret, pod
+# annotations on every pod template incl. backup and CronJob pods, clusterDNS looked up (empty).
+mailcow:
+  hostname: mail.example.org
+  networks: 10.244.0.0/16
+
+mail:
+  proxyProtocol: true
+  # the external LB's addresses (a bare address becomes /32)
+  proxyTrustedNetworks: [198.51.100.10, 198.51.100.11]
+  service:
+    type: NodePort
+    externalTrafficPolicy: Local
+    nodePorts:
+      smtp: 30025
+      imaps: 30993
+
+http:
+  service:
+    type: ClusterIP
+
+extraSecretFiles:
+  conf/sogo/plist_ldap: {secretName: mailcow-sogo-ldap, key: plist_ldap}
+  conf/postfix/sasl_passwd: {secretName: mailcow-relayhost, key: sasl_passwd}
+
+rspamd:
+  socketRelay:
+    tls:
+      existingSecret: mailcow-rspamd-relay-tls-external
+
+podDefaults:
+  annotations:
+    example.org/team: mail
+
+backup:
+  enabled: true

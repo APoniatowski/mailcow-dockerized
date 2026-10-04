@@ -29,9 +29,16 @@ until [[ $(${REDIS_CMDLINE} PING) == "PONG" ]]; do
 done
 
 echo "Waiting for Postfix..."
-until ping postfix -c1 > /dev/null; do
-  sleep 1
-done
+if [[ "${WAIT_TCP}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+  # bash /dev/tcp instead of nc -z: the debian-slim base image ships no netcat
+  until timeout 2 bash -c "</dev/tcp/postfix/25" 2>/dev/null; do
+    sleep 1
+  done
+else
+  until ping postfix -c1 > /dev/null; do
+    sleep 1
+  done
+fi
 echo "Postfix OK"
 
 cat <<EOF > /etc/postfix-tlspol/config.yaml
@@ -46,7 +53,7 @@ server:
 
 dns:
   # must support DNSSEC
-  address: 127.0.0.11:53
+  address: ${TLSPOL_DNS:-127.0.0.11:53}
 EOF
 
 /usr/local/bin/postfix-tlspol -config /etc/postfix-tlspol/config.yaml
