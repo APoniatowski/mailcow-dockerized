@@ -3,6 +3,8 @@ externalRedis.tls: mailcow's Redis clients (PHP, Python, Lua, redis-cli) speak p
 (files image) listens plain on 6379 for release pods and opens a verified TLS connection to the external
 server per client connection; the `redis` / `redis-mailcow` Services select it. The TLS files are read per
 connection (socat opens the OPENSSL address in the forked child), so rotated Secrets apply without a restart.
+Each connection is a forked process of ~5 MiB: max-children caps them below the memory limit, further
+connections wait in the listen backlog until a child exits.
 */ -}}
 {{- if include "mailcow.redisTls" . }}
 {{- $c := "redis-tls" }}
@@ -78,7 +80,7 @@ spec:
                 echo "TLS check ${UPSTREAM_ADDR}:${UPSTREAM_PORT} FAILED, relaying anyway:"; echo "${r:-no TLS answer within 10s}" | grep -iE 'error|refused|unknown|no TLS answer' | head -n 3
               fi
               if grep -qs . /proc/net/if_inet6; then pf="pf=ip6,ipv6only=0"; else pf="pf=ip4"; fi
-              exec socat -d0 "TCP-LISTEN:6379,${pf},fork,reuseaddr,nodelay,keepalive" "OPENSSL:${UPSTREAM_ADDR}:${UPSTREAM_PORT},${UPSTREAM_OPTS}"
+              exec socat -d0 "TCP-LISTEN:6379,${pf},fork,max-children={{ int $v.maxChildren }},reuseaddr,nodelay,keepalive" "OPENSSL:${UPSTREAM_ADDR}:${UPSTREAM_PORT},${UPSTREAM_OPTS}"
           env:
             - name: UPSTREAM_ADDR
               value: {{ $addr | quote }}

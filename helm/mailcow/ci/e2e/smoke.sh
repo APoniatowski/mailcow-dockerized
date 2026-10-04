@@ -12,7 +12,7 @@
 #
 #   1. every release pod Ready (CronJob, backup and TLS bootstrap Job pods excluded)
 #   2. web UI answers on https://$HOST_ADDR:30443 (Host: $MAILCOW_HOSTNAME)
-#   3. API: add domain + mailbox
+#   3. API: add domain (a new one with restart_sogo, waiting for the SOGo rollout) + mailbox
 #   4. SMTP submission STARTTLS + AUTH via NodePort 30587 from the host, send to self
 #   5. IMAPS via NodePort 30993: message arrives within 60s, COPY to Junk -> rspamd learns spam
 #   6. dockerapi Kubernetes backend: mail queue via API, container status non-empty;
@@ -88,8 +88,19 @@ created=0
 cleanup() { [ "$created" = 1 ] && api delete/mailbox -d "[\"$USER_\"]" >/dev/null 2>&1; created=0; }
 trap cleanup EXIT
 
-r=$(api add/domain -d "{\"domain\":\"$DOMAIN\",\"active\":\"1\",\"mailboxes\":\"10\",\"maxquota\":\"1024\",\"quota\":\"2048\",\"defquota\":\"512\",\"aliases\":\"10\",\"restart_sogo\":\"0\"}")
-grep -q '"type":"success"\|already exists\|domain_exists' <<<"$r" && ok "API add domain $DOMAIN" || ko "API add domain: ${r:0:300}"
+# SOGo reads its domains (authentication sources) at start: a new domain needs restart_sogo, or SOGo
+# may cache the failed user lookup in memcached and answer DAV/EAS with 403 even after a later restart.
+# The restart is a rollout restart through dockerapi: wait for it. Not with skip.sogo (the restart would
+# fail) nor for an existing domain (added by an earlier run, SOGo restarted then).
+sogo=$(K get deploy -l "$SEL,app.kubernetes.io/component=sogo" -o name 2>/dev/null | head -1)
+exists=$(api "get/domain/$DOMAIN" | jq -r 'if type == "object" then .domain_name // empty else empty end' 2>/dev/null)
+restart=0; [ -n "$sogo" ] && [ -z "$exists" ] && restart=1
+r=$(api add/domain -d "{\"domain\":\"$DOMAIN\",\"active\":\"1\",\"mailboxes\":\"10\",\"maxquota\":\"1024\",\"quota\":\"2048\",\"defquota\":\"512\",\"aliases\":\"10\",\"restart_sogo\":\"$restart\"}")
+grep -q '"type":"success"\|already exists\|domain_exists' <<<"$r" && ok "API add domain $DOMAIN (restart_sogo $restart)" || ko "API add domain: ${r:0:300}"
+if [ "$restart" = 1 ]; then
+  if K rollout status "$sogo" --timeout=300s >/dev/null 2>&1; then ok "SOGo rolled out again after the domain was added"
+  else ko "SOGo rollout after add domain not finished within 300s"; fi
+fi
 r=$(api add/mailbox -d "{\"local_part\":\"$LP\",\"domain\":\"$DOMAIN\",\"password\":\"$PASS\",\"password2\":\"$PASS\",\"active\":\"1\",\"quota\":\"100\",\"force_pw_update\":\"0\"}")
 if grep -q '"type":"success"' <<<"$r"; then created=1; ok "API add mailbox $USER_"; else ko "API add mailbox: ${r:0:300}"; fi
 

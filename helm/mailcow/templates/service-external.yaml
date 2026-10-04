@@ -34,7 +34,7 @@ metadata:
 spec:
   type: {{ $ms.type }}
   {{- if ne $ms.type "ClusterIP" }}
-  externalTrafficPolicy: {{ $ms.externalTrafficPolicy | default (ternary "Cluster" "Local" $pp) }}
+  externalTrafficPolicy: {{ $ms.externalTrafficPolicy | default "Local" }}
   {{- end }}
   {{- if eq $ms.type "LoadBalancer" }}
   {{- with $ms.loadBalancerClass }}

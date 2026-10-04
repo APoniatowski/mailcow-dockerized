@@ -96,7 +96,7 @@ Checks:
     See README "Security".
 {{- end }}
 
-{{- $etp := .Values.mail.service.externalTrafficPolicy | default (ternary "Cluster" "Local" .Values.mail.proxyProtocol) }}
+{{- $etp := .Values.mail.service.externalTrafficPolicy | default "Local" }}
 {{- if and (not .Values.mail.proxyProtocol) (eq $etp "Cluster") (ne .Values.mail.service.type "ClusterIP") }}
 
 WARNING: mail.proxyProtocol is false and the mail Service uses externalTrafficPolicy Cluster.
@@ -108,9 +108,10 @@ WARNING: mail.proxyProtocol is false and the mail Service uses externalTrafficPo
 WARNING: PROXY protocol on a {{ .Values.mail.service.type }} Service with node ports. postfix believes the client address in
   any PROXY header it receives, so whoever reaches a node port from inside mail.proxyTrustedNetworks can
   relay as an internal client.
-  {{- if eq ($.Values.mail.service.externalTrafficPolicy | default "Cluster") "Cluster" }}
-  With externalTrafficPolicy Cluster kube-proxy SNATs node-port traffic to a node address: if
-  proxyTrustedNetworks holds node addresses, ANY client that reaches a node port directly is trusted.
+  {{- if eq ($.Values.mail.service.externalTrafficPolicy | default "Local") "Cluster" }}
+  With externalTrafficPolicy Cluster kube-proxy SNATs node-port traffic to the node's address or, with
+  many CNIs, to its bridge/tunnel address inside the pod CIDR: if proxyTrustedNetworks holds those
+  addresses, ANY client that reaches a node port directly is trusted.
   {{- end }}
   Firewall the node ports (cloud security group / host firewall) so only the load balancer reaches them,
   prefer externalTrafficPolicy Local with the LB's own addresses in proxyTrustedNetworks, or an LB that

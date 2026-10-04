@@ -1,6 +1,11 @@
 # Egress NetworkPolicies on a dual-stack cluster, with an in-cluster database operator as external DB.
+# clamd and olefy skipped: rspamd must not address their endpoint-less Services (dropped, not rejected).
 mailcow:
   networks: 10.244.0.0/16,fd00:10:244::/56
+
+skip:
+  clamd: true
+  olefy: true
 
 externalDatabase:
   enabled: true

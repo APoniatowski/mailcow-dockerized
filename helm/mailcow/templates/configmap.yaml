@@ -65,6 +65,16 @@ data:
     smtpd_client_event_limit_exceptions = {{ .limitExceptions }}
     {{- end }}
     {{- end }}
+  {{- if .Values.skip.clamd }}
+  # Appended to (or creates) data/conf/rspamd/override.d/antivirus.conf with skip.clamd: without the
+  # module rspamd never connects to the endpoint-less clamd Service. Under egress policies that
+  # connection is dropped, not rejected, and every message waits for the scan timeout. The composite
+  # VIRUS_FOUND (CLAM_VIRUS & ...) then never matches, like the CLAM_SECI_* composites without symbols.
+  rspamd-antivirus.conf: |
+
+    # --- added by the mailcow Helm chart ---
+    enabled = false;
+  {{- end }}
 {{- if .Values.extraFiles }}
 ---
 apiVersion: v1

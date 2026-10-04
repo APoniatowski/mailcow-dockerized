@@ -168,7 +168,7 @@ Input: comma separated string or list. include "mailcow.netList" (list "mailcow.
 {{- if .Values.mail.proxyProtocol -}}
 {{- $l := include "mailcow.netList" (list "mail.proxyTrustedNetworks" .Values.mail.proxyTrustedNetworks) | fromJsonArray -}}
 {{- if not $l -}}
-{{- fail `mail.proxyProtocol is true, so mail.proxyTrustedNetworks is required: the source addresses the PROXY-protocol connections reach the postfix/dovecot pods from, and nothing wider. postfix's PROXY listeners trust any PROXY header, so whoever can connect from these ranges can claim any client address (including one in mailcow.networks = open relay). Use the load balancer's own addresses (IP-target LBs such as AWS NLB ip mode: its subnet/private IPs), or the node addresses when the LB targets node ports with externalTrafficPolicy Cluster (then firewall the node ports so only the LB reaches them). Never the pod CIDR. Set mail.proxyProtocol=false when nothing in front sends PROXY headers. README "Security".` -}}
+{{- fail `mail.proxyProtocol is true, so mail.proxyTrustedNetworks is required: the source addresses the PROXY-protocol connections reach the postfix/dovecot pods from, and nothing wider. postfix's PROXY listeners trust any PROXY header, so whoever can connect from these ranges can claim any client address (including one in mailcow.networks = open relay). Use the load balancer's own addresses: for IP-target LBs (AWS NLB ip mode) its subnet/private IPs; for LBs that target node ports set mail.service.externalTrafficPolicy=Local, then the pods see the LB's addresses (with Cluster they see a SNAT address, often inside the pod CIDR, that every client reaching a node port shares). Never the pod CIDR. Set mail.proxyProtocol=false when nothing in front sends PROXY headers. README "Security".` -}}
 {{- end -}}
 {{- toJson $l -}}
 {{- else -}}
@@ -270,6 +270,7 @@ true
 {{- define "mailcow.redisTls" -}}
 {{- if .Values.externalRedis.tls.enabled -}}
 {{- if not .Values.externalRedis.enabled -}}{{- fail "externalRedis.tls.enabled needs externalRedis.enabled (TLS to the bundled redis StatefulSet is not supported)" -}}{{- end -}}
+{{- if lt (int .Values.externalRedis.tls.maxChildren) 1 -}}{{- fail "externalRedis.tls.maxChildren must be at least 1" -}}{{- end -}}
 true
 {{- end -}}
 {{- end -}}
@@ -852,7 +853,8 @@ socat verifies the server certificate against the relay CA and the Service FQDN 
 
 {{/* ---------- probes ---------- */}}
 {{/* include "mailcow.probes" (dict "handler" (dict "exec" (dict "command" (list ...))) "startup" 60 "ready" 20 "live" 30 "timeout" 5)
-startup = failureThreshold * 10s; ready/live = periodSeconds (default 10/20); timeout for startup/readiness */}}
+startup = failureThreshold * 10s; ready/live = periodSeconds (default 10/20); timeout for startup/readiness;
+optional readyHandler replaces handler for readiness only */}}
 {{- define "mailcow.probes" -}}
 {{- $h := toYaml .handler -}}
 startupProbe:
@@ -863,7 +865,7 @@ startupProbe:
   {{- end }}
   failureThreshold: {{ .startup | default 60 }}
 readinessProbe:
-  {{- $h | nindent 2 }}
+  {{- toYaml (.readyHandler | default .handler) | nindent 2 }}
   periodSeconds: {{ .ready | default 10 }}
   {{- with .timeout }}
   timeoutSeconds: {{ . }}

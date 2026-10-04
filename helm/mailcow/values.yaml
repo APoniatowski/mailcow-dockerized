@@ -275,10 +275,10 @@ mail:
   # preserved only on the node that has the pod).
   proxyProtocol: false
   # -- REQUIRED with proxyProtocol: list of addresses/CIDRs the PROXY connections reach the pods from,
-  # and nothing wider: the load balancer's own (private) addresses for IP-target LBs (e.g. AWS NLB in ip
-  # mode: its subnets), the node addresses when the LB targets node ports with externalTrafficPolicy
-  # Cluster (kube-proxy SNATs to the node; then firewall the node ports so only the LB reaches them).
-  # Never the pod CIDR. Becomes dovecot's haproxy_trusted_networks and the ONLY source allowed on the
+  # and nothing wider: the load balancer's own (private) addresses, for IP-target LBs (e.g. AWS NLB in
+  # ip mode: its subnets) and for LBs targeting node ports with service.externalTrafficPolicy Local
+  # (recommended). With Cluster kube-proxy SNATs to the node's or (many CNIs) a pod-CIDR bridge/tunnel
+  # address that every client reaching a node port shares. Never the pod CIDR. Becomes dovecot's haproxy_trusted_networks and the ONLY source allowed on the
   # PROXY ports by the (then always rendered) postfix/dovecot NetworkPolicies: postfix trusts any PROXY
   # header, so anyone connecting from these ranges can claim any client address (open relay with an
   # address from mailcow.networks). README "Security". e.g. [10.0.0.0/16]
@@ -300,8 +300,8 @@ mail:
     # for LBs that send traffic straight to pod IPs (e.g. AWS NLB ip targets, MetalLB L2/BGP): fewer
     # node ports reachable around the LB. Instance-mode cloud LBs need the node ports.
     allocateLoadBalancerNodePorts: null
-    # -- externalTrafficPolicy override ("" = Cluster with proxyProtocol, Local without). NodePort and
-    # LoadBalancer only.
+    # -- externalTrafficPolicy override ("" = Local). NodePort and LoadBalancer only. Local keeps the
+    # client address (plain ports) or the LB's own address (PROXY); Cluster SNATs node-port traffic.
     externalTrafficPolicy: ""
     # -- Fixed nodePorts (NodePort/LoadBalancer), keyed smtp/smtps/submission/imap/imaps/pop3/pop3s/sieve.
     nodePorts: {}
@@ -480,10 +480,15 @@ externalRedis:
     insecureSkipVerify: false
     # -- Relay pods (a PodDisruptionBudget is added above 1).
     replicas: 1
-    # -- Resources of each relay pod.
+    # -- Concurrent client connections per relay pod (socat max-children; one ~5 MiB process each).
+    # Connections beyond it wait until one closes: keep it above the release's long-lived connections
+    # and times ~5 MiB below the memory limit.
+    maxChildren: 40
+    # -- Resources of each relay pod. Release start-up peaked at ~120 MiB (one process per connection),
+    # steady state 6-14 MiB.
     resources:
-      requests: {cpu: 5m, memory: 8Mi}
-      limits: {memory: 64Mi}
+      requests: {cpu: 5m, memory: 32Mi}
+      limits: {memory: 256Mi}
 
 redis:
   image:

@@ -1,6 +1,7 @@
 # External MySQL and Redis over TLS: ProxySQL (db-tls, 2 replicas + PDB, CA-verified chain, client
 # certificate, announced server version) for a DNS database host on 3307, and the socat relay (redis-tls)
-# for an IPv6 Redis on 6380 with its own CA, a server name for the certificate check and mutual TLS;
+# for an IPv6 Redis on 6380 with its own CA, a server name for the certificate check, mutual TLS and a
+# larger connection cap;
 # egress policies on.
 mailcow:
   networks: 10.244.0.0/16,fd00:10:244::/56
@@ -25,6 +26,10 @@ externalRedis:
     caSecret: mailcow-redis-ca
     serverName: redis.cache.example.org
     clientCertSecret: mailcow-redis-client
+    maxChildren: 80
+    resources:
+      requests: {cpu: 5m, memory: 32Mi}
+      limits: {memory: 512Mi}
 
 networkPolicy:
   egress:

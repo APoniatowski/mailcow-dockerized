@@ -1,7 +1,10 @@
 {{- /*
 In-cluster Services: every compose alias and every container name (*-mailcow) gets a ClusterIP
 Service, because mailcow code addresses both. Services of skipped components stay so the names
-resolve and connections fail fast. externalDatabase / externalRedis: `mysql`/`mysql-mailcow` and
+resolve; kube-proxy rejects connections to a Service without endpoints, but under networkPolicy.egress
+the ClusterIP is not DNATed and the policy drops them silently (clients wait for their timeout). So no
+client may keep addressing a skipped component: rspamd gets SKIP_OLEFY and, with skip.clamd, an
+antivirus override (configmap.yaml); nginx and watchdog read SKIP_SOGO / SKIP_CLAMD / SKIP_OLEFY. externalDatabase / externalRedis: `mysql`/`mysql-mailcow` and
 `redis`/`redis-mailcow` alias the external host instead (mailcow.externalServices), or with `tls.enabled`
 select the TLS proxy pods (component db-tls / redis-tls).
 [component, alias, ports [name port protocol]]

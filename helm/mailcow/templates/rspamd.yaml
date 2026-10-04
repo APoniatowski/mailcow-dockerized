@@ -70,7 +70,11 @@ spec:
         {{- $slices := list "hooks/rspamd" "conf/rspamd/override.d" "conf/rspamd/local.d" "conf/rspamd/plugins.d" "conf/rspamd/lua" "conf/rspamd/rspamd.conf.local" "conf/rspamd/rspamd.conf.override" }}
         {{- $shared := list (dict "dir" "rspamd-custom" "src" "conf/rspamd/custom") }}
         {{- /* UI password (dockerapi rspamd/worker_password writes it in one pod, then restarts the Deployment) */}}
-        {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "touch" (list "rspamd-override/worker-controller-password.inc")) | nindent 8 }}
+        {{- $appends := list }}
+        {{- if .Values.skip.clamd }}
+        {{- $appends = append $appends (dict "key" "rspamd-antivirus.conf" "dst" "conf/rspamd/override.d/antivirus.conf") }}
+        {{- end }}
+        {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "touch" (list "rspamd-override/worker-controller-password.inc") "appends" $appends) | nindent 8 }}
         # controller unix socket -> TCP 11335 with mutual TLS, for the rspamd-sock sidecars of php-fpm,
         # dovecot, postfix (and watchdog): clients need a certificate signed by the relay CA. Probe without
         # connecting: every connection reaches the controller, which logs an EOF error for a bare connect.
@@ -120,6 +124,10 @@ spec:
             {{- include "mailcow.env.redis" . | nindent 12 }}
             - name: SPAMHAUS_DQS_KEY
               value: {{ .Values.mailcow.spamhausDqsKey | quote }}
+            # read by the entrypoint (external_services.conf), not passed by compose: without it rspamd keeps
+            # scanning Office parts through the endpoint-less olefy Service (timeout 20 s, 1 retransmit)
+            - name: SKIP_OLEFY
+              value: {{ include "mailcow.yn" .Values.skip.olefy | quote }}
             - name: MAILCOW_NETWORKS
               value: {{ include "mailcow.networks" . | quote }}
             # unset, the entrypoint resolves `dovecot`/`rspamd` with dig in a loop (no search domains)

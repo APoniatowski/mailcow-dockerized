@@ -137,9 +137,17 @@ spec:
           ports:
             - name: mysql
               containerPort: 3306
-          # SELECT 1 on the local admin interface: a bare TCP connect to 3306 logs an "unhealthy client" warning
+          env:
+            - name: DBUSER
+              value: {{ .Values.mailcow.dbUser | quote }}
+            {{- include "mailcow.secretEnv" (list . "DBPASS" "DBPASS") | nindent 12 }}
+          # startup/liveness: SELECT 1 on the local admin interface (a bare TCP connect to 3306 logs an
+          # "unhealthy client" warning). Readiness: a query as DBUSER through 3306, which ProxySQL forwards
+          # to the server, so a pod that cannot reach it (down, TLS or credentials rejected) leaves the
+          # Service; liveness stays local, a database outage does not restart the proxy.
           {{- $probe := `MYSQL_PWD=$(sed -n 's/^ *admin_credentials="admin:\(.*\)"$/\1/p' /etc/proxysql/proxysql.cnf) exec mariadb -h 127.0.0.1 -P 6032 -u admin -N -e 'SELECT 1'` }}
-          {{- include "mailcow.probes" (dict "handler" (dict "exec" (dict "command" (list "sh" "-c" $probe))) "startup" 12 "timeout" 5) | nindent 10 }}
+          {{- $ready := `MYSQL_PWD="${DBPASS}" exec mariadb -h 127.0.0.1 -P 3306 -u "${DBUSER}" --connect-timeout=3 -N -e 'SELECT VERSION()' >/dev/null` }}
+          {{- include "mailcow.probes" (dict "handler" (dict "exec" (dict "command" (list "sh" "-c" $probe))) "readyHandler" (dict "exec" (dict "command" (list "sh" "-c" $ready))) "startup" 12 "timeout" 5) | nindent 10 }}
           volumeMounts:
             - name: config
               mountPath: /etc/proxysql
