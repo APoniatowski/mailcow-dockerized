@@ -1,0 +1,157 @@
+name: Build mailcow files image
+
+# Files image of the Helm chart (helm/mailcow/files-image): the tracked files of data/web, data/conf,
+# data/assets and data/hooks. Built from `git archive HEAD`, so the build context holds tracked files only.
+# Published as ghcr.io/<owner>/mailcow-files:
+#   push to master/staging -> :<branch> and :sha-<short sha>
+#   release tag (2026-09, 2026-09a, ...) -> :<tag> (= Chart appVersion, the chart's default image tag)
+#   workflow_dispatch -> the tags of the selected branch or tag
+# Pull requests build both platforms without pushing.
+
+on:
+  pull_request:
+    paths:
+      - "data/web/**"
+      - "data/conf/**"
+      - "data/assets/**"
+      - "data/hooks/**"
+      - "helm/mailcow/files-image/**"
+      - ".github/workflows/files_image.yml"
+  push:
+    branches: [ "master", "staging" ]
+    tags:
+      - "[0-9][0-9][0-9][0-9]-[0-9][0-9]"
+      - "[0-9][0-9][0-9][0-9]-[0-9][0-9][a-z]"
+  workflow_dispatch:
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  DOCKERFILE: helm/mailcow/files-image/Dockerfile
+  PLATFORMS: linux/amd64,linux/arm64
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Export tracked files
+        run: |
+          ctx="$RUNNER_TEMP/files-image-context"
+          mkdir -p "$ctx"
+          git archive --format=tar HEAD | tar -x -C "$ctx"
+          echo "CONTEXT=$ctx" >> "$GITHUB_ENV"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.CONTEXT }}
+          file: ${{ env.CONTEXT }}/${{ env.DOCKERFILE }}
+          platforms: ${{ env.PLATFORMS }}
+          push: false
+          build-args: |
+            MAILCOW_COMMIT=${{ github.event.pull_request.head.sha }}
+            MAILCOW_BRANCH=${{ github.head_ref }}
+
+  publish:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # to fetch code (actions/checkout)
+      packages: write # to push to ghcr.io
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # tags, for the release shown in the UI on branch builds
+
+      - name: Prepare
+        id: prep
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # GHCR repository names must be lowercase
+          echo "image=ghcr.io/${OWNER,,}/mailcow-files" >> "$GITHUB_OUTPUT"
+          if [ "$REF_TYPE" = "tag" ]; then
+            version="$REF_NAME"
+            branch=master
+          else
+            version=$(git describe --tags --abbrev=0 HEAD 2>/dev/null || echo dev)
+            branch="$REF_NAME"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          ctx="$RUNNER_TEMP/files-image-context"
+          mkdir -p "$ctx"
+          git archive --format=tar HEAD | tar -x -C "$ctx"
+          echo "CONTEXT=$ctx" >> "$GITHUB_ENV"
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ${{ steps.prep.outputs.image }}
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-,format=short,enable=${{ github.ref_type == 'branch' }}
+          labels: |
+            org.opencontainers.image.title=mailcow-files
+            org.opencontainers.image.description=mailcow data/web, data/conf, data/assets and data/hooks for the mailcow Helm chart
+          annotations: |
+            org.opencontainers.image.title=mailcow-files
+            org.opencontainers.image.description=mailcow data/web, data/conf, data/assets and data/hooks for the mailcow Helm chart
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.CONTEXT }}
+          file: ${{ env.CONTEXT }}/${{ env.DOCKERFILE }}
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            MAILCOW_VERSION=${{ steps.prep.outputs.version }}
+            MAILCOW_COMMIT=${{ github.sha }}
+            MAILCOW_BRANCH=${{ steps.prep.outputs.branch }}
