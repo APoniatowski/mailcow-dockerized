@@ -77,7 +77,13 @@ while pending=$(not_ready) && [ -n "$pending" ] && [ "$(date +%s)" -lt "$deadlin
 if [ -z "$pending" ]; then ok "all pods Ready"; else ko "pods not Ready: $(tr '\n' ' ' <<<"$pending")"; fi
 
 # 2
-code=$(curl_ -o /dev/null -w '%{http_code}' "https://$HOST:30443/")
+# pods turn Ready a few seconds before kube-proxy/the CNI serve their node ports (externalTrafficPolicy
+# Local): give the UI up to 90 s before the API-driven checks
+for _ in $(seq 1 30); do
+  code=$(curl_ -o /dev/null -w '%{http_code}' "https://$HOST:30443/")
+  [ "$code" = 200 ] && break
+  sleep 3
+done
 [ "$code" = 200 ] && ok "web UI 200" || ko "web UI http $code"
 
 # 3
