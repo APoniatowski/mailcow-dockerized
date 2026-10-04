@@ -48,6 +48,37 @@ spec:
       {{- end }}
       initContainers:
         {{- include "mailcow.seedInit" (dict "root" . "slices" (list "hooks/postfix" "conf/postfix") "appends" (list (dict "key" "postfix-k8s.cf" "dst" "conf/postfix/extra.cf")) "ssl" true) | nindent 8 }}
+        # postfix's trivial-rewrite keeps answering "table lookup problem" when its first lookups hit a
+        # database whose tables php-fpm (init_db) has not created yet, until it is restarted: on a fresh
+        # install wait for init_db to record the schema version (compose has the same race, usually won
+        # by php-fpm)
+        - name: wait-schema
+          image: {{ include "mailcow.image" .Values.mysql.image }}
+          imagePullPolicy: {{ .Values.mysql.image.pullPolicy | default "IfNotPresent" }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until mariadb --skip-ssl -h "$DBHOST" -P "$DBPORT" -u "$DBUSER" -N "$DBNAME" \
+                  -e "SELECT version FROM versions WHERE application = 'db_schema'" 2>/dev/null | grep -q .; do
+                echo "waiting for the mailcow schema (php-fpm init_db)"; sleep 5
+              done
+          env:
+            {{- include "mailcow.env.db" . | nindent 12 }}
+            - name: MYSQL_PWD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mailcow.secretName" . }}
+                  key: DBPASS
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 5m, memory: 16Mi}
+            limits: {memory: 64Mi}
         {{- include "mailcow.rspamdSockSidecar" . | nindent 8 }}
         {{- if $reload }}
         {{- /* `postfix start` runs /usr/lib/postfix/sbin/master -w (comm "master"); HUP = postfix reload */}}
