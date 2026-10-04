@@ -1,0 +1,232 @@
+name: Helm chart end-to-end (kind)
+
+on:
+  pull_request:
+    paths:
+      - "helm/**"
+      - "data/Dockerfiles/**"
+      - ".github/workflows/helm_e2e.yml"
+  workflow_dispatch:
+    inputs:
+      services:
+        description: "data/Dockerfiles/<service> images to build from this ref (space separated, e.g. 'dovecot postfix'); others are pulled from ghcr.io"
+        required: false
+        default: ""
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+concurrency:
+  group: helm-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  KIND_VERSION: v0.33.0
+  KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+  KIND_NODE_IMAGE: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+  KUBECTL_VERSION: v1.37.1
+  KUBECTL_SHA256: 65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8
+  HELM_VERSION: v4.3.0
+  HELM_SHA256: 86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb
+  # files image reference expected by helm/mailcow/ci/kind-values.yaml (files.image)
+  FILES_IMAGE: localhost/mailcow-files:dev
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  images:
+    name: Build changed images
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # pull_request checks out the merge commit: HEAD^1 is the base branch tip
+          fetch-depth: 2
+
+      - name: Detect changed images
+        id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          SERVICES: ${{ inputs.services }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            if git rev-parse -q --verify HEAD^2 >/dev/null; then
+              base=HEAD^1
+            else
+              git fetch -q --depth=1 origin "$BASE_SHA"
+              base=$BASE_SHA
+            fi
+            mapfile -t candidates < <(git diff --name-only "$base" HEAD -- data/Dockerfiles | cut -d/ -f3 | sort -u)
+          else
+            read -ra candidates <<< "$SERVICES"
+          fi
+          build=()
+          for s in "${candidates[@]}"; do
+            case "$s" in
+              # clamd is skipped in ci/kind-values.yaml, netfilter is not shipped by the chart
+              clamd|netfilter) echo "skip $s: not deployed by the e2e test"; continue ;;
+            esac
+            [ -f "data/Dockerfiles/$s/Dockerfile" ] || { echo "skip $s: no data/Dockerfiles/$s/Dockerfile"; continue; }
+            # the tag docker-compose.yml pins (= the chart's default, enforced by check-tags.sh)
+            ref=$(grep -Eo "image: *ghcr.io/mailcow/$s:[^[:space:]]+" docker-compose.yml | head -1 | awk '{print $2}' || true)
+            [ -n "$ref" ] || { echo "skip $s: no ghcr.io/mailcow/$s image in docker-compose.yml"; continue; }
+            build+=("$s=$ref")
+          done
+          echo "images to build: ${build[*]:-none}"
+          echo "build=${build[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space
+        if: steps.detect.outputs.build != ''
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/powershell
+          docker image prune -af >/dev/null
+          df -h /
+
+      - name: Build images
+        env:
+          BUILD: ${{ steps.detect.outputs.build }}
+        run: |
+          refs=()
+          for item in $BUILD; do
+            s=${item%%=*}
+            ref=${item#*=}
+            echo "::group::docker build $ref (data/Dockerfiles/$s)"
+            docker build -t "$ref" "data/Dockerfiles/$s"
+            echo "::endgroup::"
+            refs+=("$ref")
+            docker builder prune -af >/dev/null
+          done
+          echo "::group::docker build $FILES_IMAGE (helm/mailcow/files-image)"
+          docker build -f helm/mailcow/files-image/Dockerfile \
+            --build-arg MAILCOW_VERSION=ci \
+            --build-arg MAILCOW_COMMIT="$GITHUB_SHA" \
+            -t "$FILES_IMAGE" .
+          echo "::endgroup::"
+          refs+=("$FILES_IMAGE")
+          mkdir -p "$RUNNER_TEMP/e2e-images"
+          printf '%s\n' "${refs[@]}" > "$RUNNER_TEMP/e2e-images/images.txt"
+          docker save -o "$RUNNER_TEMP/e2e-images/images.tar" "${refs[@]}"
+          ls -lh "$RUNNER_TEMP/e2e-images"
+          df -h /
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: e2e-images
+          path: ${{ runner.temp }}/e2e-images
+          retention-days: 1
+          compression-level: 1
+
+  e2e:
+    name: e2e (${{ matrix.name }})
+    needs: images
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: kind
+            values: helm/mailcow/ci/kind-values.yaml
+          - name: kind + scale
+            values: helm/mailcow/ci/kind-values.yaml helm/mailcow/ci/scale-values.yaml
+    env:
+      KUBE_CONTEXT: kind-mailcow
+      NS: mailcow
+      RELEASE: mailcow
+      VALUES: ${{ matrix.values }}
+      LEG: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/powershell
+          docker image prune -af >/dev/null
+          df -h /
+          free -h
+
+      - name: Install kind, kubectl and helm
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP"
+          curl -fsSLo bin/kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  bin/kind" | sha256sum -c -
+          curl -fsSLo bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  bin/kubectl" | sha256sum -c -
+          curl -fsSLo helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tar.gz" | sha256sum -c -
+          tar -xzf helm.tar.gz -C bin --strip-components=1 linux-amd64/helm
+          chmod +x bin/kind bin/kubectl
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Create kind cluster
+        run: |
+          kind create cluster --config helm/mailcow/ci/e2e/kind-config.yaml --image "$KIND_NODE_IMAGE" --wait 180s
+          kubectl --context "$KUBE_CONTEXT" get nodes -o wide
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: e2e-images
+          path: ${{ runner.temp }}/e2e-images
+
+      - name: Load locally built images into kind
+        run: |
+          cat "$RUNNER_TEMP/e2e-images/images.txt"
+          kind load image-archive "$RUNNER_TEMP/e2e-images/images.tar" --name mailcow
+          rm -rf "$RUNNER_TEMP/e2e-images"
+          df -h /
+
+      - name: Install chart
+        run: |
+          args=()
+          for f in $VALUES; do args+=(-f "$f"); done
+          helm upgrade --install "$RELEASE" helm/mailcow --kube-context "$KUBE_CONTEXT" \
+            -n "$NS" --create-namespace "${args[@]}" --wait --timeout 20m
+
+      - name: Smoke test
+        run: |
+          set -o pipefail
+          helm/mailcow/ci/e2e/smoke.sh 2>&1 | tee "$RUNNER_TEMP/smoke.log"
+
+      - name: Upgrade in place (pre-upgrade hooks)
+        run: |
+          args=()
+          for f in $VALUES; do args+=(-f "$f"); done
+          helm upgrade "$RELEASE" helm/mailcow --kube-context "$KUBE_CONTEXT" \
+            -n "$NS" "${args[@]}" --wait --timeout 15m
+          kubectl --context "$KUBE_CONTEXT" -n "$NS" get pods -o wide
+
+      - name: Test summary
+        if: always()
+        run: |
+          [ -f "$RUNNER_TEMP/smoke.log" ] || exit 0
+          {
+            echo "### mailcow chart e2e: $LEG"
+            echo '```text'
+            sed -n '/^== summary/,$p' "$RUNNER_TEMP/smoke.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect diagnostics
+        if: failure()
+        run: |
+          out="$RUNNER_TEMP/diagnostics"
+          helm/mailcow/ci/e2e/collect-logs.sh "$out" || true
+          cp "$RUNNER_TEMP/smoke.log" "$out/" 2>/dev/null || true
+          df -h / > "$out/runner-disk.txt"
+          free -h > "$out/runner-memory.txt"
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: e2e-diagnostics-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/diagnostics
+          retention-days: 7

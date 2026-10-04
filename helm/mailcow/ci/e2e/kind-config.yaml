@@ -1,0 +1,22 @@
+# kind cluster for the chart's end-to-end test (.github/workflows/helm_e2e.yml, ci/e2e/smoke.sh).
+# Single node; pod/service CIDRs, cluster DNS and the unbound ClusterIP match ci/kind-values.yaml.
+# Host ports 127.0.0.1:<port> -> NodePort <port>: 30080 http, 30443 https, 30025 smtp, 30465 smtps,
+# 30587 submission, 30143 imap, 30993 imaps, 32190 sieve.
+#   kind create cluster --config helm/mailcow/ci/e2e/kind-config.yaml   (context: kind-mailcow)
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: mailcow
+networking:
+  podSubnet: 10.244.0.0/16
+  serviceSubnet: 10.96.0.0/16
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - {containerPort: 30080, hostPort: 30080, listenAddress: 127.0.0.1, protocol: TCP}
+      - {containerPort: 30443, hostPort: 30443, listenAddress: 127.0.0.1, protocol: TCP}
+      - {containerPort: 30025, hostPort: 30025, listenAddress: 127.0.0.1, protocol: TCP}
+      - {containerPort: 30465, hostPort: 30465, listenAddress: 127.0.0.1, protocol: TCP}
+      - {containerPort: 30587, hostPort: 30587, listenAddress: 127.0.0.1, protocol: TCP}
+      - {containerPort: 30143, hostPort: 30143, listenAddress: 127.0.0.1, protocol: TCP}
+      - {containerPort: 30993, hostPort: 30993, listenAddress: 127.0.0.1, protocol: TCP}
+      - {containerPort: 32190, hostPort: 32190, listenAddress: 127.0.0.1, protocol: TCP}
