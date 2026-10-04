@@ -62,16 +62,19 @@ echo "== mailcow kubernetes smoke $(date -u +%FT%TZ)  release=$RELEASE ns=$NS ho
 K get pods -o wide
 
 # 1
-# Job pods (CronJobs, backups, hooks) finish and never turn Ready: wait for the long-running ones
-if K wait --for=condition=Ready pod \
-     -l "$SEL,app.kubernetes.io/component notin (cron,tls-bootstrap,backup)" \
-     --field-selector=status.phase!=Succeeded,status.phase!=Failed \
-     --timeout=600s >/dev/null 2>&1; then
-  ok "all pods Ready"
-else
-  ko "pods not Ready: $(K get pods -l "$SEL" --no-headers 2>/dev/null \
-    | awk '{split($2,r,"/"); if ($3 != "Completed" && ($3 != "Running" || r[1] != r[2])) printf "%s(%s %s) ", $1, $2, $3}')"
-fi
+# Job pods (CronJobs, backups, hooks) finish and never turn Ready, and pods being replaced (a rollout
+# restart triggered through dockerapi, e.g. rspamd after the SpamAssassin rules load) terminate:
+# poll until every other release pod is Ready
+not_ready() {
+  K get pods -l "$SEL,app.kubernetes.io/component notin (cron,tls-bootstrap,backup)" -o json 2>/dev/null \
+    | jq -r '.items[] | select(.metadata.deletionTimestamp == null)
+        | select(.status.phase != "Succeeded" and .status.phase != "Failed")
+        | select([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 0)
+        | .metadata.name'
+}
+deadline=$(( $(date +%s) + 600 ))
+while pending=$(not_ready) && [ -n "$pending" ] && [ "$(date +%s)" -lt "$deadline" ]; do sleep 5; done
+if [ -z "$pending" ]; then ok "all pods Ready"; else ko "pods not Ready: $(tr '\n' ' ' <<<"$pending")"; fi
 
 # 2
 code=$(curl_ -o /dev/null -w '%{http_code}' "https://$HOST:30443/")
