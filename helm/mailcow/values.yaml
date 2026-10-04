@@ -664,6 +664,102 @@ cronjobs:
     dovecot-fts: {enabled: true, schedule: "0 0 * * *"}
     dovecot-repl-health: {enabled: true, schedule: "*/5 * * * *"}
 
+# Scheduled backups (helper-scripts/backup_and_restore.sh equivalent): one CronJob per group (mysql,
+# redis, mail = crypt + vmail, rspamd, postfix, sogo), all on `schedule`, writing into the same
+# <backup PVC>/mailcow-YYYY-MM-DD-HH-MM-SS/ directory (UTC, the scheduled time) with mailcow's archive
+# names (backup_vmail.tar.zst, ...). Restore: scripts/restore.sh. README "Backup and restore".
+backup:
+  # -- Render the backup CronJobs and the backup PVC.
+  enabled: false
+  # -- Cron schedule of every backup group (5 fields, in mailcow.tz). All groups share it: the directory
+  # name comes from the scheduled time, so one run lands in one directory.
+  schedule: "0 2 * * *"
+  # -- Delete backup directories older than this many days (24 h units, by the time in the directory
+  # name) at the end of each run. 0 = never.
+  retentionDays: 7
+  # -- Keep at most this many backup directories (newest first). 0 = no limit. Combines with retentionDays.
+  keep: 0
+  # -- zstd threads per archive (THREADS of backup_and_restore.sh).
+  threads: 1
+  # What to back up. Same sets as backup_and_restore.sh; vmail-index (rebuildable), clamd-db
+  # (re-downloaded), postfix-tlspol (cache) and the shared PVC (rspamd custom maps and global sieve
+  # filters are also in the database / re-seeded) are not backed up.
+  components:
+    # -- MariaDB: logical dump of mailcow.dbName as mailcow.dbUser (mariadb-dump --single-transaction),
+    # backup_mysql.sql.zst. Over the network: works with externalDatabase.
+    mysql: true
+    # -- Redis: RDB snapshot over the network (redis-cli --rdb), backup_redis.tar.zst (/redis/dump.rdb).
+    # Works with externalRedis when the server allows SYNC (many managed services do not).
+    redis: true
+    # -- crypt PVC (mail_crypt key pair), backup_crypt.tar.zst. WITHOUT IT STORED MAIL IS UNREADABLE.
+    crypt: true
+    # -- vmail PVC (all mailboxes), backup_vmail.tar.zst. Read from the live volume (like mailcow's script).
+    vmail: true
+    # -- rspamd PVC (/var/lib/rspamd + UI password), backup_rspamd.tar.zst.
+    rspamd: true
+    # -- postfix queue PVC, backup_postfix.tar.zst. Skipped with postfix.spoolPerPod (one queue per pod).
+    postfix: true
+    # -- sogo-backup PVC (SOGo's own nightly per-user exports), backup_sogo.tar.zst. Not in mailcow's script.
+    sogo: false
+  # Destination PVC `<fullname>-backup`, mounted by every backup Job. ReadWriteOnce (default): all
+  # backup Jobs must run on one node, so each also requires the dovecot pod's node; rspamd, postfix
+  # (and sogo) must then share that node too, or their Jobs stay Pending. Multi-node: ReadWriteMany or
+  # an existingClaim on RWX storage (NFS, CephFS, EFS). README "Backup and restore".
+  persistence:
+    # -- Size of the backup PVC (holds retentionDays/keep runs).
+    size: 50Gi
+    # -- accessMode (ReadWriteOnce or ReadWriteMany; ReadWriteOncePod cannot work: the Jobs run in parallel).
+    accessMode: ReadWriteOnce
+    # -- storageClass ("" = persistence.storageClass, "-" = none).
+    storageClass: ""
+    # -- Use an existing claim instead (e.g. NFS). Set accessMode to what it really is.
+    existingClaim: ""
+  image:
+    # -- Archiver image (Debian: GNU tar, zstd, pigz), the image backup_and_restore.sh runs.
+    repository: ghcr.io/mailcow/backup
+    # -- Tag (backup_and_restore.sh uses latest; scripts/check-tags.sh compares repository:tag).
+    tag: latest
+    # -- Digest pinned for the tag ("" = tag only).
+    digest: sha256:4ccba992011ef9a340e10587bbb7a0aaddfe3f91f3f61665c66bd4094e7475fb
+    # -- Pull policy.
+    pullPolicy: IfNotPresent
+  mysql:
+    # -- Image for mariadb-dump (falls back to mysqldump); empty repository = mysql.image. With an
+    # external server of a newer major version use a matching client image.
+    image:
+      repository: ""
+      tag: ""
+      pullPolicy: IfNotPresent
+  # -- successfulJobsHistoryLimit of every backup CronJob.
+  successfulJobsHistoryLimit: 1
+  # -- failedJobsHistoryLimit of every backup CronJob.
+  failedJobsHistoryLimit: 2
+  # -- Seconds a finished backup Job (and its log) is kept.
+  ttlSecondsAfterFinished: 86400
+  # -- A run missed by more than this (controller down) is skipped.
+  startingDeadlineSeconds: 3600
+  # -- A Job running (or Pending) longer is killed, so a stuck run cannot block the next ones (Forbid).
+  activeDeadlineSeconds: 21600
+  # -- Retries per Job (a retry writes into the same directory; archives are renamed into place when complete).
+  backoffLimit: 1
+  # -- Resources of every backup container.
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+  # -- Pod securityContext of the backup Jobs (e.g. supplementalGroups for NFS).
+  podSecurityContext: {}
+  # -- Container securityContext of the archiver and dump containers. Default: root with every capability
+  # dropped except DAC_READ_SEARCH (read mailboxes of any owner); writes need a root-writable destination
+  # (NFS root_squash: export with no_root_squash or replace this).
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    runAsNonRoot: false
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+      add: ["DAC_READ_SEARCH"]
+
 # Ingress NetworkPolicies (need a CNI that enforces them). Whatever `enabled` says, dockerapi :443 is
 # always limited to php-fpm, watchdog, acme and dovecot (unauthenticated exec API), and the rspamd
 # controller relay :11335 to php-fpm, dovecot, postfix and watchdog (unauthenticated controller access).

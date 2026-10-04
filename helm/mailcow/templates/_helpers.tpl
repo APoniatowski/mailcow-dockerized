@@ -848,6 +848,83 @@ spec:
 {{- end }}
 {{- end -}}
 
+{{/* ---------- backups ---------- */}}
+{{- define "mailcow.backupImage" -}}
+{{- $i := .Values.backup.image -}}
+{{- printf "%s:%s" $i.repository (toString $i.tag) -}}{{- with $i.digest -}}@{{ . }}{{- end -}}
+{{- end -}}
+
+{{/* env of every backup container; retention + info only for the group that runs mailcow.backupFinish.
+include "mailcow.backupEnv" (dict "root" . "group" "mail" "first" true) */}}
+{{- define "mailcow.backupEnv" -}}
+{{- $root := .root -}}
+{{- $b := $root.Values.backup -}}
+- name: JOB_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.labels['batch.kubernetes.io/job-name']
+- name: BACKUP_GROUP
+  value: {{ .group | quote }}
+- name: THREADS
+  value: {{ int $b.threads | quote }}
+{{- if .first }}
+- name: RETENTION_DAYS
+  value: {{ int $b.retentionDays | quote }}
+- name: KEEP
+  value: {{ int $b.keep | quote }}
+- name: BACKUP_INFO
+  value: |
+    # mailcow Helm chart backup. Not needed for a restore; the release Secret is NOT part of the backup.
+    release={{ $root.Release.Name }}
+    namespace={{ $root.Release.Namespace }}
+    chart={{ include "mailcow.chart" $root }}
+    app_version={{ $root.Chart.AppVersion }}
+    hostname={{ $root.Values.mailcow.hostname }}
+    dbname={{ $root.Values.mailcow.dbName }}
+    dbuser={{ $root.Values.mailcow.dbUser }}
+    external_database={{ $root.Values.externalDatabase.enabled }}
+    external_redis={{ $root.Values.externalRedis.enabled }}
+    mysql_image={{ include "mailcow.image" $root.Values.mysql.image }}
+    redis_image={{ include "mailcow.image" $root.Values.redis.image }}
+    dovecot_image={{ include "mailcow.image" $root.Values.dovecot.image }}
+{{- end }}
+{{- end -}}
+
+{{/* bash: sets $dir = /backup/mailcow-YYYY-MM-DD-HH-MM-SS (UTC). CronJob Jobs are named
+<cronjob>-<scheduled time in minutes since the epoch>, so every group of one run picks the same
+directory; any other Job name (kubectl create job --from=cronjob/...) uses the current time. */}}
+{{- define "mailcow.backupPrelude" -}}
+set -euo pipefail
+n="${JOB_NAME##*-}"
+if [[ "${n}" =~ ^[0-9]{8,10}$ ]]; then stamp=$(date -u -d "@$(( n * 60 ))" +%Y-%m-%d-%H-%M-%S)
+else stamp=$(date -u +%Y-%m-%d-%H-%M-%S); fi
+dir="/backup/mailcow-${stamp}"
+mkdir -p "${dir}"
+chmod 755 "${dir}"
+echo "backup ${BACKUP_GROUP} -> mailcow-${stamp}"
+{{- end -}}
+
+{{/* bash, first enabled group only: info file + retention (backup.retentionDays by the time in the
+directory name, backup.keep newest directories). Never touches the current directory. */}}
+{{- define "mailcow.backupFinish" -}}
+printf '%s' "${BACKUP_INFO}" > "${dir}/mailcow-helm.info"
+cd /backup
+mapfile -t runs < <(find . -mindepth 1 -maxdepth 1 -type d -name 'mailcow-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9]' -printf '%f\n' | sort)
+now=$(date -u +%s); i=0
+for d in "${runs[@]}"; do
+  i=$(( i + 1 ))
+  [ "${d}" = "mailcow-${stamp}" ] && continue
+  why=""
+  if [ "${KEEP}" -gt 0 ] && [ $(( ${#runs[@]} - i )) -ge "${KEEP}" ]; then why="more than ${KEEP} backups"; fi
+  if [ "${RETENTION_DAYS}" -gt 0 ]; then
+    t=${d#mailcow-}
+    t=$(date -u -d "${t:0:10} ${t:11:2}:${t:14:2}:${t:17:2}" +%s)
+    if [ $(( now - t )) -gt $(( RETENTION_DAYS * 86400 )) ]; then why="older than ${RETENTION_DAYS} days"; fi
+  fi
+  if [ -n "${why}" ]; then echo "prune ${d} (${why})"; rm -rf -- "/backup/${d}"; fi
+done
+{{- end -}}
+
 {{/* ---------- TLS reload sidecar ----------
 "true" when nginx, postfix and dovecot get the `tls-reload` sidecar: certificate from a Secret
 (cert-manager / existingSecret / self-signed) and tls.reload.enabled. With acme, the acme container

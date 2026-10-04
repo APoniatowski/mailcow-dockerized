@@ -3,7 +3,7 @@ name: mailcow
 description: mailcow-dockerized on Kubernetes (Postfix, Dovecot, Rspamd, SOGo, mailcow UI)
 type: application
 # Chart version (SemVer). Bump on every chart change.
-version: 0.7.1
+version: 0.8.0
 # mailcow release the files image (data/web, data/conf, data/assets) and image tags belong to.
 # Same value update.sh/generate_config.sh write to app_info.inc.php (latest upstream tag).
 appVersion: "2026-09"

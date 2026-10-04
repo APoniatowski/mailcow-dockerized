@@ -52,6 +52,30 @@ Checks:
   - Egress NetworkPolicies: release pods, kube-dns, the API server ({{ join ", " .Values.networkPolicy.egress.apiServerCIDRs }}) and
     everything outside {{ include "mailcow.egressClusterCIDRs" . | fromJsonArray | join "," }}. Other in-cluster targets need networkPolicy.egress.extraTo.
 {{- end }}
+{{- with .Values.backup }}{{ if .enabled }}
+  - Backups: CronJobs {{ include "mailcow.fullname" $ }}-backup-* at "{{ .schedule }}" ({{ $.Values.mailcow.tz }}) into PVC {{ .persistence.existingClaim | default (printf "%s-backup" (include "mailcow.fullname" $)) }}
+    (mailcow-<UTC time>/backup_*.tar.zst, backup_mysql.sql.zst; {{ if .retentionDays }}retention {{ .retentionDays }} days{{ else }}no age limit{{ end }}{{ if .keep }}, keep {{ .keep }}{{ end }}).
+    {{- if eq (toString .persistence.accessMode) "ReadWriteOnce" }}
+    {{- /* owners not already pinned to dovecot's node by an RWO shared PVC */}}
+    {{- $colo := include "mailcow.sharedColocate" $ }}
+    {{- $loose := list }}
+    {{- if and .components.rspamd (not $colo) }}{{ $loose = append $loose "rspamd" }}{{ end }}
+    {{- if and .components.postfix (not $.Values.postfix.spoolPerPod) (not (and $colo $.Values.acme.enabled)) }}{{ $loose = append $loose "postfix" }}{{ end }}
+    {{- if and .components.sogo (not $.Values.skip.sogo) }}{{ $loose = append $loose "sogo" }}{{ end }}
+    The backup PVC is ReadWriteOnce: every backup Job requires the dovecot pod's node.
+    {{- with $loose }}
+    {{ join ", " . }} must run there too, or their backup Jobs stay Pending (multi-node: backup.persistence.accessMode ReadWriteMany).
+    {{- end }}
+    {{- end }}
+    {{- if and .components.postfix $.Values.postfix.spoolPerPod }}
+    The postfix queue is not backed up (postfix.spoolPerPod: one queue per pod).
+    {{- end }}
+    {{- if not .components.crypt }}
+    WARNING: backup.components.crypt is off. Without the mail_crypt keys (crypt PVC) restored mail is unreadable.
+    {{- end }}
+    The release Secret {{ include "mailcow.secretName" $ }} is not part of the backups: export and keep it separately.
+    Restore: helm/mailcow/scripts/restore.sh (README "Backup and restore"). Test your restores.
+{{- end }}{{ end }}
   - dockerapi can exec into and delete every pod in namespace {{ .Release.Namespace }}: keep mailcow alone in it.
 {{- if include "mailcow.networkPolicy" . }}
   - NetworkPolicies are rendered; they only protect anything if your CNI enforces them.

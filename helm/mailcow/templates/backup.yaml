@@ -1,0 +1,288 @@
+{{- /*
+Scheduled backups, the CronJob form of helper-scripts/backup_and_restore.sh. One CronJob per group:
+the volume groups must run on the node that has their owner's ReadWriteOnce volume (required
+podAffinity), and those owners may sit on different nodes, so one pod cannot carry all of them.
+Every group writes into <backup PVC>/mailcow-YYYY-MM-DD-HH-MM-SS (UTC) derived from the Job name,
+which the CronJob controller sets to <cronjob>-<scheduled time in minutes since the epoch>: same
+schedule = same directory. Archive names and paths (tar -P, /vmail, /crypt, /redis, ...) are the
+script's. README "Backup and restore"; restore with scripts/restore.sh.
+*/ -}}
+{{- if .Values.backup.enabled }}
+{{- $root := . }}
+{{- $b := .Values.backup }}
+{{- $fullname := include "mailcow.fullname" . }}
+{{- $p := .Values.persistence }}
+{{- $comp := $b.components }}
+{{- if eq (toString $b.persistence.accessMode) "ReadWriteOncePod" }}
+{{- fail "backup.persistence.accessMode ReadWriteOncePod: the backup Jobs run in parallel and share the volume; use ReadWriteOnce or ReadWriteMany" }}
+{{- end }}
+{{- if or (lt (int $b.retentionDays) 0) (lt (int $b.keep) 0) }}
+{{- fail "backup.retentionDays and backup.keep must be >= 0" }}
+{{- end }}
+{{- $postfixOn := and $comp.postfix (not .Values.postfix.spoolPerPod) }}
+{{- $sogoOn := and $comp.sogo (not .Values.skip.sogo) }}
+{{- /* groups in run order; owners = components whose RWO volumes the group reads, vols = their accessModes */}}
+{{- $groups := list
+  (dict "name" "mysql" "on" $comp.mysql "owners" list "vols" list)
+  (dict "name" "redis" "on" $comp.redis "owners" list "vols" list)
+  (dict "name" "mail" "on" (or $comp.crypt $comp.vmail) "owners" (list "dovecot") "vols" (list $p.vmail.accessMode $p.crypt.accessMode))
+  (dict "name" "rspamd" "on" $comp.rspamd "owners" (list "rspamd") "vols" (list $p.rspamd.accessMode))
+  (dict "name" "postfix" "on" $postfixOn "owners" (list "postfix") "vols" (list $p.postfix.accessMode))
+  (dict "name" "sogo" "on" $sogoOn "owners" (list "sogo") "vols" (list $p.sogoBackup.accessMode)) }}
+{{- $first := "" }}
+{{- range $groups }}{{ if and .on (not $first) }}{{ $first = .name }}{{ end }}{{ end }}
+{{- if not $first }}
+{{- fail "backup.enabled but every backup.components entry is off (or skipped: postfix with postfix.spoolPerPod, sogo with skip.sogo)" }}
+{{- end }}
+{{- if not $b.persistence.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fullname }}-backup
+  labels:
+    {{- include "mailcow.commonLabels" . | nindent 4 }}
+    mailcow.email/volume: backup
+  {{- if $p.keep }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  accessModes:
+    - {{ $b.persistence.accessMode }}
+  {{- $sc := default $p.storageClass $b.persistence.storageClass }}
+  {{- if $sc }}
+  storageClassName: {{ if eq $sc "-" }}""{{ else }}{{ $sc }}{{ end }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $b.persistence.size }}
+{{- end }}
+{{- range $g := $groups }}
+{{- if $g.on }}
+{{- /* required node co-location: owners with an RWO volume; with an RWO backup PVC every group also
+       joins dovecot (the anchor: it always runs and holds the largest volume) */}}
+{{- $aff := list }}
+{{- range $g.vols }}
+{{- if eq (toString .) "ReadWriteOncePod" }}
+{{- fail (printf "backup group %s: a ReadWriteOncePod volume cannot be mounted by a second pod; turn the component off in backup.components or use ReadWriteOnce" $g.name) }}
+{{- end }}
+{{- if and (eq (toString .) "ReadWriteOnce") (not (has (index $g.owners 0) $aff)) }}{{ $aff = append $aff (index $g.owners 0) }}{{ end }}
+{{- end }}
+{{- if and (eq (toString $b.persistence.accessMode) "ReadWriteOnce") (not (has "dovecot" $aff)) }}{{ $aff = append $aff "dovecot" }}{{ end }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $fullname }}-backup-{{ $g.name }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" $root "component" "backup") | nindent 4 }}
+    mailcow.email/backup-group: {{ $g.name }}
+spec:
+  schedule: {{ $b.schedule | quote }}
+  timeZone: {{ $root.Values.mailcow.tz | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: {{ int $b.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ int $b.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ int $b.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ int $b.backoffLimit }}
+      activeDeadlineSeconds: {{ int $b.activeDeadlineSeconds }}
+      ttlSecondsAfterFinished: {{ int $b.ttlSecondsAfterFinished }}
+      template:
+        metadata:
+          labels:
+            {{- include "mailcow.selectorLabels" (dict "root" $root "component" "backup") | nindent 12 }}
+            mailcow.email/backup-group: {{ $g.name }}
+          {{- with $root.Values.podDefaults.annotations }}
+          annotations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          {{- with $b.podSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- include "mailcow.podCommon" (dict "root" $root) | nindent 10 }}
+          {{- with $aff }}
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                {{- range . }}
+                - topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      {{- include "mailcow.selectorLabels" (dict "root" $root "component" .) | nindent 22 }}
+                {{- end }}
+          {{- end }}
+          {{- if eq $g.name "redis" }}
+          initContainers:
+            # RDB snapshot over the replication protocol into /redis/dump.rdb (the archive then has
+            # mailcow's layout: backup_and_restore.sh tars the redis volume after SAVE)
+            - name: redis-dump
+              image: {{ include "mailcow.image" $root.Values.redis.image }}
+              imagePullPolicy: {{ $root.Values.redis.image.pullPolicy }}
+              command: ["redis-cli"]
+              args: ["-h", "redis-mailcow", "-p", "6379", "--no-auth-warning", "--rdb", "/redis/dump.rdb"]
+              env:
+                {{- include "mailcow.secretEnv" (list $root "REDISCLI_AUTH" "REDISPASS") | nindent 16 }}
+              securityContext:
+                {{- toYaml $b.securityContext | nindent 16 }}
+              volumeMounts:
+                - name: work
+                  mountPath: /redis
+              resources:
+                {{- toYaml $b.resources | nindent 16 }}
+          {{- end }}
+          containers:
+            {{- if eq $g.name "mysql" }}
+            {{- $img := $root.Values.mysql.image }}
+            {{- if $b.mysql.image.repository }}{{ $img = $b.mysql.image }}{{ end }}
+            - name: backup
+              image: {{ include "mailcow.image" $img }}
+              imagePullPolicy: {{ $img.pullPolicy | default "IfNotPresent" }}
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  {{- include "mailcow.backupPrelude" $root | nindent 18 }}
+                  dump=$(command -v mariadb-dump || command -v mysqldump)
+                  if command -v zstd >/dev/null; then out=backup_mysql.sql.zst; comp=(zstd -q --rsyncable "-T${THREADS}")
+                  else out=backup_mysql.sql.gz; comp=(gzip); fi
+                  # logical dump of DBNAME only (no CREATE DATABASE, no mysql.* grants): restores into
+                  # any server/release as DBUSER; --single-transaction = consistent InnoDB snapshot, no locks
+                  "${dump}" -h mysql -P "${DBPORT}" -u "${DBUSER}" --single-transaction --routines --triggers \
+                    --events --hex-blob --default-character-set=utf8mb4 --max-allowed-packet=1G "${DBNAME}" \
+                    | "${comp[@]}" > "${dir}/.${out}.tmp"
+                  mv -f "${dir}/.${out}.tmp" "${dir}/${out}"
+                  echo "${out}: $(du -h "${dir}/${out}" | cut -f1)"
+                  {{- if eq $first $g.name }}
+                  {{- include "mailcow.backupFinish" $root | nindent 18 }}
+                  {{- end }}
+              env:
+                {{- include "mailcow.backupEnv" (dict "root" $root "group" $g.name "first" (eq $first $g.name)) | nindent 16 }}
+                - name: DBNAME
+                  value: {{ $root.Values.mailcow.dbName | quote }}
+                - name: DBUSER
+                  value: {{ $root.Values.mailcow.dbUser | quote }}
+                - name: DBPORT
+                  value: {{ include "mailcow.dbPort" $root | quote }}
+                {{- include "mailcow.secretEnv" (list $root "MYSQL_PWD" "DBPASS") | nindent 16 }}
+            {{- else }}
+            - name: backup
+              image: {{ include "mailcow.backupImage" $root }}
+              imagePullPolicy: {{ $b.image.pullPolicy }}
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  {{- include "mailcow.backupPrelude" $root | nindent 18 }}
+                  # archive <file> <path>...: backup_and_restore.sh's tar call; written as .<file>.tmp and renamed
+                  # when complete. Exit 1 = files changed/vanished while read (live maildir): kept, logged.
+                  archive() {
+                    local name=$1 rc=0; shift
+                    tar --warning='no-file-ignored' --use-compress-program="zstd --rsyncable -T${THREADS}" \
+                      -Pcpf "${dir}/.${name}.tmp" "$@" || rc=$?
+                    if [ "${rc}" -gt 1 ]; then echo "${name}: tar failed (${rc})"; exit "${rc}"; fi
+                    mv -f "${dir}/.${name}.tmp" "${dir}/${name}"
+                    echo "${name}: $(du -h "${dir}/${name}" | cut -f1)$( [ "${rc}" -eq 1 ] && echo ', some files changed while read')"
+                  }
+                  {{- if eq $g.name "redis" }}
+                  archive backup_redis.tar.zst /redis
+                  {{- else if eq $g.name "mail" }}
+                  {{- if $comp.crypt }}
+                  # mail_crypt key pair first: without it every stored message is unreadable
+                  archive backup_crypt.tar.zst /crypt
+                  {{- end }}
+                  {{- if $comp.vmail }}
+                  archive backup_vmail.tar.zst /vmail
+                  {{- end }}
+                  {{- else if eq $g.name "rspamd" }}
+                  # architecture marker, checked by the restore (rspamd data is not portable across arches)
+                  touch "${dir}/.$(uname -m)"
+                  archive backup_rspamd.tar.zst /rspamd /rspamd_override
+                  {{- else if eq $g.name "postfix" }}
+                  archive backup_postfix.tar.zst /postfix
+                  {{- else if eq $g.name "sogo" }}
+                  archive backup_sogo.tar.zst /sogo_backup
+                  {{- end }}
+                  {{- if eq $first $g.name }}
+                  {{- include "mailcow.backupFinish" $root | nindent 18 }}
+                  {{- end }}
+              env:
+                {{- include "mailcow.backupEnv" (dict "root" $root "group" $g.name "first" (eq $first $g.name)) | nindent 16 }}
+            {{- end }}
+              securityContext:
+                {{- toYaml $b.securityContext | nindent 16 }}
+              volumeMounts:
+                - name: backup
+                  mountPath: /backup
+                {{- if eq $g.name "redis" }}
+                - name: work
+                  mountPath: /redis
+                  readOnly: true
+                {{- else if eq $g.name "mail" }}
+                {{- if $comp.crypt }}
+                - name: crypt
+                  mountPath: /crypt
+                  readOnly: true
+                {{- end }}
+                {{- if $comp.vmail }}
+                - name: vmail
+                  mountPath: /vmail
+                  readOnly: true
+                {{- end }}
+                {{- else if eq $g.name "rspamd" }}
+                - name: rspamd
+                  subPath: data
+                  mountPath: /rspamd
+                  readOnly: true
+                - name: rspamd
+                  subPath: override
+                  mountPath: /rspamd_override
+                  readOnly: true
+                {{- else if eq $g.name "postfix" }}
+                - name: spool
+                  mountPath: /postfix
+                  readOnly: true
+                {{- else if eq $g.name "sogo" }}
+                - name: sogo-backup
+                  mountPath: /sogo_backup
+                  readOnly: true
+                {{- end }}
+              resources:
+                {{- toYaml $b.resources | nindent 16 }}
+          volumes:
+            - name: backup
+              persistentVolumeClaim:
+                claimName: {{ $b.persistence.existingClaim | default (printf "%s-backup" $fullname) }}
+            {{- if eq $g.name "redis" }}
+            - name: work
+              emptyDir: {}
+            {{- else if eq $g.name "mail" }}
+            {{- if $comp.crypt }}
+            - name: crypt
+              persistentVolumeClaim:
+                claimName: {{ include "mailcow.claimName" (list $root "crypt" "crypt") }}
+            {{- end }}
+            {{- if $comp.vmail }}
+            - name: vmail
+              persistentVolumeClaim:
+                claimName: {{ include "mailcow.claimName" (list $root "vmail" "vmail") }}
+            {{- end }}
+            {{- else if eq $g.name "rspamd" }}
+            - name: rspamd
+              persistentVolumeClaim:
+                claimName: {{ include "mailcow.claimName" (list $root "rspamd" "rspamd") }}
+            {{- else if eq $g.name "postfix" }}
+            - name: spool
+              persistentVolumeClaim:
+                claimName: {{ include "mailcow.claimName" (list $root "postfix" "postfix") }}
+            {{- else if eq $g.name "sogo" }}
+            - name: sogo-backup
+              persistentVolumeClaim:
+                claimName: {{ include "mailcow.claimName" (list $root "sogoBackup" "sogo-backup") }}
+            {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -84,7 +84,7 @@ They are copied over the base slice on every pod start (also into the shared dir
 
 | PVC | mounted by |
 |---|---|
-| `vmail`, `vmail-index`, `crypt` | dovecot (**back up `crypt`**, without it mail is unreadable) |
+| `vmail`, `vmail-index`, `crypt` | dovecot (**back up `crypt`**, without it mail is unreadable; [Backup and restore](#backup-and-restore)) |
 | `mysql`, `redis`, `postfix-tlspol`, `sogo-backup`, `clamd-db` | their component (`mysql`/`redis` not created with `externalDatabase`/`externalRedis`) |
 | `rspamd` | rspamd: `data/` = `/var/lib/rspamd` (controller socket, non-critical state; bayes and fuzzy hashes live in Redis), `override/worker-controller-password.inc` (UI password) |
 | `postfix` | postfix (+ watchdog, same node). With `postfix.spoolPerPod`: one claim `spool-<fullname>-postfix-spool-<n>` per pod instead, not mounted by watchdog ([Scaling](#scaling)) |
@@ -436,6 +436,209 @@ kubectl -n mailcow patch deployment mailcow-php-fpm --type=strategic \
 
 Also new in 0.7.0: the `cert-reload` CronJob is gone ([TLS](#tls)).
 
+## Backup and restore
+
+`backup.enabled: true` (off by default) renders the CronJob form of
+`helper-scripts/backup_and_restore.sh`: the same data sets, archive names and archive paths, written
+to a `backup` PVC. `scripts/restore.sh` restores them with `kubectl`. Large mailstores are better
+served by volume snapshots ([below](#volume-snapshots-and-off-site-copies)); the CronJobs are a
+self-contained baseline.
+
+> **Back up `crypt`.** It holds dovecot's mail_crypt key pair. Every stored message is encrypted
+> with it: a vmail backup without the matching `crypt` backup cannot be read by anyone. The
+> archives therefore contain private keys: restrict access to the backup storage and encrypt it at
+> rest.
+
+### What is backed up
+
+| `backup.components` | file in the backup directory | how | `backup_and_restore.sh` |
+|---|---|---|---|
+| `mysql` | `backup_mysql.sql.zst` (`.sql.gz` if the client image has no zstd) | `mariadb-dump --single-transaction --routines --triggers --events` of `mailcow.dbName` as `mailcow.dbUser`, through the `mysql` Service | `backup_mariadb.tar.zst`, mariabackup (physical) |
+| `redis` | `backup_redis.tar.zst` (`/redis/dump.rdb`) | `redis-cli --rdb` through `redis-mailcow` (replication protocol) | `SAVE`, then the redis volume (same layout) |
+| `crypt` | `backup_crypt.tar.zst` (`/crypt`) | tar of the crypt PVC, read-only | same |
+| `vmail` | `backup_vmail.tar.zst` (`/vmail`) | tar of the vmail PVC, read-only | same |
+| `rspamd` | `backup_rspamd.tar.zst` (`/rspamd`, `/rspamd_override`), `.<arch>` marker | tar of the rspamd PVC (`/var/lib/rspamd` + the UI password) | same (compose keeps the UI password in `data/conf`) |
+| `postfix` | `backup_postfix.tar.zst` (`/postfix`) | tar of the queue PVC; skipped with `postfix.spoolPerPod` | same |
+| `sogo` (off) | `backup_sogo.tar.zst` (`/sogo_backup`) | tar of `sogo-backup` (SOGo's own nightly per-user exports) | not included |
+| - | `mailcow-helm.info` | release, chart, image tags, DBNAME/DBUSER; no secrets | copies `mailcow.conf` (with passwords) |
+
+Archives are `tar --use-compress-program="zstd --rsyncable -T<backup.threads>" -Pcpf`, exactly the
+script's call (absolute member paths), made with the same image (`ghcr.io/mailcow/backup`, Debian:
+GNU tar, zstd, pigz; tag pinned by digest in `backup.image`). A compose `backup_and_restore.sh
+restore` can read the vmail, crypt, redis, rspamd and postfix archives, and `restore.sh` reads a
+compose backup directory (see [Migrating from compose](#migrating-from-compose)).
+
+Not backed up, as in the script: `vmail-index` (dovecot rebuilds indexes), `clamd-db` (freshclam
+downloads it), `postfix-tlspol` (a cache), and configuration. Compose keeps configuration in the git
+checkout; here it is your values file and `extraFiles` (keep them in Git) plus the `shared` PVC
+(`rspamd-custom` maps and the `global-sieve` filters edited in the UI): copy those subPaths if you
+change them in the UI. The release Secret (`<release>-secrets` or `existingSecret`) is not backed up
+either; the backup Jobs have no API access. Export it once and store it encrypted next to the backups:
+
+```bash
+kubectl -n mailcow get secret mailcow-secrets -o yaml > mailcow-secrets.yaml   # contains every password
+```
+
+A restored database works with a new Secret (the dump carries no users or grants), but API keys,
+SOGo's encryption key and the dovecot master credentials then change.
+
+### Layout, schedule, retention
+
+```
+<backup PVC>/
+  mailcow-2026-10-04-02-00-00/      # UTC, scheduled time of the run (script: mailcow-<local date>)
+    backup_mysql.sql.zst  backup_redis.tar.zst  backup_crypt.tar.zst  backup_vmail.tar.zst
+    backup_rspamd.tar.zst  backup_postfix.tar.zst  .x86_64  mailcow-helm.info
+```
+
+One CronJob per group: `<fullname>-backup-{mysql,redis,mail,rspamd,postfix,sogo}` (`mail` = crypt,
+then vmail). The volume groups must run on the node of their owner's ReadWriteOnce volume (required
+podAffinity to dovecot, rspamd, postfix or sogo) and those owners may sit on different nodes, so one
+pod with several containers cannot carry them all. Every group runs on `backup.schedule` (in
+`mailcow.tz`) and picks its directory from the Job name, which the CronJob controller sets to
+`<cronjob>-<scheduled time in minutes since the epoch>`: all groups of one run land in one directory,
+retries (`backup.backoffLimit`) too. An archive is written as `.<name>.tmp` and renamed when
+complete, so a file without the dot is whole. `concurrencyPolicy: Forbid`,
+`backup.activeDeadlineSeconds` (6 h) kills a stuck or unschedulable Job so it cannot block the next
+nights, `ttlSecondsAfterFinished` keeps finished Jobs and their logs for a day.
+
+Retention runs at the end of the first enabled group (normally `mysql`): directories whose name is
+more than `backup.retentionDays` × 24 h old are deleted, then all but the newest `backup.keep` (each
+0 = off). The current run's directory is never deleted. Only `mailcow-YYYY-MM-DD-HH-MM-SS`
+directories are touched.
+
+A manual run outside the schedule: give all Jobs the same minute suffix so they share a directory
+(other names fall back to the current time, one directory per group):
+
+```bash
+m=$(( $(date +%s) / 60 ))
+for g in mysql redis mail rspamd postfix; do
+  kubectl -n mailcow create job --from=cronjob/mailcow-backup-$g mailcow-backup-$g-$m
+done
+kubectl -n mailcow get jobs -l app.kubernetes.io/component=backup
+```
+
+### Scheduling and storage
+
+- `backup.persistence.accessMode: ReadWriteOnce` (default): all backup Jobs must mount the volume on
+  one node, so each of them also requires the dovecot pod's node. rspamd and postfix (and sogo with
+  `components.sogo`) must then run there too, or their Jobs stay Pending until
+  `activeDeadlineSeconds` and fail. That holds on single-node clusters; with
+  `persistence.shared.accessMode: ReadWriteOnce` rspamd is already pinned there (postfix too with
+  `acme.enabled`). NOTES.txt lists the components that are not.
+- Multi-node: `backup.persistence.accessMode: ReadWriteMany`, or `backup.persistence.existingClaim`
+  on RWX storage (NFS, CephFS, EFS, ...; set `accessMode` to what it is). Each volume group then only
+  follows its owner (when the owner's volume is ReadWriteOnce).
+- The Jobs run as root with every capability dropped except `DAC_READ_SEARCH` (read mailboxes of any
+  owner), read-only root filesystem, no service account token. They write as root: an NFS export
+  needs `no_root_squash`, or replace `backup.securityContext` / `backup.podSecurityContext`.
+- Node-local storage (local-path, hostPath) pins the backup PVC to the node of its first Job; if
+  dovecot moves, the Jobs cannot follow.
+- ReadWriteOncePod cannot work (the chart fails): the Jobs mount volumes their owners have mounted.
+- Backup pods carry the release labels with component `backup`: the mysql/redis NetworkPolicies and
+  the egress policy treat them as release pods.
+
+### Database and Redis: network dumps
+
+mailcow's script runs mariabackup next to the data directory. On Kubernetes that would mean
+mounting the mysql ReadWriteOnce volume on its node with a matching server version, and it cannot
+work with `externalDatabase`. The chart dumps over the network instead: `--single-transaction` gives
+a consistent snapshot of mailcow's InnoDB tables without locking, the dump covers `mailcow.dbName`
+only (no `CREATE DATABASE`, no `mysql.*` users), runs as `mailcow.dbUser` (no root needed, managed
+databases work) and restores into any release as that user. Caveats: views keep
+`DEFINER=<dbUser>`, so restore as the same user (or with SUPER); MariaDB >= 10.11.8 clients write a
+`/*M!999999\- enable the sandbox mode */` first line that MySQL clients reject (`tail -n +2`); a big
+quarantine table makes the restore slower than a physical copy. `backup.mysql.image` (default: the
+chart's `mysql.image`) sets the client for a newer external server.
+
+Redis: `redis-cli --rdb` streams an RDB snapshot over the replication protocol into
+`/redis/dump.rdb`, the file the script archives. Many managed Redis services refuse `SYNC`: turn
+`components.redis` off there and use the provider's snapshots.
+
+Volume archives are read from the live volumes, as the script does. A maildir is safe to copy file
+by file; files dovecot renames or expunges during the run are reported (tar exit 1, logged, archive
+kept). The database dump and the vmail archive are not taken at the same instant.
+
+### Restore
+
+`scripts/restore.sh` needs `kubectl` access to the namespace (pods, pods/exec, deployments/statefulsets
+scale, PVCs, Secrets read; Secrets patch for a compose MariaDB restore). It prints the kubectl
+context and server it will use and asks you to type the namespace (or `--yes`).
+
+```bash
+# 1. which backups exist, what is in one
+helm/mailcow/scripts/restore.sh --namespace mailcow --release mailcow --list
+helm/mailcow/scripts/restore.sh --namespace mailcow --release mailcow --list --backup mailcow-2026-10-04-02-00-00
+
+# 2. restore everything found in it, or a selection
+helm/mailcow/scripts/restore.sh --namespace mailcow --release mailcow --backup mailcow-2026-10-04-02-00-00
+helm/mailcow/scripts/restore.sh --namespace mailcow --release mailcow --backup mailcow-2026-10-04-02-00-00 \
+  --components crypt,vmail --resync
+```
+
+What it does:
+
+1. Starts `<fullname>-restore-inspect` (backup PVC read-only) to list the backup and the node's
+   architecture.
+2. Scales watchdog and the writers of the selected components to 0 and waits for their pods to go:
+   `vmail`/`crypt` dovecot; `redis` redis; `rspamd` rspamd; `postfix` postfix; `sogo` sogo; `mysql`
+   php-fpm, sogo, dovecot, postfix, acme (+ mysql for a physical restore).
+3. Starts `<fullname>-restore`, which mounts the backup PVC read-only and each target PVC at the
+   archive's path (`/vmail`, `/crypt`, `/redis`, `/rspamd` + `/rspamd_override`, `/postfix`,
+   `/sogo_backup`), and a `db` container from the mysql client image. It schedules wherever the
+   volumes allow (their owners are stopped); with node-local storage on several nodes it may not fit
+   anywhere, and the script shows the scheduling events.
+4. Extracts the archives over the volumes (`tar --numeric-owner -Pxpf`; nothing is deleted first,
+   as in the script) and pipes `backup_mysql.sql.*` into `mariadb` through the `mysql` Service (the
+   bundled or the external database). rspamd data from another CPU architecture is skipped (the
+   script's check).
+5. Deletes the pod and scales everything back to its previous replica count, also after a failure
+   (the volumes may then be partially restored: rerun the restore). Optionally runs
+   `doveadm force-resync -A '*'` (`--resync`, or asked).
+
+Not handled by the script: Redis of `externalRedis` (load `dump.rdb` with the provider's tools) and
+`postfix.spoolPerPod` queues (extract `backup_postfix.tar.zst` into one spool PVC with a pod like
+the restore pod, while that postfix pod is scaled down; or let the old queue go).
+
+Disaster recovery into a new cluster:
+
+1. Recreate the Secret from your export (and `existingSecret: <name>`) or let the chart generate a
+   new one; install the chart with the same values and `backup.enabled: true`.
+2. Make the backups visible: `backup.persistence.existingClaim` on the restored NFS export, or copy
+   a backup directory into the new backup PVC (e.g. `kubectl cp` into a pod that mounts it).
+3. `restore.sh --backup <dir>` (all components), then log in, check a few mailboxes and open an
+   older message (proves the crypt keys match).
+
+#### Migrating from compose
+
+`restore.sh` restores a directory written by `backup_and_restore.sh backup all`: vmail, crypt,
+redis, rspamd and postfix archives are identical. The MariaDB part is a physical
+`backup_mariadb.tar.zst`: with the bundled database the script stops mysql and its clients, empties
+the mysql PVC, extracts it (`chown 999:999`) and, if the passwords in the directory's `mailcow.conf`
+differ from the release Secret, offers to set `DBPASS`/`DBROOT` in the Secret (the restored data
+directory carries the compose users). Set `mailcow.dbName`/`mailcow.dbUser` to the compose values
+first, and keep the MariaDB major version (`mysql.image`) the same. It cannot go into an external
+database (load a `mariadb-dump` there instead).
+
+### Volume snapshots and off-site copies
+
+For large mailstores, prefer CSI VolumeSnapshots (or Velero with CSI snapshots): seconds instead
+of hours, crash-consistent per volume, no tar of millions of files. Snapshot `vmail`, `crypt`,
+`mysql` and `redis` together (a VolumeGroupSnapshot or one Velero backup of the namespace); InnoDB
+and Redis recover from a crash-consistent copy, maildir tolerates it. Keep the logical database dump
+anyway: it is small, portable across versions and storage classes, and readable without the
+cluster. The backup PVC lives in the cluster too: copy it off-site (Velero file-system backup,
+restic/rclone from a pod that mounts it, or an existingClaim on storage that is replicated).
+
+### Test your restores
+
+A backup you never restored is a hope. Periodically restore the latest directory into a scratch
+release (another namespace or the local kind cluster: same values, copy the directory into its
+backup PVC, `restore.sh --yes`), then log in, count mailboxes, read an old encrypted message, open a
+SOGo calendar. Watch the Jobs: `kubectl get jobs -l app.kubernetes.io/component=backup`, and alert
+on failed ones (kube-state-metrics `kube_job_status_failed`) and on a missing directory for last
+night.
+
 ## Environment contract
 
 Every variable below is opt-in in the images: compose leaves it empty and keeps its old behaviour.
@@ -663,6 +866,8 @@ drop traffic meet. Options:
 - No fail2ban (netfilter); see [Brute-force protection](#brute-force-protection-no-fail2ban).
 - `redis` `net.core.somaxconn` is an unsafe sysctl (`redis.sysctls`, off by default); compose
   ulimits for dovecot have no pod equivalent (runtime defaults are higher).
+- Backups are opt-in (`backup.enabled`); with a ReadWriteOnce backup PVC the volume owners must
+  share dovecot's node, and `postfix.spoolPerPod` queues are not backed up ([Backup and restore](#backup-and-restore)).
 - Egress NetworkPolicies are optional and off by default (`networkPolicy.egress`): they fence off the
   cluster, not the internet.
 - External database / Redis: supported (`externalDatabase`, `externalRedis`), but the database must
@@ -684,4 +889,9 @@ drop traffic meet. Options:
   queue mount, 60 s TLS reload checks; layer it on kind-values.yaml for the local kind cluster).
   kind and cert-manager: NetworkPolicy on with the default `publicMailFrom`; cert-manager has the
   ofelia CronJobs off (no CronJob runner at all).
-  `check-tags.sh` skips the compose services the chart does not ship (ofelia, netfilter).
+  backup: the defaults (ReadWriteOnce backup PVC, every group incl. sogo, retention by age and count;
+  layer it on kind-values.yaml) and a multi-node variant (RWX existingClaim and mail volumes, external
+  database and Redis, newer client image, postfix queue per pod = not backed up).
+  `check-tags.sh` skips the compose services the chart does not ship (ofelia, netfilter) and checks
+  `backup.image` against `DEBIAN_DOCKER_IMAGE` of `helper-scripts/backup_and_restore.sh`.
+- `scripts/restore.sh`: restore a backup directory ([Backup and restore](#restore)); `KUBECTL` selects the binary.

@@ -1,0 +1,16 @@
+# Backups with the defaults: ReadWriteOnce backup PVC (every backup Job joins the dovecot pod's node),
+# all groups incl. the optional sogo-backup archive, retention by age and count. Layer it on
+# kind-values.yaml for the local kind cluster (single node: all owners share the node).
+mailcow:
+  tz: Europe/Berlin
+
+backup:
+  enabled: true
+  schedule: "30 3 * * *"
+  retentionDays: 14
+  keep: 10
+  threads: 2
+  components:
+    sogo: true
+  persistence:
+    size: 20Gi

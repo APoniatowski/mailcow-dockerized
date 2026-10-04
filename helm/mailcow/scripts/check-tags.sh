@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Asserts the chart's default image tags equal the tags pinned in docker-compose.yml.
+# Asserts the chart's default image tags equal the tags pinned in docker-compose.yml, and the backup
+# image (not a compose service) equals DEBIAN_DOCKER_IMAGE of helper-scripts/backup_and_restore.sh.
 # Usage: helm/mailcow/scripts/check-tags.sh [--fix]   (exit 0 = in sync; --fix rewrites values.yaml tags)
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../../.." && pwd)"
 
-python3 - "$repo/docker-compose.yml" "$here/../values.yaml" "${1:-}" <<'PY'
+python3 - "$repo/docker-compose.yml" "$here/../values.yaml" "${1:-}" "$repo/helper-scripts/backup_and_restore.sh" <<'PY'
 import re, sys, yaml
 
 compose = yaml.safe_load(open(sys.argv[1]))["services"]
@@ -49,6 +50,16 @@ for svc, spec in compose.items():
         print(f"fixed {svc:24} {have} -> {want}" if n else f"FAIL  {svc}: could not rewrite"); fail |= (n == 0)
     else:
         print(f"FAIL  {svc:24} compose={want} chart={have}"); fail = 1
+# backup.image: the image backup_and_restore.sh runs (reported only; --fix leaves it, the digest is pinned by hand)
+m = re.search(r'^DEBIAN_DOCKER_IMAGE="([^"]+)"', open(sys.argv[4]).read(), re.M)
+bimg = values["backup"]["image"]
+have = f'{bimg["repository"]}:{bimg["tag"]}'
+if not m:
+    print("FAIL  backup: DEBIAN_DOCKER_IMAGE not found in backup_and_restore.sh"); fail = 1
+elif have == m.group(1):
+    print(f"ok    {'backup (helper script)':24} {have}")
+else:
+    print(f"FAIL  {'backup (helper script)':24} script={m.group(1)} chart={have}"); fail = 1
 if fix:
     open(sys.argv[2], "w").write(text)
 print("TAGS IN SYNC" if not fail else "TAGS DIFFER")
