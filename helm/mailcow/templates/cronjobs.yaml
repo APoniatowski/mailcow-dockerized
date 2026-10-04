@@ -161,6 +161,10 @@ spec:
     spec:
       serviceAccountName: {{ $name }}
       automountServiceAccountToken: true
+      # the jobs run as uid 10900 while crond runs as root: without fsGroup the projected service
+      # account token is root-owned 0600 and kubectl in the jobs cannot read it
+      securityContext:
+        fsGroup: 10900
       {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
       containers:
         # busybox crond must start as root: it switches to the crontab's user (mailcow, uid 10900) with
