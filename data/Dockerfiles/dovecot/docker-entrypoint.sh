@@ -203,25 +203,57 @@ namespace {
 EOF
 
 
+# Print the valid IPv4/IPv6 addresses and CIDRs of the comma/space separated list in variable ${1}, one per line, IPv6 without brackets
 parse_nets() {
-  local net nets bad=() ok=()
+  local net addr pfx max l r c v4 g nets bad=() wide=() ok=()
+  v4='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}'
+  g='[0-9A-Fa-f]{1,4}'
   IFS=$', \t\n' read -r -d '' -a nets <<< "${!1}" || true
   for net in "${nets[@]}"; do
     [[ -z ${net} ]] && continue
     [[ ${net} =~ ^\[([^]]+)\](/.*)?$ ]] && net=${BASH_REMATCH[1]}${BASH_REMATCH[2]}
-    if [[ ${net} =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ && ${net} == *[.:]* ]]; then
+    addr=${net%/*}
+    max=
+    if [[ ${addr} =~ ^${v4}$ ]]; then
+      max=32
+    elif [[ ${addr} == *::* && ${addr} != *::*::* ]]; then
+      l=${addr%%::*}
+      r=${addr#*::}
+      if [[ ${l} =~ ^(${g}(:${g})*)?$ && ${r} =~ ^((${g}:)*(${g}|${v4}))?$ ]]; then
+        c=${l//[^:]/}${r//[^:]/}
+        [[ -n ${l} ]] && c+=:
+        [[ -n ${r} ]] && c+=:
+        [[ ${r} == *.* ]] && c+=:
+        [[ ${#c} -le 7 ]] && max=128
+      fi
+    elif [[ ${addr} =~ ^(${g}:){6}(${g}:${g}|${v4})$ ]]; then
+      max=128
+    fi
+    if [[ -n ${max} && ${net} == */* ]]; then
+      pfx=${net#*/}
+      if [[ ! ${pfx} =~ ^(0|[1-9][0-9]{0,2})$ || ${pfx} -gt ${max} ]]; then
+        max=
+      elif [[ ${pfx} -eq 0 ]]; then
+        wide+=("${net}")
+        continue
+      fi
+    fi
+    if [[ -n ${max} ]]; then
       ok+=("${net}")
     else
       bad+=("${net}")
     fi
   done
-  if [[ -n ${!1} && ${#ok[@]} -eq 0 ]]; then
-    echo "WARNING: ${1} contains no valid networks, ignoring it" >&2
-  elif [[ ${#bad[@]} -gt 0 ]]; then
+  if [[ ${#wide[@]} -gt 0 ]]; then
+    echo "WARNING: ${1}: ignoring ${wide[*]}: a /0 network would trust every address" >&2
+  fi
+  if [[ ${#bad[@]} -gt 0 ]]; then
     echo "WARNING: ${1}: ignoring invalid entries: ${bad[*]}" >&2
   fi
   if [[ ${#ok[@]} -gt 0 ]]; then
     printf '%s\n' "${ok[@]}"
+  elif [[ ${#wide[@]} -gt 0 || ${#bad[@]} -gt 0 ]]; then
+    echo "WARNING: ${1} contains no valid networks, ignoring it" >&2
   fi
 }
 
@@ -248,6 +280,10 @@ fi
 
 # Create random master Password for SOGo SSO
 if [[ -n "${SOGO_SSO_PASS}" ]]; then
+  if [[ ! ${SOGO_SSO_PASS} =~ ^[A-Za-z0-9]+$ ]]; then
+    echo "ERROR: SOGO_SSO_PASS may only contain letters and digits" >&2
+    exit 1
+  fi
   RAND_PASS=${SOGO_SSO_PASS}
 else
   RAND_PASS=$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 32 | head -n 1)

@@ -30,6 +30,7 @@ done
 
 echo "Waiting for Postfix..."
 if [[ "${WAIT_TCP}" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+  # bash /dev/tcp instead of nc -z: the debian-slim base image ships no netcat
   until timeout 2 bash -c "</dev/tcp/postfix/25" 2>/dev/null; do
     sleep 1
   done

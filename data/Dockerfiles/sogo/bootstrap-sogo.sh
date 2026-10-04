@@ -2,7 +2,11 @@
 
 if [[ -n "${DBHOST}" ]]; then
   DB_CONN_ARGS="--protocol=tcp --host=${DBHOST} --port=${DBPORT:-3306}"
-  SOGO_DB_HOST="${DBHOST}:${DBPORT:-3306}"
+  if [[ ${DBHOST} == *:* && ${DBHOST} != \[* ]]; then
+    SOGO_DB_HOST="[${DBHOST}]:${DBPORT:-3306}"
+  else
+    SOGO_DB_HOST="${DBHOST}:${DBPORT:-3306}"
+  fi
 else
   DB_CONN_ARGS="--socket=/var/run/mysqld/mysqld.sock"
   SOGO_DB_HOST="%2Fvar%2Frun%2Fmysqld%2Fmysqld.sock"
@@ -38,6 +42,10 @@ fi
 
 # cat /dev/urandom seems to hang here occasionally and is not recommended anyway, better use openssl
 if [[ -n "${SOGO_ENCRYPTION_KEY}" ]]; then
+  if [[ ! ${SOGO_ENCRYPTION_KEY} =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "ERROR: SOGO_ENCRYPTION_KEY may only contain letters, digits, '_' and '-'" >&2
+    exit 1
+  fi
   RAND_PASS=${SOGO_ENCRYPTION_KEY}
 else
   RAND_PASS=$(openssl rand -base64 16 | tr -dc _A-Z-a-z-0-9)

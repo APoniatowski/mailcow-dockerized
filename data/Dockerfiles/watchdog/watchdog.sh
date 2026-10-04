@@ -207,9 +207,6 @@ get_container_ip() {
   until [[ ${CONTAINER_IP} =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || [[ ${LOOP_C} -gt 5 ]]; do
     if [ ${IP_BY_DOCKER_API} -eq 0 ]; then
       CONTAINER_IP=$(dig a "${1}" +short | grep -m1 -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$')
-      if [[ -z ${CONTAINER_IP} ]] && [[ -n ${KUBERNETES_SERVICE_HOST} ]]; then
-        CONTAINER_IP=$(dig a "${1}" +short +search | grep -m1 -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$')
-      fi
     else
       sleep 0.5
       # get long container id for exact match
@@ -1156,24 +1153,24 @@ while true; do
   elif [[ ${com_pipe_answer} =~ .+-mailcow ]]; then
     kill -STOP ${BACKGROUND_TASKS[*]}
     sleep 10
-    CONTAINER_ID=$(curl --silent --insecure "https://${DOCKERAPIHOST:-dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network}/containers/json" | jq -r ".[] | {name: .Config.Labels[\"com.docker.compose.service\"], project: .Config.Labels[\"com.docker.compose.project\"], id: .Id}" | jq -rc "select( .name | tostring | contains(\"${com_pipe_answer}\")) | select( .project | tostring | contains(\"${COMPOSE_PROJECT_NAME,,}\")) | .id" | head -n1)
-    if [[ ! -z "${CONTAINER_ID}" ]]; then
+    CONTAINER_ID=$(curl --silent --insecure https://${DOCKERAPIHOST:-dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network}/containers/json | jq -r ".[] | {name: .Config.Labels[\"com.docker.compose.service\"], project: .Config.Labels[\"com.docker.compose.project\"], id: .Id}" | jq -rc "select( .name | tostring | contains(\"${com_pipe_answer}\")) | select( .project | tostring | contains(\"${COMPOSE_PROJECT_NAME,,}\")) | .id" | head -n1)
+    if [[ ! -z ${CONTAINER_ID} ]]; then
       if [[ "${com_pipe_answer}" == "php-fpm-mailcow" ]]; then
-        HAS_INITDB=$(curl --silent --insecure -XPOST "https://${DOCKERAPIHOST:-dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network}/containers/${CONTAINER_ID}/top" | jq '.msg.Processes[] | contains(["php -c /usr/local/etc/php -f /web/inc/init_db.inc.php"])' | grep true)
+        HAS_INITDB=$(curl --silent --insecure -XPOST https://${DOCKERAPIHOST:-dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network}/containers/${CONTAINER_ID}/top | jq '.msg.Processes[] | contains(["php -c /usr/local/etc/php -f /web/inc/init_db.inc.php"])' | grep true)
       fi
-      S_STARTED=$(curl --silent --insecure "https://${DOCKERAPIHOST:-dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network}/containers/${CONTAINER_ID}/json" | jq -r '.State.StartedAt // empty' | xargs -r -n1 date +%s -d)
+      S_STARTED=$(curl --silent --insecure https://${DOCKERAPIHOST:-dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network}/containers/${CONTAINER_ID}/json | jq -r '.State.StartedAt // empty' | xargs -r -n1 date +%s -d)
       S_RUNNING=
-      [[ "${S_STARTED}" =~ ^-?[0-9]+$ ]] && S_RUNNING=$(($(date +%s) - S_STARTED))
-      if [[ -z "${S_RUNNING}" ]]; then
+      [[ ${S_STARTED} =~ ^-?[0-9]+$ ]] && S_RUNNING=$(($(date +%s) - S_STARTED))
+      if [[ -z ${S_RUNNING} ]]; then
         log_msg "Cannot determine start time of ${CONTAINER_ID}, skipping action..."
-      elif [ "${S_RUNNING}" -lt 360 ]; then
+      elif [ ${S_RUNNING} -lt 360 ]; then
         log_msg "Container is running for less than 360 seconds, skipping action..."
       elif [[ ! -z ${HAS_INITDB} ]]; then
         log_msg "Database is being initialized by php-fpm-mailcow, not restarting but delaying checks for a minute..."
         sleep 60
       else
         log_msg "Sending restart command to ${CONTAINER_ID}..."
-        curl --silent --insecure -XPOST "https://${DOCKERAPIHOST:-dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network}/containers/${CONTAINER_ID}/restart"
+        curl --silent --insecure -XPOST https://${DOCKERAPIHOST:-dockerapi.${COMPOSE_PROJECT_NAME}_mailcow-network}/containers/${CONTAINER_ID}/restart
         notify_error "${com_pipe_answer}"
         log_msg "Wait for restarted container to settle and continue watching..."
         sleep 35
