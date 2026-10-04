@@ -521,11 +521,14 @@ kubectl -n mailcow get jobs -l app.kubernetes.io/component=backup
 ### Scheduling and storage
 
 - `backup.persistence.accessMode: ReadWriteOnce` (default): all backup Jobs must mount the volume on
-  one node, so each of them also requires the dovecot pod's node. rspamd and postfix (and sogo with
-  `components.sogo`) must then run there too, or their Jobs stay Pending until
-  `activeDeadlineSeconds` and fail. That holds on single-node clusters; with
-  `persistence.shared.accessMode: ReadWriteOnce` rspamd is already pinned there (postfix too with
-  `acme.enabled`). NOTES.txt lists the components that are not.
+  one node. The mysql, redis and mail Jobs require the dovecot pod's node; the rspamd, postfix and
+  sogo Jobs require their owner's node (their volume is RWO) and only *prefer* dovecot's, because the
+  scheduler counts an existing pod for required pod affinity only if it matches every required term,
+  so "next to rspamd AND next to dovecot" can never be required. On a single node, or with
+  `persistence.shared.accessMode: ReadWriteOnce` (rspamd is pinned next to dovecot), this just works;
+  if postfix or sogo run on another node than dovecot, their Jobs land there and fail with a
+  multi-attach error on the backup volume: use RWX backup storage (next point). NOTES.txt lists the
+  components that are not pinned next to dovecot.
 - Multi-node: `backup.persistence.accessMode: ReadWriteMany`, or `backup.persistence.existingClaim`
   on RWX storage (NFS, CephFS, EFS, ...; set `accessMode` to what it is). Each volume group then only
   follows its owner (when the owner's volume is ReadWriteOnce).

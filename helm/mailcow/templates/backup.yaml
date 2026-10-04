@@ -106,16 +106,30 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           {{- include "mailcow.podCommon" (dict "root" $root) | nindent 10 }}
+          {{- /* The scheduler only counts an existing pod for required pod affinity if it matches
+                 ALL required terms, so two terms selecting different pods can never be met. Require
+                 the first (the volume owner, else dovecot); prefer the rest. rspamd shares dovecot's
+                 node anyway through the shared PVC; for postfix/sogo on several nodes use an RWX
+                 backup volume (README "Scheduling and storage"). */}}
           {{- with $aff }}
           affinity:
             podAffinity:
               requiredDuringSchedulingIgnoredDuringExecution:
-                {{- range . }}
                 - topologyKey: kubernetes.io/hostname
                   labelSelector:
                     matchLabels:
-                      {{- include "mailcow.selectorLabels" (dict "root" $root "component" .) | nindent 22 }}
+                      {{- include "mailcow.selectorLabels" (dict "root" $root "component" (first .)) | nindent 22 }}
+              {{- with (rest .) }}
+              preferredDuringSchedulingIgnoredDuringExecution:
+                {{- range . }}
+                - weight: 100
+                  podAffinityTerm:
+                    topologyKey: kubernetes.io/hostname
+                    labelSelector:
+                      matchLabels:
+                        {{- include "mailcow.selectorLabels" (dict "root" $root "component" .) | nindent 24 }}
                 {{- end }}
+              {{- end }}
           {{- end }}
           {{- if eq $g.name "redis" }}
           initContainers:
