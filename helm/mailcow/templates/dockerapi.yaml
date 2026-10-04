@@ -101,7 +101,7 @@ spec:
               value: {{ .Values.mailcow.composeProjectName | quote }}
             # namespace: the ServiceAccount's own; Job pods (CronJob runner, backups, TLS bootstrap) are no containers
             - name: K8S_POD_SELECTOR
-              value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component notin (cron,backup,tls-bootstrap)" (include "mailcow.name" .) .Release.Name | quote }}
+              value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component notin (cron,backup,tls-bootstrap,redis-tls,db-tls)" (include "mailcow.name" .) .Release.Name | quote }}
           ports:
             - name: https
               containerPort: 443

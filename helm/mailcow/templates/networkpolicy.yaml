@@ -215,7 +215,7 @@ spec:
         {{- toYaml . | nindent 8 }}
     {{- end }}
 ---
-{{- /* Kubernetes API server: dockerapi (pods, exec, rollout restarts, metrics), CronJob runner (exec),
+{{- /* Kubernetes API server: dockerapi (pods, exec, rollout restarts, metrics), cron scheduler / CronJob runner (exec),
 TLS bootstrap hook Job (Secret create) */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

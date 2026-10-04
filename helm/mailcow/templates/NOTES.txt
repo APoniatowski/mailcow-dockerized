@@ -50,13 +50,14 @@ Checks:
   - rspamd's controller socket reaches php-fpm, dovecot, postfix{{ if .Values.watchdog.enabled }}, watchdog{{ end }} over TCP 11335 with mutual TLS (socat
     relays, native sidecars: Kubernetes >= 1.29; Secret {{ include "mailcow.rspamdRelayTlsSecret" . }}). Its NetworkPolicy is always on.
 {{- with .Values.externalDatabase }}{{ if .enabled }}
-  - External database {{ .host }}:{{ .port }} (Services mysql, mysql-mailcow): database {{ $.Values.mailcow.dbName }}, user
+  - External database {{ .host }}:{{ .port }} (Services mysql, mysql-mailcow{{ if .tls.enabled }} -> ProxySQL {{ include "mailcow.fullname" $ }}-db-tls, TLS{{ if .tls.verify }} with the
+    chain verified against Secret {{ .tls.caSecret }} (not the server name){{ else }} WITHOUT certificate verification{{ end }}{{ end }}): database {{ $.Values.mailcow.dbName }}, user
     {{ $.Values.mailcow.dbUser }} (DBPASS from the Secret) must exist with ALL PRIVILEGES on {{ $.Values.mailcow.dbName }}.*, event_scheduler=ON,
     time zone tables loaded. php-fpm skips mysql_upgrade (SKIP_MYSQL_UPGRADE=y); backups and upgrades are yours.
 {{- end }}{{ end }}
 {{- with .Values.externalRedis }}{{ if .enabled }}
   - External Redis {{ .host }}:{{ .port }} (Services redis, redis-mailcow): its password must equal REDISPASS from the
-    Secret; plain TCP, no TLS. rspamd sends SLAVEOF NO ONE on start: point it at a primary.
+    Secret; {{ if .tls.enabled }}TLS through the relay {{ include "mailcow.fullname" $ }}-redis-tls{{ if .tls.insecureSkipVerify }} WITHOUT certificate verification{{ end }} (its log shows a TLS check at start){{ else }}plain TCP{{ end }}. rspamd sends SLAVEOF NO ONE on start: point it at a primary.
 {{- end }}{{ end }}
 {{- if .Values.networkPolicy.egress.enabled }}
   - Egress NetworkPolicies: release pods, kube-dns, the API server ({{ join ", " .Values.networkPolicy.egress.apiServerCIDRs }}) and
@@ -69,7 +70,6 @@ Checks:
     {{- /* owners not already pinned to dovecot's node by an RWO shared PVC */}}
     {{- $colo := include "mailcow.sharedColocate" $ }}
     {{- $loose := list }}
-    {{- if and .components.rspamd (not $colo) }}{{ $loose = append $loose "rspamd" }}{{ end }}
     {{- if and .components.postfix (not $.Values.postfix.spoolPerPod) (not (and $colo $.Values.acme.enabled)) }}{{ $loose = append $loose "postfix" }}{{ end }}
     {{- if and .components.sogo (not $.Values.skip.sogo) }}{{ $loose = append $loose "sogo" }}{{ end }}
     The backup PVC is ReadWriteOnce: every backup Job requires the dovecot pod's node.

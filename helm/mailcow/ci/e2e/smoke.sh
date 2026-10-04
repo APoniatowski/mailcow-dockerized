@@ -144,6 +144,11 @@ learned=""
 for _ in 1 2 3 4 5 6; do
   learned1=$(api get/logs/rspamd-stats | jq -r '.learned // 0' 2>/dev/null)
   if [ "${learned1:-0}" -gt "${learned0:-0}" ]; then learned="learned $learned0 -> $learned1"; break; fi
+  # with rspamd replicas the counter is per pod and the stats request may hit another one: the
+  # controller's own log line (any rspamd pod) proves the learn as well
+  if [ -n "$TAG" ] && rspamd_logs | grep 'learned message as spam' | grep -qF "smoke-$TAG"; then
+    learned="rspamd log: learned message as spam (smoke-$TAG)"; break
+  fi
   # a well-trained bayes skips messages it already classifies as spam: the request still arrived.
   # Only lines since the start of this run count; the one naming this message's Message-ID is preferred
   skips=$(rspamd_logs | grep 'already in class spam')

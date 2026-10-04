@@ -1,0 +1,182 @@
+{{- /*
+externalDatabase.tls: MySQL negotiates TLS inside its protocol and mailcow's clients have no TLS settings,
+so ProxySQL terminates the plaintext client side (3306, release pods only) and opens TLS connections
+(use_ssl=1) to the external server. Multiplexing is off: every client connection keeps its own server
+connection (session variables, transactions, prepared statements behave as on a direct connection); the
+monitor is off (it would need a user of its own); the admin interface listens on 127.0.0.1 only.
+*/ -}}
+{{- if include "mailcow.dbTls" . }}
+{{- $c := "db-tls" }}
+{{- $d := .Values.externalDatabase }}
+{{- $v := $d.tls }}
+{{- $fullname := include "mailcow.fullname" . }}
+{{- $family := include "mailcow.externalHost" (dict "what" "externalDatabase" "host" $d.host "port" $d.port) }}
+{{- $host := trim (toString $d.host) | trimPrefix "[" | trimSuffix "]" }}
+{{- if and $v.verify (not $v.caSecret) }}
+{{- fail "externalDatabase.tls.verify needs externalDatabase.tls.caSecret (Secret with ca.crt): ProxySQL checks the server certificate chain against it but not the server name, so a public CA bundle would accept any publicly trusted certificate. Use the CA that signed the database server (private CA / the provider's database CA), or verify: false for encryption without authentication" }}
+{{- end }}
+{{- $secretName := printf "%s-db-tls" $fullname }}
+{{- $old := (lookup "v1" "Secret" .Release.Namespace $secretName).data | default dict }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+type: Opaque
+data:
+  # ProxySQL admin interface (127.0.0.1:6032 inside the pod only)
+  admin-password: {{ get $old "admin-password" | default (randAlphaNum 32 | b64enc) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-{{ $c }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
+spec:
+  {{- include "mailcow.replicas" (dict "v" $v "key" "externalDatabase.tls") | nindent 2 }}
+  {{- include "mailcow.strategy" "RollingUpdate" | nindent 2 }}
+  selector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 8 }}
+      {{- with include "mailcow.podDefaultAnnotations" . }}
+      {{- . | nindent 6 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      # cluster DNS, not unbound: also resolves in-cluster Service names and private zones kube-dns knows
+      dnsPolicy: ClusterFirst
+      {{- include "mailcow.podCommon" (dict "root" .) | nindent 6 }}
+      {{- if include "mailcow.multi" $v }}
+      {{- include "mailcow.spread" (dict "root" . "component" $c) | nindent 6 }}
+      {{- end }}
+      initContainers:
+        # proxysql.cnf from the release Secret (DBUSER/DBPASS become the only ProxySQL user, the same
+        # credentials go to the server). Listens dual-stack when the pod has IPv6.
+        - name: config
+          image: {{ include "mailcow.filesImage" . }}
+          imagePullPolicy: {{ .Values.files.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              umask 077
+              esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+              admin=$(cat /etc/db-tls-admin/admin-password)
+              case "${admin}" in ""|*[!A-Za-z0-9]*) echo "admin-password in Secret {{ $secretName }} must be non-empty [A-Za-z0-9]"; exit 1 ;; esac
+              if grep -qs . /proc/net/if_inet6; then ifaces="0.0.0.0:3306;[::]:3306"; else ifaces="0.0.0.0:3306"; fi
+              cat > /config/proxysql.cnf <<EOF
+              datadir="/var/lib/proxysql"
+              admin_variables=
+              {
+                admin_credentials="admin:${admin}"
+                mysql_ifaces="127.0.0.1:6032"
+              }
+              mysql_variables=
+              {
+                interfaces="${ifaces}"
+                threads=2
+                max_connections=2048
+                monitor_enabled=false
+                multiplexing=false
+                have_ssl=false
+                max_allowed_packet=1073741824
+                default_charset="utf8mb4"
+                default_collation_connection="utf8mb4_general_ci"
+              {{- if $v.verify }}
+                ssl_p2s_ca="/etc/db-tls/ca/ca.crt"
+              {{- end }}
+              {{- if $v.clientCertSecret }}
+                ssl_p2s_cert="/etc/db-tls/client/tls.crt"
+                ssl_p2s_key="/etc/db-tls/client/tls.key"
+              {{- end }}
+              {{- with $v.serverVersion }}
+                server_version="{{ . }}"
+              {{- end }}
+              }
+              mysql_servers=
+              (
+                { address="${DB_ADDR}", port=${DB_PORT}, hostgroup=0, use_ssl=1, max_connections=2048 }
+              )
+              mysql_users=
+              (
+                { username="$(esc "${DBUSER}")", password="$(esc "${DBPASS}")", default_hostgroup=0, default_schema="$(esc "${DBNAME}")", transaction_persistent=1 }
+              )
+              EOF
+              echo "ProxySQL: ${ifaces} (plain) -> ${DB_ADDR}:${DB_PORT} (TLS{{ if $v.verify }}, chain verified{{ else }}, not verified{{ end }}{{ if $v.clientCertSecret }}, client certificate{{ end }})"
+          env:
+            - name: DB_ADDR
+              value: {{ $host | quote }}
+            - name: DB_PORT
+              value: {{ int $d.port | quote }}
+            - name: DBNAME
+              value: {{ .Values.mailcow.dbName | quote }}
+            - name: DBUSER
+              value: {{ .Values.mailcow.dbUser | quote }}
+            {{- include "mailcow.secretEnv" (list . "DBPASS" "DBPASS") | nindent 12 }}
+          {{- include "mailcow.relaySecurityContext" . | nindent 10 }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: admin
+              mountPath: /etc/db-tls-admin
+              readOnly: true
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+      containers:
+        - name: proxysql
+          image: {{ include "mailcow.image" $v.image }}
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          # --initial: configuration from proxysql.cnf on every start, not from a previous proxysql.db
+          command: ["proxysql", "-f", "--idle-threads", "--no-version-check", "--initial", "-c", "/etc/proxysql/proxysql.cnf", "-D", "/var/lib/proxysql"]
+          {{- include "mailcow.relaySecurityContext" . | nindent 10 }}
+          ports:
+            - name: mysql
+              containerPort: 3306
+          # SELECT 1 on the local admin interface: a bare TCP connect to 3306 logs an "unhealthy client" warning
+          {{- $probe := `MYSQL_PWD=$(sed -n 's/^ *admin_credentials="admin:\(.*\)"$/\1/p' /etc/proxysql/proxysql.cnf) exec mariadb -h 127.0.0.1 -P 6032 -u admin -N -e 'SELECT 1'` }}
+          {{- include "mailcow.probes" (dict "handler" (dict "exec" (dict "command" (list "sh" "-c" $probe))) "startup" 12 "timeout" 5) | nindent 10 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/proxysql
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/proxysql
+            {{- if $v.verify }}
+            - name: ca
+              mountPath: /etc/db-tls/ca
+              readOnly: true
+            {{- end }}
+            {{- if $v.clientCertSecret }}
+            - name: client-cert
+              mountPath: /etc/db-tls/client
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+      volumes:
+        - name: config
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: data
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: admin
+          secret:
+            secretName: {{ $secretName }}
+            defaultMode: 0444
+        {{- if $v.verify }}
+        {{- include "mailcow.keysVolume" (dict "name" "ca" "secret" $v.caSecret "keys" (list "ca.crt")) | nindent 8 }}
+        {{- end }}
+        {{- if $v.clientCertSecret }}
+        {{- include "mailcow.keysVolume" (dict "name" "client-cert" "secret" $v.clientCertSecret "keys" (list "tls.crt" "tls.key")) | nindent 8 }}
+        {{- end }}
+{{- include "mailcow.pdb" (dict "root" . "v" $v "component" $c) }}
+---
+{{ include "mailcow.tlsProxyPolicy" (dict "root" . "component" $c "port" 3306) }}
+{{- end }}

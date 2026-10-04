@@ -36,10 +36,12 @@ metadata:
   labels:
     {{- include "mailcow.labels" (dict "root" . "component" $c) | nindent 4 }}
 spec:
-  # single instance: /var/lib/rspamd (controller socket) and the UI password file live on its own RWO PVC,
-  # worker-proxy binds the pod hostname `rspamd`; README "Scaling"
-  replicas: 1
-  {{- include "mailcow.strategy" "Recreate" | nindent 2 }}
+  {{- with include "mailcow.replicas" (dict "v" $v "key" "rspamd") }}
+  {{- . | nindent 2 }}
+  {{- end }}
+  # /var/lib/rspamd (controller socket, per-pod stats and caches) is a per-pod emptyDir; Bayes, fuzzy hashes,
+  # history, ratelimits, greylisting and reputation live in Redis. README "Scaling"
+  {{- include "mailcow.strategy" "RollingUpdate" | nindent 2 }}
   selector:
     matchLabels:
       {{- include "mailcow.selectorLabels" (dict "root" . "component" $c) | nindent 6 }}
@@ -61,13 +63,14 @@ spec:
       terminationGracePeriodSeconds: {{ $v.terminationGracePeriodSeconds }}
       {{- include "mailcow.dnsUnbound" . | nindent 6 }}
       {{- include "mailcow.podCommon" (dict "root" . "shared" true) | nindent 6 }}
+      {{- if and (include "mailcow.multi" $v) (not (include "mailcow.sharedColocate" .)) }}
+      {{- include "mailcow.spread" (dict "root" . "component" $c) | nindent 6 }}
+      {{- end }}
       initContainers:
         {{- $slices := list "hooks/rspamd" "conf/rspamd/override.d" "conf/rspamd/local.d" "conf/rspamd/plugins.d" "conf/rspamd/lua" "conf/rspamd/rspamd.conf.local" "conf/rspamd/rspamd.conf.override" }}
         {{- $shared := list (dict "dir" "rspamd-custom" "src" "conf/rspamd/custom") }}
-        {{- /* rspamd PVC: data/ = /var/lib/rspamd, override/ = UI password (written by dockerapi rspamd/worker_password) */}}
-        {{- $script := `mkdir -p /rspamd/data /rspamd/override
-touch /rspamd/override/worker-controller-password.inc` }}
-        {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "script" $script "extraMounts" (list (dict "name" "rspamd" "mountPath" "/rspamd"))) | nindent 8 }}
+        {{- /* UI password (dockerapi rspamd/worker_password writes it in one pod, then restarts the Deployment) */}}
+        {{- include "mailcow.seedInit" (dict "root" . "slices" $slices "shared" $shared "touch" (list "rspamd-override/worker-controller-password.inc")) | nindent 8 }}
         # controller unix socket -> TCP 11335 with mutual TLS, for the rspamd-sock sidecars of php-fpm,
         # dovecot, postfix (and watchdog): clients need a certificate signed by the relay CA. Probe without
         # connecting: every connection reaches the controller, which logs an EOF error for a bare connect.
@@ -96,8 +99,7 @@ touch /rspamd/override/worker-controller-password.inc` }}
             periodSeconds: 2
             failureThreshold: 30
           volumeMounts:
-            - name: rspamd
-              subPath: data
+            - name: rspamd-data
               mountPath: /var/lib/rspamd
               readOnly: true
             - name: rspamd-relay-tls
@@ -147,9 +149,10 @@ touch /rspamd/override/worker-controller-password.inc` }}
             - name: seed
               subPath: conf/rspamd/override.d
               mountPath: /etc/rspamd/override.d
-            # rspamd UI password (dockerapi rspamd/worker_password writes it, then restarts = deletes the pod)
-            - name: rspamd
-              subPath: override/worker-controller-password.inc
+            # rspamd UI password, the same file for every replica (dockerapi rspamd/worker_password writes it in
+            # one pod, then rolls the whole Deployment)
+            - name: shared
+              subPath: rspamd-override/worker-controller-password.inc
               mountPath: /etc/rspamd/override.d/worker-controller-password.inc
             - name: seed
               subPath: conf/rspamd/local.d
@@ -167,15 +170,16 @@ touch /rspamd/override/worker-controller-password.inc` }}
             - name: seed
               subPath: conf/rspamd/rspamd.conf.override
               mountPath: /etc/rspamd/rspamd.conf.override
-            # rspamd-vol-1 (own RWO PVC); rspamd.sock reaches the other pods through rspamd-sock-relay
-            - name: rspamd
-              subPath: data
+            # rspamd-vol-1: per pod (controller socket for rspamd-sock-relay, stats, caches)
+            - name: rspamd-data
               mountPath: /var/lib/rspamd
           resources:
             {{- toYaml $v.resources | nindent 12 }}
       volumes:
         {{- include "mailcow.seedVolumes" (dict "root" . "shared" true) | nindent 8 }}
-        - name: rspamd
-          persistentVolumeClaim:
-            claimName: {{ include "mailcow.claimName" (list . "rspamd" "rspamd") }}
+        - name: rspamd-data
+          emptyDir:
+            sizeLimit: 1Gi
         {{- include "mailcow.rspamdRelayTlsVolume" (dict "root" . "side" "server") | nindent 8 }}
+{{- include "mailcow.pdb" (dict "root" . "v" $v "component" $c) }}
+{{- include "mailcow.hpa" (dict "root" . "v" $v "component" $c) }}

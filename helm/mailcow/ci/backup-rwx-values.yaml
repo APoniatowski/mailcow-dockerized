@@ -1,5 +1,5 @@
 # Backups on a multi-node cluster: existing ReadWriteMany backup claim (NFS) and RWX mail volumes, so
-# only the rspamd Job keeps a required podAffinity (its RWO volume); external database and Redis by
+# no backup Job needs a podAffinity (and dovecot does not mount the backup claim); external database and Redis by
 # DNS name (network dumps with a newer client image); postfix with a queue per pod (not backed up).
 backup:
   enabled: true

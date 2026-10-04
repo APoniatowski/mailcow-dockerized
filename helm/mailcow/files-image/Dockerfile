@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 # mailcow files image: data/web, data/conf, data/assets, data/hooks of one mailcow release.
 # Every chart pod copies its slice into an emptyDir from this image (initContainer "seed"),
-# the TLS bootstrap Job uses its openssl + curl, the rspamd controller socket relays its socat.
+# the TLS bootstrap Job uses its openssl + curl, the rspamd controller socket relays and the external
+# Redis TLS relay its socat, the cron scheduler (cronjobs.mode scheduler) busybox crond + kubectl.
 #
 # Build from the repository root with BuildKit (docker buildx), which picks up Dockerfile.dockerignore
 # next to this file; the legacy builder ignores that file and would copy generated secrets:
@@ -11,12 +12,21 @@
 #     -t <registry>/mailcow-files:<release> .
 # Releases: build from a clean export (tracked files only), with any builder:
 #   git archive HEAD | docker build -f helm/mailcow/files-image/Dockerfile -t <registry>/mailcow-files:<release> -
+# kubectl for the cron scheduler; keep in line with the chart's cronjobs.image.tag
+ARG KUBECTL_VERSION=v1.36.5
+FROM registry.k8s.io/kubectl:${KUBECTL_VERSION} AS kubectl
+
 FROM alpine:3.23
 
 LABEL org.opencontainers.image.title="mailcow-files" \
       org.opencontainers.image.source="https://github.com/mailcow/mailcow-dockerized"
 
-RUN apk add --no-cache openssl curl socat
+RUN apk add --no-cache openssl curl socat tzdata
+
+COPY --from=kubectl /bin/kubectl /usr/local/bin/kubectl
+
+# uid/gid 10900 of the chart's helper containers; named so busybox crond can run jobs as it
+RUN addgroup -S -g 10900 mailcow && adduser -S -D -H -h /tmp -s /bin/sh -G mailcow -u 10900 mailcow
 
 COPY data/web /mailcow/data/web
 COPY data/conf /mailcow/data/conf

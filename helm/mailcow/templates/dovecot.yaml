@@ -2,6 +2,8 @@
 {{- $v := .Values.dovecot }}
 {{- $m := .Values.mailcow }}
 {{- $reload := include "mailcow.tlsReload" . }}
+{{- /* backup PVC created by the chart: mounted so WaitForFirstConsumer storage binds it at install */}}
+{{- $bindBackup := and .Values.backup.enabled (not .Values.backup.persistence.existingClaim) }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -145,6 +147,15 @@ spec:
             # rspamd.sock from the rspamd-sock sidecar (rspamd-pipe-ham/spam)
             - name: rspamd-sock
               mountPath: /var/lib/rspamd
+            {{- if $bindBackup }}
+            # unused by dovecot: binds a WaitForFirstConsumer backup PVC at install (otherwise only the
+            # backup Jobs use it and `helm install --wait` waits for it forever), on dovecot's node, which
+            # every backup Job with a ReadWriteOnce backup PVC must share anyway. Read-only; grants nothing
+            # new (dovecot already holds all mail, the mail_crypt keys and DBPASS/REDISPASS).
+            - name: backup
+              mountPath: /backup
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml $v.resources | nindent 12 }}
       volumes:
@@ -164,3 +175,9 @@ spec:
         - name: crypt
           persistentVolumeClaim:
             claimName: {{ include "mailcow.claimName" (list . "crypt" "crypt") }}
+        {{- if $bindBackup }}
+        - name: backup
+          persistentVolumeClaim:
+            claimName: {{ include "mailcow.fullname" . }}-backup
+            readOnly: true
+        {{- end }}

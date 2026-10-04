@@ -1,4 +1,5 @@
-# Multi-node cluster: RWX shared volume, cloud LoadBalancer with PROXY protocol, opt-in extras.
+# Multi-node cluster: RWX shared volume, cloud LoadBalancer with PROXY protocol, rspamd HPA (spread over
+# nodes), opt-in extras.
 mailcow:
   hostname: mail.example.org
   networks: 100.64.0.0/16
@@ -39,3 +40,9 @@ watchdog:
 
 networkPolicy:
   enabled: true
+
+rspamd:
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4

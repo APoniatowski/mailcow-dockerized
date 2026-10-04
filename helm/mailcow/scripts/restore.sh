@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Restores a backup written by the chart's backup CronJobs (backup.enabled) into a running release:
 # the kubectl counterpart of `helper-scripts/backup_and_restore.sh restore`. Also restores the
-# vmail/crypt/redis/rspamd/postfix archives and the MariaDB physical backup of a compose
-# backup_and_restore.sh backup copied into the backup PVC (migration from compose).
+# vmail/crypt/redis/postfix archives and the MariaDB physical backup of a compose
+# backup_and_restore.sh backup copied into the backup PVC (migration from compose); a compose rspamd
+# archive is skipped (the chart keeps rspamd's state in Redis only).
 #
 #   restore.sh --namespace NS --release REL --list [--backup mailcow-YYYY-MM-DD-HH-MM-SS]
 #   restore.sh --namespace NS --release REL --backup mailcow-YYYY-MM-DD-HH-MM-SS \
-#              [--components all|mysql,redis,crypt,vmail,rspamd,postfix,sogo] [--resync] [--yes]
+#              [--components all|mysql,redis,crypt,vmail,postfix,sogo] [--resync] [--yes]
 #
 # Options:
 #   --namespace NS        namespace of the release (required)
@@ -116,12 +117,6 @@ claim_of() {
 }
 cronjob_jsonpath() {
   k get cronjob -l "${SEL},app.kubernetes.io/component=backup,mailcow.email/backup-group $1" -o jsonpath="$2" 2>/dev/null || true
-}
-# uname -m style architecture of a node from its kubernetes.io/arch label (empty if not readable)
-node_arch() {
-  local a
-  a=$("${KC[@]}" get node "$1" -o jsonpath='{.metadata.labels.kubernetes\.io/arch}' 2>/dev/null || true)
-  case "${a}" in amd64) echo x86_64 ;; arm64) echo aarch64 ;; *) echo "${a}" ;; esac
 }
 
 NAME_LABEL=$(k get sts -l "${SEL},app.kubernetes.io/component=dovecot" -o jsonpath='{.items[0].metadata.labels.app\.kubernetes\.io/name}' 2>/dev/null || true)
@@ -324,21 +319,8 @@ if has postfix && [ -n "$(k get sts -l "${SEL},app.kubernetes.io/component=postf
   cannot postfix "postfix.spoolPerPod: one queue PVC per pod, restore the postfix archive by hand (README \"Backup and restore\")"
 fi
 if has rspamd; then
-  MARK=$(grep -E '^\.(x86_64|aarch64)$' <<<"${FILES}" | head -n 1 | sed 's/^\.//' || true)
-  # rspamd's data must match the CPU of the node rspamd runs on, not the node of this pod
-  node=$(k get pod -l "${SEL},app.kubernetes.io/component=rspamd" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
-  arch="" where="node ${node} of the rspamd pod"
-  [ -z "${node}" ] || arch=$(node_arch "${node}")
-  if [ -z "${arch}" ]; then
-    arch=$(k exec "${INSPECT}" -c tools -- uname -m)
-    where="this pod's node (rspamd pod or its node not readable)"
-  fi
-  if [ -z "${MARK}" ]; then
-    echo "warning: no architecture marker in ${DIR}; if rspamd crashes after the restore, empty its PVC"
-  elif [ "${MARK}" != "${arch}" ]; then
-    echo "warning: rspamd data is from ${MARK}, ${where} is ${arch}: skipping rspamd (not portable)"
-    drop rspamd
-  fi
+  # the chart keeps no rspamd volume: per-pod /var/lib/rspamd, Bayes/fuzzy/history/ratelimits in Redis
+  cannot rspamd "rspamd has no volume in this chart (its state lives in Redis, restore redis instead)"
 fi
 [ ${#SELECTED[@]} -gt 0 ] || die "nothing left to restore"
 
@@ -367,7 +349,6 @@ for c in "${SELECTED[@]}"; do
     vmail) MOUNTS+=("vmail|$(claim_of dovecot vmail)|/vmail|") ;;
     crypt) MOUNTS+=("crypt|$(claim_of dovecot crypt)|/crypt|") ;;
     redis) MOUNTS+=("redis|$(claim_of redis data)|/redis|") ;;
-    rspamd) cl=$(claim_of rspamd rspamd); MOUNTS+=("rspamd|${cl}|/rspamd|data" "rspamd|${cl}|/rspamd_override|override") ;;
     postfix) MOUNTS+=("spool|$(claim_of postfix spool)|/postfix|") ;;
     sogo) MOUNTS+=("sogo-backup|$(claim_of sogo backup)|/sogo_backup|") ;;
     mysql) [ -z "${PHYSICAL}" ] || MOUNTS+=("mysql|$(claim_of mysql data)|/backup_mariadb|") ;;
@@ -386,7 +367,6 @@ for c in "${SELECTED[@]}"; do
     mysql) for w in php-fpm sogo dovecot postfix acme; do STOP[${w}]=1; done; [ -n "${PHYSICAL}" ] && STOP[mysql]=1 ;;
     redis) STOP[redis]=1 ;;
     crypt|vmail) STOP[dovecot]=1 ;;
-    rspamd) STOP[rspamd]=1 ;;
     postfix) STOP[postfix]=1 ;;
     sogo) STOP[sogo]=1 ;;
   esac

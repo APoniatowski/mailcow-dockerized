@@ -252,9 +252,77 @@ except mailcow.networks (in-cluster pods from the pod CIDR would be trusted as i
 {{- end -}}
 {{- end -}}
 
-{{/* DBPORT */}}
+{{/* DBPORT: the external port for the ExternalName/EndpointSlice aliases; 3306 for the bundled server and
+the ProxySQL TLS proxy (externalDatabase.tls) */}}
 {{- define "mailcow.dbPort" -}}
-{{- if .Values.externalDatabase.enabled -}}{{- int .Values.externalDatabase.port -}}{{- else -}}3306{{- end -}}
+{{- if and .Values.externalDatabase.enabled (not (include "mailcow.dbTls" .)) -}}{{- int .Values.externalDatabase.port -}}{{- else -}}3306{{- end -}}
+{{- end -}}
+
+{{/* "true" when the external database is reached through the ProxySQL TLS proxy <fullname>-db-tls */}}
+{{- define "mailcow.dbTls" -}}
+{{- if .Values.externalDatabase.tls.enabled -}}
+{{- if not .Values.externalDatabase.enabled -}}{{- fail "externalDatabase.tls.enabled needs externalDatabase.enabled (TLS to the bundled mysql StatefulSet is not supported)" -}}{{- end -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* "true" when the external Redis is reached through the TLS relay <fullname>-redis-tls */}}
+{{- define "mailcow.redisTls" -}}
+{{- if .Values.externalRedis.tls.enabled -}}
+{{- if not .Values.externalRedis.enabled -}}{{- fail "externalRedis.tls.enabled needs externalRedis.enabled (TLS to the bundled redis StatefulSet is not supported)" -}}{{- end -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* external host:port validation shared by the aliases and the TLS proxies; returns the address
+family ("IPv4", "IPv6", "" = DNS name). include "mailcow.externalHost" (dict "what" "externalRedis" "host" .host "port" .port) */}}
+{{- define "mailcow.externalHost" -}}
+{{- $host := trim (toString .host) -}}
+{{- if not $host -}}{{- fail (printf "%s.enabled needs %s.host (DNS name or IP address)" .what .what) -}}{{- end -}}
+{{- $port := int .port -}}
+{{- if or (lt $port 1) (gt $port 65535) -}}{{- fail (printf "%s.port must be 1-65535" .what) -}}{{- end -}}
+{{- $family := include "mailcow.ipFamily" $host -}}
+{{- if and (not $family) (not (regexMatch `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*\.?$` (lower $host))) -}}
+{{- fail (printf "%s.host %q is neither an IP address nor a valid DNS name" .what $host) -}}
+{{- end -}}
+{{- $family -}}
+{{- end -}}
+
+{{/* TLS proxy pods (redis-tls, db-tls): plain listener for release pods only, always rendered while the
+proxy exists: it lends its client certificate (if any) to whoever connects.
+include "mailcow.tlsProxyPolicy" (dict "root" . "component" "redis-tls" "port" 6379) */}}
+{{- define "mailcow.tlsProxyPolicy" -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "mailcow.fullname" .root }}-{{ .component }}
+  labels:
+    {{- include "mailcow.labels" (dict "root" .root "component" .component) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "mailcow.selectorLabels" (dict "root" .root "component" .component) | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        {{- include "mailcow.releasePeer" .root | nindent 8 }}
+      ports:
+        - port: {{ .port }}
+          protocol: TCP
+{{- end -}}
+
+{{/* Secret volume with the given keys, mode 0444 (the proxies run as mailcow.helperUid, Secret files are
+root-owned; only the proxy container mounts it). include "mailcow.keysVolume" (dict "name" "ca" "secret" "x" "keys" (list "ca.crt")) */}}
+{{- define "mailcow.keysVolume" -}}
+- name: {{ .name }}
+  secret:
+    secretName: {{ .secret }}
+    defaultMode: 0444
+    items:
+      {{- range .keys }}
+      - key: {{ . }}
+        path: {{ . }}
+      {{- end }}
 {{- end -}}
 
 {{/* Services `<alias>` and `<component>-mailcow` for an external endpoint, instead of the selector Services.
@@ -266,15 +334,10 @@ include "mailcow.externalServices" (dict "root" $ "component" "mysql" "alias" "m
 {{- $root := .root -}}
 {{- $what := .what -}}
 {{- $host := trim (toString .host) -}}
-{{- if not $host -}}{{- fail (printf "%s.enabled needs %s.host (DNS name or IP address)" $what $what) -}}{{- end -}}
 {{- $port := int .port -}}
-{{- if or (lt $port 1) (gt $port 65535) -}}{{- fail (printf "%s.port must be 1-65535" $what) -}}{{- end -}}
-{{- $family := include "mailcow.ipFamily" $host -}}
+{{- $family := include "mailcow.externalHost" (dict "what" $what "host" $host "port" $port) -}}
 {{- $ip := $host | trimPrefix "[" | trimSuffix "]" -}}
 {{- $dns := lower $host -}}
-{{- if and (not $family) (not (regexMatch `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*\.?$` $dns)) -}}
-{{- fail (printf "%s.host %q is neither an IP address nor a valid DNS name" $what $host) -}}
-{{- end -}}
 {{- if and (not $family) (ne $port (int .svcPort)) -}}
 {{- fail (printf "%s.port %d: with a DNS host the Services are ExternalName aliases, which cannot remap ports, and mailcow components connect to %d. Use %d, or an IP address as host (the EndpointSlice then maps %d to %d)" $what $port (int .svcPort) (int .svcPort) (int .svcPort) $port) -}}
 {{- end -}}

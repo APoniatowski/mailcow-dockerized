@@ -2,7 +2,8 @@
 In-cluster Services: every compose alias and every container name (*-mailcow) gets a ClusterIP
 Service, because mailcow code addresses both. Services of skipped components stay so the names
 resolve and connections fail fast. externalDatabase / externalRedis: `mysql`/`mysql-mailcow` and
-`redis`/`redis-mailcow` alias the external host instead (mailcow.externalServices).
+`redis`/`redis-mailcow` alias the external host instead (mailcow.externalServices), or with `tls.enabled`
+select the TLS proxy pods (component db-tls / redis-tls).
 [component, alias, ports [name port protocol]]
 */ -}}
 {{- $root := . }}
@@ -21,9 +22,13 @@ resolve and connections fail fast. externalDatabase / externalRedis: `mysql`/`my
   (list "nginx" "nginx" (list (list "http" (int .Values.mailcow.httpPort) "TCP") (list "https" (int .Values.mailcow.httpsPort) "TCP") (list "http-8081" 8081 "TCP") (list "http-9081" 9081 "TCP") (list "https-9082" 9082 "TCP")))
   (list "dockerapi" "dockerapi" (list (list "https" 443 "TCP")))
   (list "olefy" "olefy" (list (list "olefy" 10055 "TCP"))) }}
-{{- $external := dict "mysql" .Values.externalDatabase.enabled "redis" .Values.externalRedis.enabled }}
+{{- $dbTls := include "mailcow.dbTls" . }}
+{{- $redisTls := include "mailcow.redisTls" . }}
+{{- $external := dict "mysql" (and .Values.externalDatabase.enabled (not $dbTls)) "redis" (and .Values.externalRedis.enabled (not $redisTls)) }}
+{{- $proxy := dict "mysql" (ternary "db-tls" "" (eq $dbTls "true")) "redis" (ternary "redis-tls" "" (eq $redisTls "true")) }}
 {{- range $svcs }}
 {{- $component := index . 0 }}{{ $alias := index . 1 }}{{ $ports := index . 2 }}
+{{- $target := get $proxy $component | default $component }}
 {{- if not (get $external $component) }}
 {{- range $name := list $alias (printf "%s-mailcow" $component) }}
 ---
@@ -33,13 +38,16 @@ metadata:
   name: {{ $name }}
   labels:
     {{- include "mailcow.labels" (dict "root" $root "component" $component) | nindent 4 }}
+    {{- if ne $target $component }}
+    mailcow.email/external: "true"
+    {{- end }}
 spec:
   type: ClusterIP
   {{- if and (eq $component "unbound") (eq $name "unbound") }}
   clusterIP: {{ $root.Values.unbound.clusterIP }}
   {{- end }}
   selector:
-    {{- include "mailcow.selectorLabels" (dict "root" $root "component" $component) | nindent 4 }}
+    {{- include "mailcow.selectorLabels" (dict "root" $root "component" $target) | nindent 4 }}
   ports:
     {{- range $ports }}
     - name: {{ index . 0 }}
@@ -51,12 +59,12 @@ spec:
 {{- end }}
 {{- end }}
 {{- with .Values.externalDatabase }}
-{{- if .enabled }}
+{{- if and .enabled (not $dbTls) }}
 {{- include "mailcow.externalServices" (dict "root" $root "component" "mysql" "alias" "mysql" "what" "externalDatabase" "host" .host "port" .port "svcPort" .port "portName" "mysql") }}
 {{- end }}
 {{- end }}
 {{- with .Values.externalRedis }}
-{{- if .enabled }}
+{{- if and .enabled (not $redisTls) }}
 {{- include "mailcow.externalServices" (dict "root" $root "component" "redis" "alias" "redis" "what" "externalRedis" "host" .host "port" .port "svcPort" 6379 "portName" "redis") }}
 {{- end }}
 {{- end }}

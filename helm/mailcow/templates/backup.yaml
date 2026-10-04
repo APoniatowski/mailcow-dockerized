@@ -26,7 +26,6 @@ script's. README "Backup and restore"; restore with scripts/restore.sh.
   (dict "name" "mysql" "on" $comp.mysql "owners" list "vols" list)
   (dict "name" "redis" "on" $comp.redis "owners" list "vols" list)
   (dict "name" "mail" "on" (or $comp.crypt $comp.vmail) "owners" (list "dovecot") "vols" (list $p.vmail.accessMode $p.crypt.accessMode))
-  (dict "name" "rspamd" "on" $comp.rspamd "owners" (list "rspamd") "vols" (list $p.rspamd.accessMode))
   (dict "name" "postfix" "on" $postfixOn "owners" (list "postfix") "vols" (list $p.postfix.accessMode))
   (dict "name" "sogo" "on" $sogoOn "owners" (list "sogo") "vols" (list $p.sogoBackup.accessMode)) }}
 {{- $first := "" }}
@@ -107,9 +106,9 @@ spec:
           {{- include "mailcow.podCommon" (dict "root" $root) | nindent 10 }}
           {{- /* The scheduler only counts an existing pod for required pod affinity if it matches
                  ALL required terms, so two terms selecting different pods can never be met. Require
-                 the first (the volume owner, else dovecot); prefer the rest. rspamd shares dovecot's
-                 node anyway through the shared PVC; for postfix/sogo on several nodes use an RWX
-                 backup volume (README "Scheduling and storage"). */}}
+                 the first (the volume owner, else dovecot); prefer the rest. For postfix/sogo on several
+                 nodes use an RWX backup volume (README "Scheduling and storage"). rspamd has no volume:
+                 its state is in Redis (group redis). */}}
           {{- with $aff }}
           affinity:
             podAffinity:
@@ -210,10 +209,6 @@ spec:
                   {{- if $comp.vmail }}
                   archive backup_vmail.tar.zst /vmail
                   {{- end }}
-                  {{- else if eq $g.name "rspamd" }}
-                  # architecture marker, checked by the restore (rspamd data is not portable across arches)
-                  touch "${dir}/.$(uname -m)"
-                  archive backup_rspamd.tar.zst /rspamd /rspamd_override
                   {{- else if eq $g.name "postfix" }}
                   archive backup_postfix.tar.zst /postfix
                   {{- else if eq $g.name "sogo" }}
@@ -245,15 +240,6 @@ spec:
                   mountPath: /vmail
                   readOnly: true
                 {{- end }}
-                {{- else if eq $g.name "rspamd" }}
-                - name: rspamd
-                  subPath: data
-                  mountPath: /rspamd
-                  readOnly: true
-                - name: rspamd
-                  subPath: override
-                  mountPath: /rspamd_override
-                  readOnly: true
                 {{- else if eq $g.name "postfix" }}
                 - name: spool
                   mountPath: /postfix
@@ -283,10 +269,6 @@ spec:
               persistentVolumeClaim:
                 claimName: {{ include "mailcow.claimName" (list $root "vmail" "vmail") }}
             {{- end }}
-            {{- else if eq $g.name "rspamd" }}
-            - name: rspamd
-              persistentVolumeClaim:
-                claimName: {{ include "mailcow.claimName" (list $root "rspamd" "rspamd") }}
             {{- else if eq $g.name "postfix" }}
             - name: spool
               persistentVolumeClaim:

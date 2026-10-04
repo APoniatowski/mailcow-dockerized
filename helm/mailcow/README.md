@@ -8,33 +8,58 @@ variables of the mailcow images (see [Environment contract](#environment-contrac
 ## Install
 
 ```bash
-# 1. files image: data/web, data/conf, data/assets, data/hooks of this checkout. Not published upstream
-#    (the default files.image.repository is a placeholder): build and push it yourself. For releases build
-#    from a clean export, which holds tracked files only:
-git archive HEAD | docker build -f helm/mailcow/files-image/Dockerfile \
-  --build-arg MAILCOW_VERSION=$(git describe --tags --abbrev=0) \
-  --build-arg MAILCOW_COMMIT=$(git rev-parse HEAD) \
-  -t registry.example.org/mailcow-files:2026-09 -
-#    or from the working tree with BuildKit (docker buildx), which applies Dockerfile.dockerignore:
-#    docker buildx build -f helm/mailcow/files-image/Dockerfile -t registry.example.org/mailcow-files:2026-09 .
-docker push registry.example.org/mailcow-files:2026-09
-
-# 2. release (one release per namespace: Services use the fixed compose names)
+# one release per namespace: Services use the fixed compose names
 helm install mailcow helm/mailcow -n mailcow --create-namespace \
   --set mailcow.hostname=mail.example.org \
   --set mailcow.networks=10.244.0.0/16 \
   --set unbound.clusterIP=10.96.53.53 \
-  --set files.image.repository=registry.example.org/mailcow-files
+  --set files.image.repository=ghcr.io/<owner>/mailcow-files
 ```
 
-The files image holds exactly the tracked files of `data/{web,conf,assets,hooks}` (+ openssl, curl,
-socat): `Dockerfile.dockerignore` mirrors every `data/` entry of `.gitignore` and re-includes the tracked
-files those patterns match, so the generated and secret files a compose installation leaves in the
-working tree (`mailcow.conf`-derived configs, `data/conf/rspamd/override.d/*`, `sogo/plist_ldap`, nginx
-`*.conf`, postfix maps, certificates, hooks) stay out. Only BuildKit reads that file; the legacy
-builder would copy everything, and the Dockerfile then fails on a list of known secret files. Untracked
-files that `.gitignore` does not cover still get in from a working tree: hence `git archive` for
-releases.
+### Files image
+
+Every pod copies its config from the files image: the tracked files of `data/{web,conf,assets,hooks}`
+at one commit, plus openssl, curl, socat, tzdata and kubectl (TLS bootstrap, relays, cron scheduler).
+`files.image.tag` defaults to the chart's `appVersion` (the mailcow release).
+
+The workflow `.github/workflows/files_image.yml` builds it for linux/amd64 and linux/arm64 from `git
+archive HEAD` (tracked files only) and pushes `ghcr.io/<owner>/mailcow-files`:
+
+| trigger | tags |
+|---|---|
+| push to `master` / `staging` | `:<branch>`, `:sha-<short sha>` |
+| release tag (`2026-09`, `2026-09a`, ...) | `:<tag>` (= `appVersion`, the default `files.image.tag`) |
+| manual run (workflow_dispatch) | as above, for the selected branch or tag |
+| pull request | build only, nothing pushed |
+
+Publishing it from a fork:
+
+1. Enable Actions on the fork (Settings > Actions; a fresh fork also asks for confirmation on the
+   Actions tab). No secrets needed: the workflow pushes with `GITHUB_TOKEN`.
+2. Push a release tag, `master` or `staging`, or run the workflow manually.
+3. The first push creates a **private** package `mailcow-files`: make it public (Packages >
+   mailcow-files > Package settings > Change visibility), or keep it private and give the chart a
+   ghcr.io pull secret through `imagePullSecrets`.
+4. Set `files.image.repository: ghcr.io/<owner, lower case>/mailcow-files` (tag: `appVersion` by
+   default, or a branch / `sha-` tag).
+
+Building it by hand (e.g. for the local kind cluster), from a clean export:
+
+```bash
+git archive HEAD | docker build -f helm/mailcow/files-image/Dockerfile \
+  --build-arg MAILCOW_VERSION=$(git describe --tags --abbrev=0) \
+  --build-arg MAILCOW_COMMIT=$(git rev-parse HEAD) \
+  -t registry.example.org/mailcow-files:2026-09 -
+```
+
+or from the working tree with BuildKit (`docker buildx build -f helm/mailcow/files-image/Dockerfile
+-t ... .`), which applies `Dockerfile.dockerignore`: it mirrors every `data/` entry of `.gitignore` and
+re-includes the tracked files those patterns match, so the generated and secret files a compose
+installation leaves in the working tree (`mailcow.conf`-derived configs, `data/conf/rspamd/override.d/*`,
+`sogo/plist_ldap`, nginx `*.conf`, postfix maps, certificates, hooks) stay out. The legacy builder
+ignores that file and would copy everything; the Dockerfile then fails on a list of known secret
+files. Untracked files that `.gitignore` does not cover still get in from a working tree: hence `git
+archive`. `--build-arg KUBECTL_VERSION=v1.xx.y` picks the kubectl of the cron scheduler.
 
 GitOps and other client-side renderers (Argo CD, Flux with `helm template`-style rendering, `helm
 template | kubectl apply`) cannot run `lookup`: every render would generate new passwords and a new
@@ -61,17 +86,17 @@ Login: `admin` / `moohoo`. API key: `kubectl -n mailcow get secret mailcow-secre
 | compose service | Kubernetes |
 |---|---|
 | unbound | Deployment + Service `unbound` with fixed ClusterIP; repo `unbound.conf` + appended `forward-zone` for `clusterDomain` → `clusterDNS` (`domain-insecure`, DNSSEC stays on for the rest), plus `forward-zone "."` → `unbound.forwarders` when set |
-| mysql, redis | StatefulSet (1 replica, PVC), or an external server (`externalDatabase` / `externalRedis`, [External database / Redis](#external-database--redis)). Clients use TCP (`DBHOST=mysql`) |
+| mysql, redis | StatefulSet (1 replica, PVC), or an external server (`externalDatabase` / `externalRedis`, optionally over TLS through a proxy: [External database / Redis](#external-database--redis)). Clients use TCP (`DBHOST=mysql`) |
 | dovecot | StatefulSet (1 replica) |
 | postfix | StatefulSet `<fullname>-postfix`, `postfix.replicas` (default 1; > 1 with a queue PVC per pod in StatefulSet `<fullname>-postfix-spool`, [Scaling](#scaling)) |
-| rspamd | Deployment (1 replica), `hostname: rspamd` (worker-proxy binds `rspamd:9900`), own PVC; controller socket relayed over TCP 11335 with mutual TLS ([Storage](#storage)) |
+| rspamd | Deployment, `rspamd.replicas` or an HPA, `hostname: rspamd` (worker-proxy binds `rspamd:9900`, the own pod IP in every replica), per-pod `/var/lib/rspamd`; controller socket relayed over TCP 11335 with mutual TLS ([Storage](#storage)) |
 | php-fpm, sogo, nginx | Deployment, `replicas` or an HPA ([Scaling](#scaling)) |
 | clamd, olefy, memcached, postfix-tlspol | Deployment |
 | dockerapi | Deployment + ServiceAccount/Role (pods list/delete, pods/exec create/get, replicasets get, deployments/statefulsets patch, metrics.k8s.io pods get), `DOCKERAPI_BACKEND=kubernetes`; restart = rollout restart of the owning Deployment/StatefulSet; Services `dockerapi`/`dockerapi-mailcow`, NetworkPolicy always on. **See [Namespace](#namespace)** |
 | acme | optional (`acme.enabled`), default off → cert-manager / Secret / self-signed |
 | watchdog | optional (`watchdog.enabled`); probes do the self-healing |
 | netfilter | not shipped: fail2ban is not supported on Kubernetes, see [Brute-force protection](#brute-force-protection-no-fail2ban) |
-| ofelia | one CronJob per ofelia job, `kubectl exec` into the main container |
+| ofelia | `cronjobs.mode`: one scheduler Deployment with busybox crond (default) or one CronJob per ofelia job; either runs `kubectl exec` into the main container ([CronJobs](#cronjobs-ofelia)) |
 
 Naming contract: pods carry `app.kubernetes.io/component=<svc>` (`<svc>` = compose service minus
 `-mailcow`, e.g. `php-fpm`), the main container is named `<svc>-mailcow`. Every compose alias
@@ -115,7 +140,6 @@ extraSecretFiles:
 |---|---|
 | `vmail`, `vmail-index`, `crypt` | dovecot (**back up `crypt`**, without it mail is unreadable; [Backup and restore](#backup-and-restore)) |
 | `mysql`, `redis`, `postfix-tlspol`, `sogo-backup`, `clamd-db` | their component (`mysql`/`redis` not created with `externalDatabase`/`externalRedis`) |
-| `rspamd` | rspamd: `data/` = `/var/lib/rspamd` (controller socket, non-critical state; bayes and fuzzy hashes live in Redis), `override/worker-controller-password.inc` (UI password) |
 | `postfix` | postfix (+ watchdog, same node). With `postfix.spoolPerPod`: one claim `spool-<fullname>-postfix-spool-<n>` per pod instead, not mounted by watchdog ([Scaling](#scaling)) |
 | `shared` (subPaths) | see below |
 
@@ -124,6 +148,7 @@ Only directories that one pod writes and another reads at runtime remain on `sha
 | subPath | written by | read by |
 |---|---|---|
 | `rspamd-custom` (`data/conf/rspamd/custom`) | php-fpm (UI maps), dovecot (`sa-rules` CronJob) | rspamd |
+| `rspamd-override/worker-controller-password.inc` (rspamd UI password, compose: `data/conf/rspamd/override.d`) | dockerapi (`rspamd/worker_password`, exec into one rspamd pod, then a rollout restart of the Deployment) | every rspamd replica |
 | `global-sieve/{before,after}` | php-fpm (UI global filters) | dovecot |
 | `ssl`, `acme-challenge` (only `acme.enabled`) | acme | nginx, postfix, dovecot, watchdog |
 
@@ -150,6 +175,13 @@ Not shared (compose shares them through bind mounts or named volumes):
   (`DOVECOT_MASTER_USER`, `DOVECOT_MASTER_PASS`, `SOGO_SSO_PASS`, same `echo`/`echo -n` as the
   entrypoint). With `existingSecret` nothing new is needed: those keys were already required. The
   SOGo CronJobs read the files in the sogo pod.
+- rspamd's `/var/lib/rspamd` (compose: `rspamd-vol-1`, shared with php-fpm, dovecot, postfix and
+  watchdog for the controller socket) is an `emptyDir` per rspamd pod. What rspamd keeps there is
+  per-instance and rebuilt on demand: the controller socket, the controller's counters (`stats.ucl`:
+  scanned/learned numbers shown in the UI), downloaded map and hyperscan caches. Everything that must
+  survive lives in Redis: mailcow's `local.d/redis.conf` (written by the entrypoint) points every
+  module at `redis:6379`, and `statistic.conf` (Bayes), `worker-fuzzy.inc` (fuzzy hashes),
+  `history_redis.conf`, ratelimits, greylisting and reputation use it.
 - rspamd's controller socket (`/var/lib/rspamd/rspamd.sock`, trusted without password by
   `worker-controller.inc`: full controller access): the rspamd pod runs a native sidecar
   `rspamd-sock-relay` (socat, files image) that forwards TCP 11335 to the socket with **mutual TLS**
@@ -203,7 +235,7 @@ Notes on the aliases:
 - An IPv6 address needs an IPv6-capable (single- or dual-stack) cluster, and vice versa: the Service
   family must match the address.
 - Switching an existing release between the in-cluster server and an external one (or between DNS
-  and IP hosts) changes the Service type; if Helm reports an immutable field, delete the four
+  and IP hosts, or `tls.enabled` on and off) changes the Service type; if Helm reports an immutable field, delete the four
   Services and upgrade again. Data does not move by itself: dump the in-cluster database
   (`mariadb-dump`) and restore it into the external one before switching.
 
@@ -233,10 +265,11 @@ high availability of the database are yours.
 #### Redis (`externalRedis`)
 
 - Its password must equal `REDISPASS` from the release Secret (`requirepass`, or the default user's
-  password). No TLS: mailcow's Redis clients (PHP, Python, Lua, `redis-cli`) speak plain TCP.
+  password). mailcow's Redis clients (PHP, Python, Lua, `redis-cli`) speak plain TCP; for TLS see
+  [TLS to the external database / Redis](#tls-to-the-external-database--redis).
 - mailcow components hard-code port 6379. With a DNS `host` the port must therefore be 6379 (the chart
   fails otherwise, ExternalName cannot remap ports); with an IP `host` the Services listen on 6379 and
-  the EndpointSlice maps it to `externalRedis.port`.
+  the EndpointSlice maps it to `externalRedis.port`. With `externalRedis.tls.enabled` any port works.
 - rspamd sends `SLAVEOF NO ONE` on every start (compose behaviour): point `host` at a primary, never
   at a replica. Managed services that reject the command just log an error.
 - Give mailcow a Redis of its own: its keys are unprefixed, in the default database. mailcow keeps
@@ -244,6 +277,67 @@ high availability of the database are yours.
   backups.
 - watchdog (off by default) checks Redis with `check_tcp -4`: with an IPv6 Redis its Redis check
   fails. Its restart action for mysql/redis finds no pod with either external server.
+
+#### TLS to the external database / Redis
+
+mailcow's clients have no TLS settings for MySQL or Redis. `externalDatabase.tls.enabled` /
+`externalRedis.tls.enabled` put a proxy in between: it listens in plain text inside the namespace and
+opens TLS connections to `host:port`. The Services `mysql` + `mysql-mailcow` / `redis` + `redis-mailcow`
+then become ordinary ClusterIP Services selecting the proxy pods (no ExternalName / EndpointSlice), so
+clients keep using the same names and ports (`DBHOST=mysql`, `DBPORT=3306`, `redis:6379`). Without
+`tls.enabled` nothing changes.
+
+| | Redis: `<fullname>-redis-tls` | MySQL/MariaDB: `<fullname>-db-tls` |
+|---|---|---|
+| proxy | socat from the files image (TLS is a plain wrapper around the Redis protocol) | ProxySQL 2.x (`externalDatabase.tls.image`, GPL-3.0): MySQL switches to TLS inside its protocol, a byte relay cannot add it |
+| listens | 6379, plain | 3306, plain (ProxySQL user = `DBUSER`/`DBPASS` from the release Secret) |
+| server certificate | `caSecret` (`ca.crt`), empty = public CA bundle of the files image; name = `serverName`, empty = `host` (an IP `host` is checked against the certificate's IP addresses); `serverName` is also the SNI | `caSecret` (`ca.crt`), required with `verify: true`. **Chain only: ProxySQL does not check the server name** (below) |
+| client certificate | `clientCertSecret` (`tls.crt`/`tls.key`), optional | `clientCertSecret` (`tls.crt`/`tls.key`), optional (users with `REQUIRE X509`) |
+| no verification | `insecureSkipVerify: true` | `verify: false` |
+| replicas | `externalRedis.tls.replicas` (PDB and soft spread above 1) | `externalDatabase.tls.replicas` (same) |
+| rotation | certificate files are read per connection: no restart needed | read at start: `kubectl rollout restart deployment/<fullname>-db-tls` after a rotation |
+
+Both run as uid 10900 with a read-only root filesystem and every capability dropped, use the cluster DNS
+(kube-dns, not unbound: in-cluster Service names and private zones the cluster resolves work), and are
+hidden from dockerapi (not part of the UI's container list). A NetworkPolicy, rendered even with
+`networkPolicy.enabled: false`, admits only pods of this release to the plain port: the proxy hands its
+client certificate to whoever connects. With `networkPolicy.egress.enabled` a server inside
+`networkPolicy.egress.clusterCIDRs` (an operator in another namespace) must be added to
+`networkPolicy.egress.extraTo`, as without TLS.
+
+Redis relay: at start it logs one verification of the server certificate (`TLS check ...: ok` or
+`FAILED` with the reason, e.g. `hostname mismatch`, `certificate required`) and relays either way;
+socat itself logs errors only, so a later failure shows up as connection errors in the clients and the
+server's log. Tested against `redis:7.4` with `--tls-port`, `--port 0` and `--tls-auth-clients yes`
+(wrong CA, wrong name and missing client certificate are refused, `PING`/`SET`/`GET` through the relay work).
+
+ProxySQL (`proxysql.cnf` is generated by an initContainer on every pod start):
+
+- Multiplexing is off: every client connection gets its own TLS connection to the server for its
+  lifetime, so session state (`SET NAMES`, `SET FOREIGN_KEY_CHECKS`, transactions, server-side prepared
+  statements of PDO with `ATTR_EMULATE_PREPARES => false`) behaves as on a direct connection. Verified
+  through ProxySQL 2.7.3 against `mariadb:10.11` with `--require-secure-transport=ON`: `SHOW STATUS
+  LIKE 'Ssl_cipher'` on the proxied session returns the server's TLS cipher; php-fpm's `init_db.inc.php`
+  creates the full schema; the entrypoint's `DROP EVENT` / `CREATE EVENT` blocks (`DELIMITER`),
+  `mariadb-admin status` (the start-up wait loops), multi-statement queries, PDO transactions, rollback,
+  `lastInsertId`, utf8mb4, a 50 MiB value and `mariadb-dump --single-transaction` + restore (backups) work.
+- **The server name is not verified.** ProxySQL (2.7 and 3.0) checks the certificate chain against
+  `caSecret` but has no setting to check the host name: any certificate signed by that CA is accepted.
+  Use a CA that signs only database servers you trust (a private CA, or the provider's database CA:
+  then any database server of that provider/region with a certificate from it could impersonate yours).
+  Never a public CA bundle (the chart requires `caSecret` with `verify: true`). If you need host name
+  verification, the alternative is TLS in mailcow's clients themselves, which needs image changes
+  (PDO `MYSQL_ATTR_SSL_CA`, dovecot/postfix/SOGo connection settings, the `mariadb` CLI calls).
+- The monitor is off (`mysql-monitor_enabled=false`, no extra user needed); a server that refuses
+  connections is shunned for 10 s and retried. The admin interface listens on 127.0.0.1:6032 only, with
+  a random password from Secret `<fullname>-db-tls` (kept on upgrade); the probes use it
+  (`SELECT 1`; a bare TCP probe makes ProxySQL log an "unhealthy client" warning per probe).
+- ProxySQL announces itself as `8.0.11` in the handshake unless `serverVersion` is set; queries,
+  including `SELECT VERSION()`, still reach the real server. mailcow does not check the version.
+- Only `DBUSER` exists in ProxySQL: watchdog's MySQL replication checks (`DBROOT`, off by default) and
+  `scripts/restore.sh` physical restores (bundled server only anyway) do not go through it. The server
+  user authenticates with `mysql_native_password` (MariaDB default); tested with MariaDB only.
+- `--no-version-check`: ProxySQL does not phone home for its latest version.
 
 ### TLS
 
@@ -335,17 +429,46 @@ no sidecar is rendered: the acme container reloads/restarts the daemons through 
 | dovecot-clean-q-aged, dovecot-fts | `0 0 * * *` | dovecot |
 | dovecot-sarules (`@every 24h`) | `0 3 * * *` | dovecot |
 
-All `concurrencyPolicy: Forbid`, time zone `mailcow.tz`; the `MASTER` guards run unchanged inside
-the target container. Override with `cronjobs.jobs.<name>.{enabled,schedule}`. With replicas,
-`kubectl exec deployment/<name>` picks one pod, so each job still runs once per schedule (the
-`MASTER`-guarded SOGo jobs must run once, not per replica). `cronjobs.enabled: false` removes the
-runner's ServiceAccount and Role too. The runner's Role can `get` only the targeted workloads
-(`<fullname>-php-fpm`, `-sogo`, `-dovecot`) but `pods/exec` cannot be scoped to them.
+Every job is a `kubectl exec <workload> -c <svc>-mailcow -- /bin/bash -c '<ofelia command>'`: the
+`MASTER` guards run unchanged inside the target container. With replicas, `kubectl exec
+deployment/<name>` picks one pod, so each job still runs once per schedule (the `MASTER`-guarded SOGo
+jobs must run once, not per replica). Schedules are in `mailcow.tz`; override per job with
+`cronjobs.jobs.<name>.{enabled,schedule}` (both modes). `cronjobs.enabled: false` runs no jobs and
+removes the ServiceAccount and Role too. The Role (shared by both modes) can `get` only the targeted
+workloads (`<fullname>-php-fpm`, `-sogo`, `-dovecot`) but `pods/exec` cannot be scoped to them.
 
-Pod churn: unlike ofelia's in-process timer, every run is a pod. The 14 default CronJobs, 6 of them
-every minute, start about 9,300 short-lived pods a day (each with an API token, an image check and
-scheduler/kubelet work; `ttlSecondsAfterFinished` and the history limits clean them up). Disable what
-you do not use and slow down the rest, e.g.:
+`cronjobs.mode` picks how the jobs are started:
+
+| | `scheduler` (default) | `cronjob` |
+|---|---|---|
+| objects | Deployment `<fullname>-cron` (1 replica, `Recreate`) + ConfigMap with the crontab | one CronJob `<fullname>-<job>` per job |
+| runs | busybox `crond` in the files image starts `kubectl exec` (files image, `/usr/local/bin/kubectl`) | a pod per run with `cronjobs.image` (kubectl) |
+| pods per day (defaults: 14 jobs, 6 of them every minute) | 0 (one long-running pod) | ~9,300 short-lived pods, each with an API token, an image check, scheduler and kubelet work |
+| API load | the same ~9,300 `pods/exec` calls a day | the exec calls plus pod and Job objects |
+| overlap | crond never starts a job while its previous run is still active; ofelia's `no-overlap` jobs (`phpfpm-keycloak-sync`, `phpfpm-ldap-sync`, `dovecot-imapsync-runner`) also hold `flock -n /tmp/<job>.lock` for the run | `concurrencyPolicy: Forbid` |
+| missed runs | lost while the scheduler pod is down (rescheduling, node drain, upgrade), like compose's single ofelia container | started late if the controller catches up within `startingDeadlineSeconds` (120 s) |
+| logs | the scheduler pod's log: crond's `USER mailcow pid ... cmd ... run-job <job>` per start, every output line prefixed `[<job>]`, `[<job>] failed (exit N)` on errors | one pod log per run, kept until `ttlSecondsAfterFinished` |
+| failures | logged, nothing retried (ofelia behaviour) | Job marked failed (`backoffLimit: 0`), nothing retried |
+
+Scheduler details:
+
+- One replica only: two schedulers would run every job twice. `Recreate` stops the old pod before
+  the new one starts; a run in progress during an upgrade is cut off with its `kubectl exec` session
+  (the command in the target container may finish or be killed, as with a restarted ofelia).
+- `crond` starts as root with only `CAP_SETUID`/`CAP_SETGID` (every other capability dropped,
+  read-only root filesystem, no privilege escalation): busybox crond switches to the crontab's user for
+  every job (initgroups/setgid/setuid; as non-root every job fails with `can't set groups: Operation
+  not permitted`) and only reads root-owned crontabs. The jobs run as user `mailcow` (uid 10900,
+  files image) without capabilities. Pod Security: allowed by `baseline`, not by `restricted`.
+- `TZ=mailcow.tz` (the files image carries tzdata); the pod restarts when a schedule or job changes.
+- `cronjobs.scheduler.resources`: crond plus one kubectl process (a few tens of MiB) per running job.
+- kubectl comes from the files image (`ARG KUBECTL_VERSION` in its Dockerfile, default = the chart's
+  `cronjobs.image.tag`); either way kubectl should stay within one minor version of the cluster
+  (kubectl's version skew policy). Rebuild the files image with `--build-arg KUBECTL_VERSION=...` for an
+  older or newer cluster.
+- Run a job by hand: `kubectl -n mailcow exec deploy/<fullname>-cron -- su mailcow -s /bin/sh -c '/etc/mailcow-cron/run-job dovecot-quarantine'`.
+
+With `mode: cronjob`, disable what you do not use and slow down the rest to cut the pod churn, e.g.:
 
 ```yaml
 cronjobs:
@@ -354,9 +477,6 @@ cronjobs:
     phpfpm-ldap-sync: {enabled: false}
     dovecot-imapsync-runner: {schedule: "*/5 * * * *"}   # sync jobs start up to 5 min later
 ```
-
-`cronjobs.image.tag` (kubectl) should stay within one minor version of the cluster (kubectl's
-version skew policy).
 
 ### Scaling
 
@@ -367,7 +487,7 @@ version skew policy).
 | php-fpm | yes | `phpFpm.replicas` or `phpFpm.autoscaling`. PHP sessions in Redis; every pod is `MASTER=y` |
 | postfix | yes | `postfix.replicas` with `postfix.spoolPerPod: true` (queue per pod), no HPA |
 | dovecot | no | several instances need shared maildir storage with locking (NFS + director-style routing) or dsync replication, which Dovecot 2.4 removed |
-| rspamd | no | `/var/lib/rspamd` (controller socket, state) and the UI password file are on its own RWO PVC; worker-proxy binds the pod hostname `rspamd` |
+| rspamd | yes | `rspamd.replicas` or `rspamd.autoscaling`. State in Redis, `/var/lib/rspamd` per pod, UI password on `shared` (all replicas read it, a password change restarts them all). Every pod has `hostname: rspamd`, so worker-proxy's `rspamd:9900` is its own address. The controller relay (11335) and postfix's milter reach any replica through the Service. Per pod: the UI's scanned/learned counters (each UI request may land on another replica); Bayes learning, fuzzy hashes, history and ratelimits are shared through Redis |
 | mysql, redis, unbound, memcached, clamd, olefy, postfix-tlspol, dockerapi, watchdog, acme | no | single instance as in compose |
 
 For every component with more than one pod (replicas > 1 or an HPA) the chart adds a
@@ -499,7 +619,6 @@ self-contained baseline.
 | `redis` | `backup_redis.tar.zst` (`/redis/dump.rdb`) | `redis-cli --rdb` through `redis-mailcow` (replication protocol) | `SAVE`, then the redis volume (same layout) |
 | `crypt` | `backup_crypt.tar.zst` (`/crypt`) | tar of the crypt PVC, read-only | same |
 | `vmail` | `backup_vmail.tar.zst` (`/vmail`) | tar of the vmail PVC, read-only | same |
-| `rspamd` | `backup_rspamd.tar.zst` (`/rspamd`, `/rspamd_override`), `.<arch>` marker | tar of the rspamd PVC (`/var/lib/rspamd` + the UI password) | same (compose keeps the UI password in `data/conf`) |
 | `postfix` | `backup_postfix.tar.zst` (`/postfix`) | tar of the queue PVC; skipped with `postfix.spoolPerPod` | same |
 | `sogo` (off) | `backup_sogo.tar.zst` (`/sogo_backup`) | tar of `sogo-backup` (SOGo's own nightly per-user exports) | not included |
 | - | `mailcow-helm.info` | release, chart, image tags, DBNAME/DBUSER; no secrets | copies `mailcow.conf` (with passwords) |
@@ -507,14 +626,18 @@ self-contained baseline.
 Archives are `tar --use-compress-program="zstd --rsyncable -T<backup.threads>" -Pcpf`, exactly the
 script's call (absolute member paths), made with the same image (`ghcr.io/mailcow/backup`, Debian:
 GNU tar, zstd, pigz; tag pinned by digest in `backup.image`). A compose `backup_and_restore.sh
-restore` can read the vmail, crypt, redis, rspamd and postfix archives, and `restore.sh` reads a
+restore` can read the vmail, crypt, redis and postfix archives, and `restore.sh` reads a
 compose backup directory (see [Migrating from compose](#migrating-from-compose)).
+
+No rspamd archive (the script's `backup_rspamd.tar.zst` of `rspamd-vol-1`): the chart keeps no rspamd
+volume. rspamd's Bayes, fuzzy hashes, history and ratelimits are in Redis (`redis` group); its
+`/var/lib/rspamd` is per pod and disposable (see [Storage](#storage)).
 
 Not backed up, as in the script: `vmail-index` (dovecot rebuilds indexes), `clamd-db` (freshclam
 downloads it), `postfix-tlspol` (a cache), and configuration. Compose keeps configuration in the git
 checkout; here it is your values file and `extraFiles` (keep them in Git) plus the `shared` PVC
-(`rspamd-custom` maps and the `global-sieve` filters edited in the UI): copy those subPaths if you
-change them in the UI. The release Secret (`<release>-secrets` or `existingSecret`) is not backed up
+(`rspamd-custom` maps, the rspamd UI password in `rspamd-override` and the `global-sieve` filters edited
+in the UI): copy those subPaths if you change them in the UI. The release Secret (`<release>-secrets` or `existingSecret`) is not backed up
 either; the backup Jobs have no API access. Export it once and store it encrypted next to the backups:
 
 ```bash
@@ -530,12 +653,12 @@ SOGo's encryption key and the dovecot master credentials then change.
 <backup PVC>/
   mailcow-2026-10-04-02-00-00/      # UTC, scheduled time of the run (script: mailcow-<local date>)
     backup_mysql.sql.zst  backup_redis.tar.zst  backup_crypt.tar.zst  backup_vmail.tar.zst
-    backup_rspamd.tar.zst  backup_postfix.tar.zst  .x86_64  mailcow-helm.info
+    backup_postfix.tar.zst  mailcow-helm.info
 ```
 
-One CronJob per group: `<fullname>-backup-{mysql,redis,mail,rspamd,postfix,sogo}` (`mail` = crypt,
+One CronJob per group: `<fullname>-backup-{mysql,redis,mail,postfix,sogo}` (`mail` = crypt,
 then vmail). The volume groups must run on the node of their owner's ReadWriteOnce volume (required
-podAffinity to dovecot, rspamd, postfix or sogo) and those owners may sit on different nodes, so one
+podAffinity to dovecot, postfix or sogo) and those owners may sit on different nodes, so one
 pod with several containers cannot carry them all. Every group runs on `backup.schedule` (in
 `mailcow.tz`) and picks its directory from the Job name, which the CronJob controller sets to
 `<cronjob>-<scheduled time in minutes since the epoch>`: all groups of one run land in one directory,
@@ -554,7 +677,7 @@ A manual run outside the schedule: give all Jobs the same minute suffix so they 
 
 ```bash
 m=$(( $(date +%s) / 60 ))
-for g in mysql redis mail rspamd postfix; do
+for g in mysql redis mail postfix; do
   kubectl -n mailcow create job --from=cronjob/mailcow-backup-$g mailcow-backup-$g-$m
 done
 kubectl -n mailcow get jobs -l app.kubernetes.io/component=backup
@@ -563,14 +686,19 @@ kubectl -n mailcow get jobs -l app.kubernetes.io/component=backup
 ### Scheduling and storage
 
 - `backup.persistence.accessMode: ReadWriteOnce` (default): all backup Jobs must mount the volume on
-  one node. The mysql, redis and mail Jobs require the dovecot pod's node; the rspamd, postfix and
-  sogo Jobs require their owner's node (their volume is RWO) and only *prefer* dovecot's, because the
-  scheduler counts an existing pod for required pod affinity only if it matches every required term,
-  so "next to rspamd AND next to dovecot" can never be required. On a single node, or with
-  `persistence.shared.accessMode: ReadWriteOnce` (rspamd is pinned next to dovecot), this just works;
-  if postfix or sogo run on another node than dovecot, their Jobs land there and fail with a
+  one node. The mysql, redis and mail Jobs require the dovecot pod's node; the postfix and sogo Jobs
+  require their owner's node (their volume is RWO) and only *prefer* dovecot's, because the scheduler
+  counts an existing pod for required pod affinity only if it matches every required term, so "next
+  to postfix AND next to dovecot" can never be required. On a single node this just works; if
+  postfix or sogo run on another node than dovecot, their Jobs land there and fail with a
   multi-attach error on the backup volume: use RWX backup storage (next point). NOTES.txt lists the
   components that are not pinned next to dovecot.
+- The backup PVC the chart creates is also mounted read-only at `/backup` in the dovecot pod, which
+  never uses it: with `WaitForFirstConsumer` storage classes (kind's local-path, most cloud defaults) a
+  claim only binds once a pod uses it, and otherwise only the backup Jobs would, so `helm install --wait`
+  would wait for it until the timeout. It binds on dovecot's node, where every backup Job with a
+  ReadWriteOnce backup PVC runs anyway. It grants dovecot nothing new: it already holds all mail, the
+  mail_crypt keys and `DBPASS`/`REDISPASS`. Not done for `existingClaim` (already bound).
 - Multi-node: `backup.persistence.accessMode: ReadWriteMany`, or `backup.persistence.existingClaim`
   on RWX storage (NFS, CephFS, EFS, ...; set `accessMode` to what it is). Each volume group then only
   follows its owner (when the owner's volume is ReadWriteOnce).
@@ -621,7 +749,6 @@ coreutils (macOS: `brew install bash coreutils`), and RBAC in the release namesp
 | secrets | get; patch | read `DBPASS`; patch `DBPASS`/`DBROOT` only for a compose MariaDB (physical) restore |
 | cronjobs | get, list, patch | find the backup CronJobs and their retention, suspend them during the restore (flag kept in an annotation) |
 | deployments, statefulsets | get, list, patch; `deployments/scale`, `statefulsets/scale` update/patch | scale writers down and back; previous replica counts kept in an annotation |
-| nodes (cluster scope) | get, optional | architecture of the rspamd pod's node for the rspamd archive check (falls back without it) |
 
 It prints the kubectl context and server it will use and asks you to type `<namespace>@<context>`
 (or `--yes`). Suspend Argo CD / Flux self-heal (auto-sync) for the release while restoring: the
@@ -641,26 +768,26 @@ helm/mailcow/scripts/restore.sh --namespace mailcow --release mailcow --backup m
 
 What it does:
 
-1. Starts `<fullname>-restore-inspect` (backup PVC read-only) to list the backup; checks the
-   architecture of the rspamd pod's node. Refuses to start while a backup run is active, and warns
+1. Starts `<fullname>-restore-inspect` (backup PVC read-only) to list the backup. Refuses to start
+   while a backup run is active, and warns
    if the next backup run would prune the directory being restored (retention).
 2. `--components all` takes every component found in the directory that this release can take:
-   `redis` is skipped with `externalRedis`, `postfix` with `postfix.spoolPerPod` (with a warning).
+   `redis` is skipped with `externalRedis`, `postfix` with `postfix.spoolPerPod`, and `rspamd` (a
+   compose archive) always: the chart has no rspamd volume (with a warning).
 3. Suspends the release's backup CronJobs (no run may write into or prune the backup PVC meanwhile),
    then scales watchdog and the writers of the selected components to 0 and waits for their pods to
-   go: `vmail`/`crypt` dovecot; `redis` redis; `rspamd` rspamd; `postfix` postfix; `sogo` sogo;
+   go: `vmail`/`crypt` dovecot; `redis` redis; `postfix` postfix; `sogo` sogo;
    `mysql` php-fpm, sogo, dovecot, postfix, acme (+ mysql for a physical restore). The previous
    replica counts and suspend flags are stored in the annotations `mailcow.email/restore-replicas` /
    `mailcow.email/restore-suspend`, so a rerun after an interrupted restore still scales back correctly.
 4. Starts `<fullname>-restore`, which mounts the backup PVC read-only and each target PVC at the
-   archive's path (`/vmail`, `/crypt`, `/redis`, `/rspamd` + `/rspamd_override`, `/postfix`,
+   archive's path (`/vmail`, `/crypt`, `/redis`, `/postfix`,
    `/sogo_backup`), plus a `db` container from the mysql client image only for a logical database
    restore. It schedules wherever the volumes allow (their owners are stopped); with node-local
    storage on several nodes it may not fit anywhere, and the script shows the scheduling events.
 5. Extracts the archives over the volumes (`tar --numeric-owner -Pxpf`; nothing is deleted first,
    as in the script) and pipes `backup_mysql.sql.*` into `mariadb` through the `mysql` Service (the
-   bundled or the external database). rspamd data from another CPU architecture is skipped (the
-   script's check).
+   bundled or the external database).
 6. Deletes the pod, scales everything back to its previous replica count and resumes the CronJobs,
    also after a failure (the volumes may then be partially restored: rerun the restore). Optionally
    runs `doveadm force-resync -A '*'` (`--resync`, or asked), repeated until the message count is
@@ -685,7 +812,8 @@ Disaster recovery into a new cluster:
 #### Migrating from compose
 
 `restore.sh` restores a directory written by `backup_and_restore.sh backup all`: vmail, crypt,
-redis, rspamd and postfix archives are identical. Copy the compose directory into the backup PVC
+redis and postfix archives are identical (its rspamd archive is skipped: rspamd's Bayes and fuzzy data
+come back with the redis archive). Copy the compose directory into the backup PVC
 under a name the retention ignores (e.g. `restore-2026-10-04`, see above). The MariaDB part is a
 physical `backup_mariadb.tar.zst`: with the bundled database the script stops mysql and its clients,
 empties the mysql PVC, extracts it (`chown 999:999`) and, if the passwords in the directory's
@@ -738,14 +866,15 @@ The chart sets them; images at the tags pinned in `docker-compose.yml` support a
 | `DOVECOT_TRUSTED_NETS`, `RSPAMD_TRUSTED_NETS` | rspamd | `mailcow.dovecotTrustedNets` / `rspamdTrustedNets` (empty = `mailcow.networks`); unset, rspamd waits forever for `dig dovecot` |
 | `SOGO_SSO_PASS`, `DOVECOT_MASTER_USER/PASS` | dovecot (+ seed initContainers of sogo, php-fpm) | release Secret (stable SOGo SSO, sieve.creds, cron.creds; sogo/php-fpm derive the same files, see [Storage](#storage)). `SOGO_SSO_PASS` `[A-Za-z0-9]` only: dovecot exits otherwise, and the sogo/php-fpm seed initContainers fail with a message |
 | `SOGO_ENCRYPTION_KEY` | sogo | release Secret, `[A-Za-z0-9_-]` only (sogo exits otherwise; checked by sogo's seed initContainer) |
-| `DOCKERAPI_BACKEND=kubernetes`, `COMPOSE_PROJECT_NAME`, `K8S_POD_SELECTOR` | dockerapi | pods matched by `app.kubernetes.io/name=mailcow,app.kubernetes.io/instance=<release>,app.kubernetes.io/component notin (cron,backup,tls-bootstrap)` in the ServiceAccount's namespace |
+| `DOCKERAPI_BACKEND=kubernetes`, `COMPOSE_PROJECT_NAME`, `K8S_POD_SELECTOR` | dockerapi | pods matched by `app.kubernetes.io/name=mailcow,app.kubernetes.io/instance=<release>,app.kubernetes.io/component notin (cron,backup,tls-bootstrap,redis-tls,db-tls)` in the ServiceAccount's namespace |
 
 List values (`MAILCOW_NETWORKS`, `*_TRUSTED_NETS`) are comma-separated without spaces (a space breaks
 dovecot's `/source_env.sh` export), IPv6 without brackets (`10.244.0.0/16,fd00:10:244::/56`). The
 images drop `/0` entries and anything that is not an address/CIDR with only a warning; the chart
 fails the render for them instead (`mailcow.networks`, `sogoTrustedNets`, `dovecotTrustedNets`,
-`rspamdTrustedNets`, `mail.proxyTrustedNetworks`) and strips spaces around entries. The external
-database and Redis are reached without TLS (mailcow's clients have no TLS settings).
+`rspamdTrustedNets`, `mail.proxyTrustedNetworks`) and strips spaces around entries. mailcow's clients
+reach the database and Redis without TLS; TLS to an external server goes through the chart's proxies
+([TLS to the external database / Redis](#tls-to-the-external-database--redis)).
 
 ## Security
 
@@ -870,7 +999,7 @@ every pod of the release may reach:
 | `0.0.0.0/0` and `::/0` except `networkPolicy.egress.clusterCIDRs` (empty = the `mailcow.networks` entries + `networkPolicy.egress.serviceCIDR`, default `10.96.0.0/12`) | the internet: postfix outbound 25, unbound recursion / `unbound.forwarders`, clamd freshclam, rspamd fuzzy and DNS lists, `sa-rules` download, Keycloak/LDAP sync, imapsync, SOGo remote calendars, acme |
 | `networkPolicy.egress.extraTo` (raw peers, all ports) | in-cluster targets you need |
 
-plus, for dockerapi, the CronJob runner and the TLS bootstrap hook Job only, the Kubernetes API server:
+plus, for dockerapi, the cron scheduler or CronJob runner and the TLS bootstrap hook Job only, the Kubernetes API server:
 `networkPolicy.egress.apiServerCIDRs` on `apiServerPorts` (443, 6443). `apiServerCIDRs` is required
 when egress is on (the chart fails without it): use the **endpoint** addresses from
 `kubectl get endpoints kubernetes -n default` (e.g. `172.18.0.2` on kind), not the `kubernetes`
@@ -898,7 +1027,7 @@ are additive, so `apiServerCIDRs` and `extraTo` get through even inside `cluster
 Install mailcow into a namespace of its own. RBAC cannot be scoped to labels: dockerapi's Role allows
 exec into and deletion of **every** pod in the namespace and a rolling restart (restartedAt
 annotation patch) of **every** Deployment and StatefulSet in it (without the apps rules it would fall
-back to deleting single pods), and the CronJob runner can exec into every pod too.
+back to deleting single pods), and the cron scheduler or CronJob runner can exec into every pod too.
 
 ## Brute-force protection (no fail2ban)
 
@@ -969,8 +1098,8 @@ drop traffic meet. Options:
 
 ## Limitations (chart 0.1.0)
 
-- dovecot and rspamd run a single replica; postfix replicas each have their own queue (UI queue view
-  shows one pod), php-fpm restarts with `Recreate` (short UI/login gap on upgrades), see
+- dovecot runs a single replica; postfix replicas each have their own queue (UI queue view
+  shows one pod), rspamd replicas each show their own UI counters, php-fpm restarts with `Recreate` (short UI/login gap on upgrades), see
   [Scaling](#scaling).
 - `shared` needs RWX for php-fpm, dovecot and rspamd to spread over nodes; with RWO they share one
   node ([Storage](#storage)). rspamd.sock no longer ties pods to a node (TCP relay).
@@ -983,17 +1112,20 @@ drop traffic meet. Options:
 - Egress NetworkPolicies are optional and off by default (`networkPolicy.egress`): they fence off the
   cluster, not the internet.
 - External database / Redis: supported (`externalDatabase`, `externalRedis`), but the database must
-  be prepared by hand (user, grants, `event_scheduler`, time zone tables); Redis is plain TCP only
-  and must listen on 6379 when given by DNS name ([External database / Redis](#external-database--redis)).
+  be prepared by hand (user, grants, `event_scheduler`, time zone tables); without TLS, Redis must
+  listen on 6379 when given by DNS name ([External database / Redis](#external-database--redis)).
 - The rspamd socket relay listens dual-stack when the pod has IPv6, IPv4-only otherwise; IPv6-only
   and dual-stack clusters work. Other IPv6 caveats (nginx `mailcow.enableIpv6`, watchdog's IPv4-only
   checks) are unchanged.
-- The files image is not published upstream: build it yourself ([Install](#install)).
+- The files image comes from the repository's workflow (`ghcr.io/<owner>/mailcow-files`) or your own
+  build; point `files.image.repository` at it ([Files image](#files-image)).
 - `lookup`-based generation (release Secret, rspamd relay TLS, `clusterDNS`, skipping the TLS
   bootstrap Job) needs a real `helm install/upgrade`; GitOps renderers must use the `existingSecret`
   values and an explicit `clusterDNS`.
-- No TLS to an external database or Redis.
-- Ofelia's schedules become CronJobs: ~9,300 short-lived pods a day by default ([CronJobs](#cronjobs-ofelia)).
+- TLS to an external database or Redis only through the chart's proxies; ProxySQL verifies the
+  database certificate's chain, not its host name ([TLS to the external database / Redis](#tls-to-the-external-database--redis)).
+- The ofelia jobs run from a single scheduler pod (jobs are missed while it is down, like ofelia), or
+  as CronJobs with ~9,300 short-lived pods a day ([CronJobs](#cronjobs-ofelia)).
 
 ## Development
 
@@ -1005,8 +1137,10 @@ drop traffic meet. Options:
 - `ci/*-values.yaml` (each rendered and schema-checked by the chart workflow):
   - `kind`: local kind cluster (NodePorts 30080/30443/30025/30465/30587/30143/30993/32190, RWO shared,
     self-signed TLS, clamd skipped, no PROXY protocol, NetworkPolicy on with the default `publicMailFrom`);
-  - `certmanager`: cert-manager + Ingress, ofelia CronJobs off (no CronJob runner at all);
-  - `ha`: RWX shared, NLB with PROXY protocol (ip targets, `proxyTrustedNetworks` = VPC,
+  - `certmanager`: cert-manager + Ingress, ofelia jobs off (no scheduler, CronJobs or runner RBAC);
+  - `cronjob`: the ofelia jobs as CronJobs (`cronjobs.mode: cronjob`) with per-job overrides, SOGo
+    skipped, pod annotations;
+  - `ha`: RWX shared, rspamd HPA, NLB with PROXY protocol (ip targets, `proxyTrustedNetworks` = VPC,
     `allocateLoadBalancerNodePorts: false`), watchdog, NetworkPolicy;
   - `acme`: acme + extraFiles + watchdog, postfix limits off, NetworkPolicy off with PROXY protocol
     (the PROXY-port policies are still rendered), `http.service.loadBalancerSourceRanges`;
@@ -1016,8 +1150,11 @@ drop traffic meet. Options:
   - `netpol`: NetworkPolicy without PROXY protocol, custom `publicMailFrom`, dual-stack networks;
   - `external-dns` / `external-ip`: external MySQL/Redis by DNS name (ExternalName, DBPORT 3307) and
     by IPv4/IPv6 address (EndpointSlices, Redis 6379 -> 6380);
+  - `external-tls` / `external-tls-insecure`: the TLS proxies, verified with CA Secrets, client
+    certificates, server name, 2 ProxySQL replicas and egress policies (DNS database, IPv6 Redis), and
+    without certificate checks by IPv4 address with 2 relay replicas and NetworkPolicy off;
   - `egress`: egress policies on a dual-stack cluster with an in-cluster external database in `extraTo`;
-  - `scale`: nginx HPA, sogo/php-fpm 2 replicas, postfix 2 with a queue per pod, watchdog without the
+  - `scale`: nginx HPA, sogo/php-fpm/rspamd 2 replicas, postfix 2 with a queue per pod, watchdog without the
     queue mount, 60 s TLS reload checks (layer it on `kind-values.yaml`);
   - `backup`: the defaults (ReadWriteOnce backup PVC, every group incl. sogo, retention by age and
     count; layer it on `kind-values.yaml`) and `backup-rwx`, a multi-node variant (RWX existingClaim

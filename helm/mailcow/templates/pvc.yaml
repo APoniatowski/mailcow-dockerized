@@ -4,7 +4,6 @@
   (list "vmailIndex" "vmail-index" true)
   (list "mysql" "mysql" (not .Values.externalDatabase.enabled))
   (list "redis" "redis" (not .Values.externalRedis.enabled))
-  (list "rspamd" "rspamd" true)
   (list "postfix" "postfix" (not .Values.postfix.spoolPerPod))
   (list "postfixTlspol" "postfix-tlspol" true)
   (list "crypt" "crypt" true)
