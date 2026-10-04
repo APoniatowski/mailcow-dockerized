@@ -28,8 +28,10 @@ NULL_TIME = '0001-01-01T00:00:00Z'
 CONNECT_TIMEOUT = 10
 REQUEST_TIMEOUT = 30
 EXEC_MAX_SECONDS = 300
-RESTART_WAIT_SECONDS = 50
-RESTART_POLL_SECONDS = 2
+RESTART_WAIT_SECONDS = 10
+RESTART_POLL_SECONDS = 1
+RESTART_DEDUP_SECONDS = 10
+RESTART_ANNOTATION = 'kubectl.kubernetes.io/restartedAt'
 WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 WS_PROTOCOLS = 'v5.channel.k8s.io, v4.channel.k8s.io'
 
@@ -175,12 +177,12 @@ class KubernetesApi:
     with open(SA_DIR + '/token') as f:
       return f.read().strip()
 
-  def request(self, method, path, body=None):
+  def request(self, method, path, body=None, content_type='application/json'):
     headers = { 'Authorization': 'Bearer ' + self._token(), 'Accept': 'application/json' }
     data = None
     if body is not None:
       data = json.dumps(body).encode('utf-8')
-      headers['Content-Type'] = 'application/json'
+      headers['Content-Type'] = content_type
     conn = http.client.HTTPSConnection(self.host, self.port, context=self.ssl, timeout=REQUEST_TIMEOUT)
     try:
       conn.request(method, path, body=data, headers=headers)
@@ -196,7 +198,9 @@ class KubernetesApi:
       raise KubernetesError(resp.status, msg)
     return json.loads(payload) if payload else {}
 
-  def exec(self, namespace, pod, container, command, stdin=None, eof=b'', timeout=EXEC_MAX_SECONDS):
+  def exec(self, namespace, pod, container, command, stdin=None, eof=b'', timeout=EXEC_MAX_SECONDS, idle=None):
+    # idle: like docker's exec socket reader, stop once no output arrived for idle seconds
+    # (2 * idle before the first output)
     params = [('container', container), ('stdout', 'true'), ('stderr', 'true')]
     if stdin is not None:
       params.append(('stdin', 'true'))
@@ -212,6 +216,7 @@ class KubernetesApi:
     deadline = time.monotonic() + timeout
     out = bytearray()
     err = bytearray()
+    last = None
     try:
       sock.sendall(('GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
         'Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: %s\r\n'
@@ -254,8 +259,13 @@ class KubernetesApi:
           ws.send(b'\xff\x00')
         else:
           ws.send(b'\x00' + stdin + eof)
+      begin = time.monotonic()
       while True:
-        remaining = deadline - time.monotonic()
+        now = time.monotonic()
+        limit = deadline
+        if idle:
+          limit = min(limit, last + idle if last else begin + 2 * idle)
+        remaining = limit - now
         if remaining <= 0:
           break
         sock.settimeout(remaining)
@@ -270,6 +280,7 @@ class KubernetesApi:
         elif op in (0x1, 0x2) and data:
           if data[0] in (1, 2):
             out += data[1:]
+            last = time.monotonic()
           elif data[0] == 3:
             err += data[1:]
       try:
@@ -295,7 +306,7 @@ class KubernetesContainer:
     self.component = (meta.get('labels') or {}).get(COMPONENT_LABEL, '')
     self.service = self.component + '-mailcow'
     # stable across delete/recreate of a StatefulSet pod (callers cache the id)
-    self.id = self._id = hashlib.sha256(('%s/%s' % (kube.namespace, self.name)).encode('utf-8')).hexdigest()
+    self.id = hashlib.sha256(('%s/%s' % (kube.namespace, self.name)).encode('utf-8')).hexdigest()
     containers = spec.get('containers') or []
     self.spec = next((c for c in containers if c.get('name') == self.service), containers[0])
     self.container = self.spec['name']
@@ -374,20 +385,20 @@ class KubernetesContainer:
     }
 
   def matches_name(self, name):
-    return name in self.name or name in self.service
+    # callers pass the compose container name ('dovecot-mailcow'); the pod name is not matched,
+    # it carries the release name, which may itself contain a service name
+    return name in self.service
 
-  def _exec(self, command, stdin=None, eof=b''):
-    return self.kube.api.exec(self.kube.namespace, self.name, self.container, command, stdin=stdin, eof=eof)
+  def _exec(self, command, stdin=None, eof=b'', **kwargs):
+    return self.kube.api.exec(self.kube.namespace, self.name, self.container, command, stdin=stdin, eof=eof, **kwargs)
 
-  def _exec_script(self, shell, script, user):
+  def _exec_script(self, shell, script, user, **kwargs):
     # shell scripts go through stdin: the exec request URI (audit log) only carries the shell.
     # The script must not end in a backslash, it would swallow the closing brace of the wrapper.
     script = '{\n' + script + '\n} </dev/null\n'
-    return self._exec(_user_cmd([shell, '-s'], user), stdin=script.encode('utf-8'), eof=b'exit\n')
+    return self._exec(_user_cmd([shell, '-s'], user), stdin=script.encode('utf-8'), eof=b'exit\n', **kwargs)
 
   def exec_run(self, cmd, user='', **kwargs):
-    if isinstance(cmd, str):
-      cmd = shlex.split(cmd)
     if len(cmd) == 3 and cmd[1] == '-c':
       out, err = self._exec_script(cmd[0], cmd[2], user)
     else:
@@ -396,30 +407,82 @@ class KubernetesContainer:
     return ExecResult(exit_code, out + msg)
 
   def exec_stdin(self, cmd, user, timeout=2, shell_cmd="/bin/bash"):
-    out, err = self._exec_script(shell_cmd, cmd, user)
+    out, err = self._exec_script(shell_cmd, cmd, user, idle=timeout)
     return out.decode('utf-8', 'replace')
 
-  def restart(self, **kwargs):
-    # the pod's controller recreates it; the uid precondition protects a recreated StatefulSet pod.
-    # Like docker restart, block until the replacement runs (bounded).
-    before = set(c.uid for c in self.kube.containers.candidates() if c.component == self.component)
+  def _controller(self, meta):
+    return next((o for o in meta.get('ownerReferences') or [] if o.get('controller')), None)
+
+  def _workload(self):
+    # (resource, name) of the Deployment or StatefulSet that controls the pod, None if there is none
+    ref = self._controller(self.pod['metadata'])
+    if ref and ref.get('kind') == 'StatefulSet':
+      return 'statefulsets', ref['name']
+    if ref and ref.get('kind') == 'ReplicaSet':
+      rs = self.kube.api.request('GET', '/apis/apps/v1/namespaces/%s/replicasets/%s' % (quote(self.kube.namespace, safe=''), quote(ref['name'], safe='')))
+      ref = self._controller(rs.get('metadata') or {})
+      if ref and ref.get('kind') == 'Deployment':
+        return 'deployments', ref['name']
+    return None
+
+  def _rollout_restart(self, workload):
+    # kubectl rollout restart: every replica is replaced, following the workload's update strategy.
+    # Returns False if the patch cannot roll the pods (paused Deployment, OnDelete StatefulSet).
+    resource, name = workload
+    stamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    obj = self.kube.api.request('PATCH', '/apis/apps/v1/namespaces/%s/%s/%s' % (quote(self.kube.namespace, safe=''), resource, quote(name, safe='')),
+      { 'spec': { 'template': { 'metadata': { 'annotations': { RESTART_ANNOTATION: stamp } } } } }, 'application/merge-patch+json')
+    spec = obj.get('spec') or {}
+    if spec.get('paused') or (spec.get('updateStrategy') or {}).get('type') == 'OnDelete':
+      self.kube.warn_once('restart-norollout-%s-%s' % workload, "restart %s/%s: paused or OnDelete, deleting pods instead" % workload)
+      return False
+    return True
+
+  def _delete(self):
+    # the controller recreates the pod; the uid precondition protects a recreated StatefulSet pod.
+    # Return once the pod is terminating (bounded), callers poll for the replacement.
+    pods = '/api/v1/namespaces/%s/pods' % quote(self.kube.namespace, safe='')
     try:
-      self.kube.api.request('DELETE', '/api/v1/namespaces/%s/pods/%s' % (quote(self.kube.namespace, safe=''), quote(self.name, safe='')),
+      res = self.kube.api.request('DELETE', pods + '/' + quote(self.name, safe=''),
         { 'apiVersion': 'v1', 'kind': 'DeleteOptions', 'preconditions': { 'uid': self.uid } })
     except KubernetesError as e:
       if e.status in (404, 409):
         # already gone or replaced
         return
       raise
+    if res.get('kind') != 'Pod' or (res.get('metadata') or {}).get('deletionTimestamp'):
+      return
     deadline = time.monotonic() + RESTART_WAIT_SECONDS
     while time.monotonic() < deadline:
       time.sleep(RESTART_POLL_SECONDS)
       try:
-        if any(c.running and c.uid not in before for c in self.kube.containers.candidates() if c.component == self.component):
-          return
+        items = self.kube.api.request('GET', pods + '?' + urlencode({ 'fieldSelector': 'metadata.name=' + self.name })).get('items') or []
       except Exception as e:
-        self.kube.logger.warning("restart %s: polling for replacement pod failed: %s" % (self.name, e))
-    self.kube.logger.warning("restart %s: no running replacement pod for component %s after %ss" % (self.name, self.component, RESTART_WAIT_SECONDS))
+        self.kube.logger.warning("restart %s: polling for pod termination failed: %s" % (self.name, e))
+        continue
+      if not any(p['metadata'].get('uid') == self.uid and not p['metadata'].get('deletionTimestamp') for p in items):
+        return
+    self.kube.logger.warning("restart %s: pod not terminating after %ss" % (self.name, RESTART_WAIT_SECONDS))
+
+  def restart(self, **kwargs):
+    # restart the owning workload, so a restart by id reaches every replica; a pod without a
+    # Deployment/StatefulSet owner, or without RBAC for it, is deleted instead
+    try:
+      workload = self._workload()
+      if workload:
+        if self.kube.restarted_recently(workload):
+          # by-name restarts call this once per replica
+          return
+        if self._rollout_restart(workload):
+          self.kube.mark_restarted(workload)
+          return
+    except KubernetesError as e:
+      if e.status not in (403, 404):
+        raise
+      if e.status == 403:
+        self.kube.warn_once('restart-rbac', "restart %s: %s; deleting pods instead of a rollout restart "
+          "(needs get on replicasets, patch on deployments and statefulsets)" % (self.name, e))
+    self._delete()
 
   def start(self, **kwargs):
     raise RuntimeError('start is not supported by the kubernetes backend, use restart')
@@ -445,8 +508,8 @@ class KubernetesContainer:
       for c in metrics.get('containers', []):
         if c.get('name') == self.container:
           mem = _quantity((c.get('usage') or {}).get('memory'))
-    except Exception:
-      pass
+    except Exception as e:
+      self.kube.warn_once('stats', "memory usage of %s unavailable, reporting 0 (metrics-server installed, RBAC get on metrics.k8s.io pods?): %s" % (self.name, e))
     limit = _quantity(((self.spec.get('resources') or {}).get('limits') or {}).get('memory'))
     cpu = { 'cpu_usage': { 'total_usage': 0, 'usage_in_kernelmode': 0, 'usage_in_usermode': 0 }, 'system_cpu_usage': 0, 'online_cpus': 0 }
     return {
@@ -532,6 +595,8 @@ class KubernetesClient:
     self.project = (os.environ.get('COMPOSE_PROJECT_NAME') or 'mailcowdockerized').lower()
     self.containers = KubernetesContainers(self)
     self.logger = logger or logging.getLogger('dockerapi')
+    self._warned = set()
+    self._restarted = {}
     if logger:
       logger.info("kubernetes backend: namespace %s, pod selector %s, project %s" % (self.namespace, self.selector, self.project))
       if 'app.kubernetes.io/instance=' not in self.selector:
@@ -545,6 +610,18 @@ class KubernetesClient:
         return f.read().strip() or 'default'
     except OSError:
       return 'default'
+
+  def warn_once(self, key, msg):
+    if key not in self._warned:
+      self._warned.add(key)
+      self.logger.warning(msg)
+
+  def restarted_recently(self, workload):
+    t = self._restarted.get(workload)
+    return t is not None and time.monotonic() - t < RESTART_DEDUP_SECONDS
+
+  def mark_restarted(self, workload):
+    self._restarted[workload] = time.monotonic()
 
   def close(self):
     pass

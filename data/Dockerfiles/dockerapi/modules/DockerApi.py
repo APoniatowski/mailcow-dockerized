@@ -604,6 +604,7 @@ class DockerApi:
       return ''.join(total_data)
 
     try :
+      # kubernetes backend only: its containers have no attachable exec socket and provide exec_stdin, docker containers do not
       exec_stdin = getattr(container, 'exec_stdin', None)
       if exec_stdin:
         return exec_stdin(cmd, user, timeout, shell_cmd)

@@ -44,6 +44,9 @@ async def lifespan(app: FastAPI):
     logger.info("Using kubernetes backend")
     sync_docker_client = KubernetesClient(logger)
     async_docker_client = AsyncKubernetesClient(sync_docker_client)
+  elif os.environ.get('DOCKERAPI_BACKEND', '') != '':
+    logger.error("Unknown DOCKERAPI_BACKEND '%s', use 'kubernetes' or leave it unset for docker" % os.environ['DOCKERAPI_BACKEND'])
+    sys.exit(1)
   else:
     sync_docker_client = docker.DockerClient(base_url='unix://var/run/docker.sock', version='auto')
     async_docker_client = aiodocker.Docker(url='unix:///var/run/docker.sock')
