@@ -424,14 +424,26 @@ trap - EXIT
 
 if has vmail; then
   echo
-  echo "In most cases a full resync is not needed. After checking the mailboxes you can run:"
+  # the index volume is not restored: messages expunged after the backup stay hidden until dovecot
+  # resyncs, and one pass may re-add only part of them ("Expunged message reappeared")
+  echo "Messages deleted after the backup stay hidden until dovecot resyncs. To do it later run (repeat"
+  echo "until the message counts stop changing):"
   echo "  kubectl -n ${NS} exec $(workload dovecot) -c dovecot-mailcow -- doveadm force-resync -A '*'"
   ans="n"
   if [ -n "${RESYNC}" ]; then ans="y"
   elif [ -z "${YES}" ] && [ -t 0 ]; then read -r -p "Force a resync now? [y/N] " ans; fi
   if [[ "${ans,,}" =~ ^(y|yes)$ ]]; then
     k rollout status "$(workload dovecot)" --timeout="${TIMEOUT}"
-    k exec "$(workload dovecot)" -c dovecot-mailcow -- doveadm force-resync -A '*'
+    msgs() { k exec "$(workload dovecot)" -c dovecot-mailcow -- doveadm -f flow mailbox status -A messages '*' 2>/dev/null \
+      | sed -n 's/.*messages=\([0-9]*\).*/\1/p' | awk '{s+=$1} END{print s+0}'; }
+    before=$(msgs)
+    for pass in 1 2 3; do
+      k exec "$(workload dovecot)" -c dovecot-mailcow -- doveadm force-resync -A '*'
+      after=$(msgs)
+      echo "resync pass ${pass}: ${before} -> ${after} messages"
+      [ "${after}" = "${before}" ] && break
+      before=${after}
+    done
   fi
 fi
 echo "restore of ${DIR} done"

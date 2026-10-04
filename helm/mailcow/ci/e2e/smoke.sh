@@ -58,8 +58,10 @@ echo "== mailcow kubernetes smoke $(date -u +%FT%TZ)  release=$RELEASE ns=$NS ho
 K get pods -o wide
 
 # 1
+# Job pods (CronJobs, backups, hooks) finish and never turn Ready: wait for the long-running ones
 if K wait --for=condition=Ready pod \
-     -l "$SEL,app.kubernetes.io/component notin (cron,tls-bootstrap,strategy-fix)" \
+     -l "$SEL,app.kubernetes.io/component notin (cron,tls-bootstrap,strategy-fix,backup)" \
+     --field-selector=status.phase!=Succeeded,status.phase!=Failed \
      --timeout=600s >/dev/null 2>&1; then
   ok "all pods Ready"
 else
