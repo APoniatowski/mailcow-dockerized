@@ -16,24 +16,29 @@
 #   4. SMTP submission STARTTLS + AUTH via NodePort 30587 from the host, send to self
 #   5. IMAPS via NodePort 30993: message arrives within 60s, COPY to Junk -> rspamd learns spam
 #   6. dockerapi Kubernetes backend: mail queue via API, container status non-empty;
-#      rspamd stats via the controller socket; rspamd resolves bare service names
+#      rspamd stats via the controller socket; rspamd resolves bare service names (rspamd logs
+#      since the start of the run, which must not be empty)
 #   7. SOGo served via nginx
-#   8. with NetworkPolicy on: a foreign pod cannot reach postfix/dovecot
+#   8. with networkPolicy.enabled: a foreign pod cannot reach postfix/dovecot by ClusterIP, while
+#      it does reach nginx (positive control; probe broken = FAIL)
 # ok/ko always succeed, so `test && ok ... || ko ...` reports exactly one of them
 # shellcheck disable=SC2015
 set -uo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib.sh
 . "$(dirname "$0")/lib.sh"
 
 allow=""
 for a in "$@"; do
   case "$a" in
     --allow-any-context) allow="$a" ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,/^# ok\/ko/{/^# ok\/ko/d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
     *) die "unknown argument: $a" ;;
   esac
 done
 need_tools kubectl python3 curl jq openssl
 select_cluster "$allow"
+# log checks only look at what happened during this run
+START=$(date -u +%FT%TZ)
 
 HOST="${MAILCOW_HOSTNAME:-mail.example.org}"
 ADDR="${HOST_ADDR:-127.0.0.1}"
@@ -48,10 +53,9 @@ pass=0; fail=0; results=()
 ok() { echo "PASS  $*"; pass=$((pass+1)); results+=("PASS  $*"); }
 ko() { echo "FAIL  $*"; fail=$((fail+1)); results+=("FAIL  $*"); }
 curl_() { curl -sk --max-time 30 --resolve "$HOST:30443:$ADDR" "$@"; }
-rspamd_logs() { # $1 = --since window
-  local d
-  d=$(K get deploy -l "$SEL,app.kubernetes.io/component=rspamd" -o name 2>/dev/null | head -1)
-  [ -n "$d" ] && K logs "$d" -c rspamd-mailcow --since="$1" 2>/dev/null
+rspamd_logs() { # logs of every rspamd pod since the start of the run
+  K logs -l "$SEL,app.kubernetes.io/component=rspamd" -c rspamd-mailcow --since-time="$START" \
+    --tail=-1 --max-log-requests=10 2>/dev/null
 }
 
 echo "== mailcow kubernetes smoke $(date -u +%FT%TZ)  release=$RELEASE ns=$NS host=$HOST"
@@ -91,10 +95,13 @@ py=$(cat <<PY
 import smtplib, imaplib, ssl, time, sys, uuid
 ctx = ssl._create_unverified_context(); tag = str(uuid.uuid4())
 addr, u, p = "$ADDR", "$USER_", "$PASS"
+print("TAG", tag)
 try:
     s = smtplib.SMTP(addr, 30587, timeout=30); s.starttls(context=ctx); s.login(u, p)
     body = " ".join(f"word{n} lorem ipsum dolor sit amet consectetur" for n in range(40))
-    s.sendmail(u, [u], f"From: {u}\r\nTo: {u}\r\nSubject: smoke {tag}\r\n\r\n{body}\r\n"); s.quit()
+    # the Message-ID carries the tag, so rspamd's learn log lines can be matched to this message
+    hdr = f"From: {u}\r\nTo: {u}\r\nSubject: smoke {tag}\r\nMessage-ID: <smoke-{tag}@{u.split('@')[1]}>\r\n"
+    s.sendmail(u, [u], f"{hdr}\r\n{body}\r\n"); s.quit()
     print("PASS  smtp submission via NodePort 30587 (public path) auth+send")
 except Exception as e:
     print("FAIL  smtp submission:", e); sys.exit(1)
@@ -117,6 +124,7 @@ PY
 )
 learned0=$(api get/logs/rspamd-stats | jq -r '.learned // 0' 2>/dev/null)
 out=$(python3 -c "$py" 2>&1)
+TAG=$(sed -n 's/^TAG //p' <<<"$out" | head -1)
 if grep -q '^\(PASS\|FAIL\)' <<<"$out"; then
   while IFS= read -r line; do
     case "$line" in PASS*) ok "${line#PASS  }" ;; FAIL*) ko "${line#FAIL  }" ;; esac
@@ -136,38 +144,59 @@ learned=""
 for _ in 1 2 3 4 5 6; do
   learned1=$(api get/logs/rspamd-stats | jq -r '.learned // 0' 2>/dev/null)
   if [ "${learned1:-0}" -gt "${learned0:-0}" ]; then learned="learned $learned0 -> $learned1"; break; fi
-  # a well-trained bayes skips messages it already classifies as spam: the request still arrived
-  if rspamd_logs 2m | grep -q 'already in class spam'; then learned="bayes skip: already in class spam"; break; fi
+  # a well-trained bayes skips messages it already classifies as spam: the request still arrived.
+  # Only lines since the start of this run count; the one naming this message's Message-ID is preferred
+  skips=$(rspamd_logs | grep 'already in class spam')
+  if [ -n "$TAG" ] && grep -qF "smoke-$TAG" <<<"$skips"; then learned="bayes skip of this message: already in class spam"; break; fi
+  if [ -n "$skips" ]; then learned="bayes skip since $START: already in class spam"; break; fi
   sleep 3
 done
 [ -n "$learned" ] && ok "sieve learnspam reached rspamd (dovecot -> rspamd.sock; $learned)" \
   || ko "no learn request reached rspamd after COPY to Junk (dovecot rspamd-pipe-spam -> rspamd.sock)"
 
 # 6c rspamd's own resolver ignores search domains: bare service names (http://nginx:9081 for the
-#    quarantine exporter, dynmaps on nginx:8081) must still resolve
-n=$(rspamd_logs 2m | grep -c 'unable to resolve host')
-[ "$n" = 0 ] && ok "rspamd resolves bare service names (no 'unable to resolve host')" || ko "rspamd: $n x 'unable to resolve host' in the last 2m"
+#    quarantine exporter, dynmaps on nginx:8081) must still resolve. No logs = nothing proven.
+logs=$(rspamd_logs)
+n=$(grep -c 'unable to resolve host' <<<"$logs")
+if [ -z "$logs" ]; then ko "rspamd: no logs since $START (cannot check name resolution)"
+elif [ "$n" = 0 ]; then ok "rspamd resolves bare service names (no 'unable to resolve host' since $START)"
+else ko "rspamd: $n x 'unable to resolve host' since $START"
+fi
 
 # 7
 code=$(curl_ -o /dev/null -w '%{http_code}' "https://$HOST:30443/SOGo/")
 [[ "$code" =~ ^(200|302)$ ]] && ok "SOGo via nginx ($code)" || ko "SOGo http $code"
 
-# 8 relay protection: with NetworkPolicy on, a foreign in-cluster pod (pod CIDR = trusted by
-#   mailcow) must not reach postfix/dovecot; only release pods may.
-if [ "$(K get networkpolicy --no-headers 2>/dev/null | wc -l)" -gt 1 ]; then
-  # shellcheck disable=SC2016  # expanded by the probe pod's shell
-  r=$(K run "netpol-probe-$(openssl rand -hex 3)" --rm -i --restart=Never --image=busybox:1.37 \
-      --pod-running-timeout=180s --command -- \
-      sh -c 'for t in postfix:25 postfix:587 postfix:588 dovecot:143; do nc -z -w 3 ${t%:*} ${t#*:} && echo "OPEN $t" || echo "closed $t"; done' 2>&1)
-  if grep -q '^OPEN' <<<"$r"; then
-    ko "foreign pod reached: $(grep '^OPEN' <<<"$r" | tr '\n' ' ')"
-  elif [ "$(grep -c '^closed ' <<<"$r")" = 4 ]; then
-    ok "foreign pod blocked from postfix/dovecot (NetworkPolicy)"
+# 8 relay protection: with networkPolicy.enabled, a foreign in-cluster pod (pod CIDR = trusted by
+#   mailcow) must not reach postfix/dovecot; only release pods may. Probed by ClusterIP (no DNS
+#   involved); nginx http is open to everyone, so a probe that cannot reach it is broken and proves
+#   nothing. Gate: the postfix policy, plus the memcached one, which only networkPolicy.enabled
+#   renders (with mail.proxyProtocol alone the postfix policy exists but leaves port 25 open).
+np() { K get networkpolicy -l "$SEL,app.kubernetes.io/component=$1" -o name 2>/dev/null; }
+if [ -n "$(np postfix)" ] && [ -n "$(np memcached)" ]; then
+  svc_ip() { K get svc "$1" -o jsonpath='{.spec.clusterIP}' 2>/dev/null; }
+  pf=$(svc_ip postfix); dc=$(svc_ip dovecot); ng=$(svc_ip nginx)
+  ngp=$(K get svc nginx -o jsonpath='{.spec.ports[?(@.name=="http")].port}' 2>/dev/null)
+  if [ -z "$pf" ] || [ -z "$dc" ] || [ -z "$ng" ] || [ -z "$ngp" ]; then
+    ko "relay-protection: Service ClusterIPs not found (postfix=$pf dovecot=$dc nginx=$ng:$ngp)"
   else
-    ko "NetworkPolicy probe pod did not run: ${r:0:300}"
+    # shellcheck disable=SC2016  # expanded by the probe pod's shell
+    r=$(K run "netpol-probe-$(openssl rand -hex 3)" --rm -i --restart=Never --image=busybox:1.37 \
+        --pod-running-timeout=180s --command -- \
+        sh -c 'for t in "$@"; do n=${t%%=*}; a=${t#*=}; nc -z -w 3 "${a%:*}" "${a##*:}" && echo "OPEN $n" || echo "closed $n"; done' \
+        probe "control=$ng:$ngp" "postfix:25=$pf:25" "postfix:587=$pf:587" "postfix:588=$pf:588" "dovecot:143=$dc:143" 2>&1)
+    if ! grep -qx 'OPEN control' <<<"$r"; then
+      ko "relay-protection probe broken: positive control nginx $ng:$ngp (open to all) not reachable: ${r:0:300}"
+    elif grep '^OPEN ' <<<"$r" | grep -qvx 'OPEN control'; then
+      ko "foreign pod reached: $(grep '^OPEN ' <<<"$r" | grep -vx 'OPEN control' | tr '\n' ' ')"
+    elif [ "$(grep -c '^closed ' <<<"$r")" = 4 ]; then
+      ok "foreign pod blocked from postfix/dovecot by ClusterIP, reaches nginx (NetworkPolicy)"
+    else
+      ko "relay-protection probe output incomplete: ${r:0:300}"
+    fi
   fi
 else
-  echo "skip  relay-protection check (NetworkPolicy off)"
+  echo "skip  relay-protection check (networkPolicy.enabled off: no postfix/memcached NetworkPolicy)"
 fi
 
 # cleanup: the domain caps mailboxes, so every run removes its own

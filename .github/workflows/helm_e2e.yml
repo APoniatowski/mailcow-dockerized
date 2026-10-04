@@ -5,7 +5,15 @@ on:
     paths:
       - "helm/**"
       - "data/Dockerfiles/**"
+      # content of the files image (helm/mailcow/files-image/Dockerfile). data/web is in it too, so
+      # every web UI change also costs a kind run (~30-60 min of runners)
+      - "data/conf/**"
+      - "data/assets/**"
+      - "data/hooks/**"
+      - "data/web/**"
       - ".github/workflows/helm_e2e.yml"
+      # docs only
+      - "!helm/mailcow/README.md"
   workflow_dispatch:
     inputs:
       services:
@@ -126,15 +134,18 @@ jobs:
     name: e2e (${{ matrix.name }})
     needs: images
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # install + smoke + upgrade ~30 min; the backup -> restore round trip adds ~15 min
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: kind
-            values: helm/mailcow/ci/kind-values.yaml
+          - name: kind + backup
+            values: helm/mailcow/ci/kind-values.yaml helm/mailcow/ci/backup-values.yaml
+            roundtrip: true
           - name: kind + scale
             values: helm/mailcow/ci/kind-values.yaml helm/mailcow/ci/scale-values.yaml
+            roundtrip: false
     env:
       KUBE_CONTEXT: kind-mailcow
       NS: mailcow
@@ -204,23 +215,89 @@ jobs:
             -n "$NS" "${args[@]}" --wait --timeout 15m
           kubectl --context "$KUBE_CONTEXT" -n "$NS" get pods -o wide
 
+      # backup CronJobs -> Jobs, then scripts/restore.sh of mysql, vmail and crypt. A marker domain
+      # that exists only in the backup proves the database really came back.
+      - name: Backup and restore round trip
+        if: matrix.roundtrip
+        timeout-minutes: 30
+        run: |
+          set -o pipefail
+          kc() { kubectl --context "$KUBE_CONTEXT" -n "$NS" "$@"; }
+          host=mail.example.org
+          marker="restore-check.example.org"
+          key=$(kc get secret "$RELEASE-secrets" -o jsonpath='{.data.API_KEY}' | base64 -d)
+          api() {
+            curl -sk --max-time 30 --resolve "$host:30443:127.0.0.1" -H "X-API-Key: $key" \
+              -H 'Content-Type: application/json' "https://$host:30443/api/v1/$1" "${@:2}"
+          }
+          has_marker() { api "get/domain/$marker" | jq -e --arg d "$marker" '.domain_name == $d' >/dev/null 2>&1; }
+          r=$(api add/domain -d "{\"domain\":\"$marker\",\"active\":\"1\",\"mailboxes\":\"1\",\"maxquota\":\"10\",\"quota\":\"10\",\"defquota\":\"10\",\"aliases\":\"1\",\"restart_sogo\":\"0\"}")
+          grep -q '"type":"success"' <<<"$r" || { echo "::error::add marker domain: $r"; exit 1; }
+          has_marker || { echo "::error::marker domain $marker not readable after adding it"; exit 1; }
+
+          # one Job per backup CronJob; the shared numeric suffix (minutes since the epoch, like the
+          # CronJob controller's) puts every group into the same directory
+          suffix=$(( $(date +%s) / 60 ))
+          dir="mailcow-$(date -u -d "@$(( suffix * 60 ))" +%Y-%m-%d-%H-%M-%S)"
+          jobs=()
+          for cj in $(kc get cronjob -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=backup" -o name); do
+            kc create job "${cj#*/}-$suffix" --from="$cj"
+            jobs+=("${cj#*/}-$suffix")
+          done
+          [ ${#jobs[@]} -gt 0 ] || { echo "::error::no backup CronJobs"; exit 1; }
+          deadline=$(( $(date +%s) + 900 ))
+          for j in "${jobs[@]}"; do
+            until [ "$(kc get job "$j" -o jsonpath='{.status.succeeded}')" = 1 ]; do
+              if [ "$(kc get job "$j" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}')" = True ] \
+                 || [ "$(date +%s)" -ge "$deadline" ]; then
+                kc describe job "$j" | tail -n 20
+                kc logs "job/$j" --all-containers || true
+                echo "::error::backup job $j failed or timed out"; exit 1
+              fi
+              sleep 5
+            done
+            echo "::group::$j"; kc logs "job/$j" --all-containers; echo "::endgroup::"
+          done
+
+          # changed after the backup: the restore must bring the marker back
+          r=$(api delete/domain -d "[\"$marker\"]")
+          grep -q '"type":"success"' <<<"$r" || { echo "::error::delete marker domain: $r"; exit 1; }
+          ! has_marker || { echo "::error::marker domain $marker still there after deleting it"; exit 1; }
+
+          restore=(helm/mailcow/scripts/restore.sh --context "$KUBE_CONTEXT" --namespace "$NS" --release "$RELEASE")
+          "${restore[@]}" --list --backup "$dir"
+          "${restore[@]}" --backup "$dir" --components mysql,vmail,crypt --resync --yes
+
+          for _ in $(seq 1 60); do has_marker && break; sleep 5; done
+          has_marker || { echo "::error::marker domain $marker not restored from $dir"; exit 1; }
+          echo "marker domain $marker restored from $dir"
+          kc get pods -o wide
+
+      - name: Smoke test after restore
+        if: matrix.roundtrip
+        run: |
+          set -o pipefail
+          helm/mailcow/ci/e2e/smoke.sh 2>&1 | tee "$RUNNER_TEMP/smoke-restore.log"
+
       - name: Test summary
         if: always()
         run: |
-          [ -f "$RUNNER_TEMP/smoke.log" ] || exit 0
-          {
-            echo "### mailcow chart e2e: $LEG"
-            echo '```text'
-            sed -n '/^== summary/,$p' "$RUNNER_TEMP/smoke.log"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          for log in smoke smoke-restore; do
+            [ -f "$RUNNER_TEMP/$log.log" ] || continue
+            {
+              echo "### mailcow chart e2e: $LEG ($log)"
+              echo '```text'
+              sed -n '/^== summary/,$p' "$RUNNER_TEMP/$log.log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
 
       - name: Collect diagnostics
         if: failure()
         run: |
           out="$RUNNER_TEMP/diagnostics"
           helm/mailcow/ci/e2e/collect-logs.sh "$out" || true
-          cp "$RUNNER_TEMP/smoke.log" "$out/" 2>/dev/null || true
+          cp "$RUNNER_TEMP"/smoke*.log "$out/" 2>/dev/null || true
           df -h / > "$out/runner-disk.txt"
           free -h > "$out/runner-memory.txt"
 

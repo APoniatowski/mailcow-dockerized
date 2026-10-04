@@ -7,6 +7,7 @@
 # Environment: KUBE_CONTEXT (default: current context; must start with kind- unless
 # --allow-any-context), NS (mailcow), RELEASE (mailcow), LOG_TAIL (lines per container, 400).
 set -uo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib.sh
 . "$(dirname "$0")/lib.sh"
 
 out="" allow=""

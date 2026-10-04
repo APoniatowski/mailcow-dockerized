@@ -12,7 +12,8 @@
 #   --namespace NS        namespace of the release (required)
 #   --release REL         Helm release name (required)
 #   --backup DIR          backup directory in the backup PVC (required unless --list)
-#   --components LIST     comma separated, default all (every component found in DIR)
+#   --components LIST     comma separated, default all (every component found in DIR that this
+#                         release can take; the others are skipped with a warning)
 #   --list                list backups (and the contents of --backup), change nothing
 #   --resync              run `doveadm force-resync -A '*'` after a vmail restore (asked otherwise)
 #   --yes                 do not ask for confirmation
@@ -25,18 +26,28 @@
 #   --timeout DURATION    wait for pods to start/stop, in seconds (default 600s)
 #   env KUBECTL           kubectl binary (default kubectl)
 #
-# What it does: shows the kubectl context and asks; scales the writers of the selected components
-# (and watchdog) to 0; starts a pod `<fullname>-restore` that mounts the backup PVC read-only and the
-# target PVCs, on whatever node their volumes allow; extracts the archives over the target volumes
-# (like backup_and_restore.sh: nothing is deleted first, except the MariaDB data directory for a
-# physical restore); loads backup_mysql.sql.* through the `mysql` Service (bundled or external
-# database); deletes the pod and scales everything back to its previous replica count, also when a
-# step fails.
+# Requires bash >= 4.4, kubectl and GNU coreutils (macOS: brew install bash coreutils). The archiver
+# image needs GNU tar, zstd and pigz (the chart's backup image has them).
+#
+# What it does: shows the kubectl context and asks you to type <namespace>@<context>; suspends the
+# release's backup CronJobs; scales the writers of the selected components (and watchdog) to 0; starts
+# a pod `<fullname>-restore` that mounts the backup PVC read-only and the target PVCs, on whatever
+# node their volumes allow; extracts the archives over the target volumes (like
+# backup_and_restore.sh: nothing is deleted first, except the MariaDB data directory for a physical
+# restore); loads backup_mysql.sql.* through the `mysql` Service (bundled or external database);
+# deletes the pod, scales everything back to its previous replica count and resumes the CronJobs,
+# also when a step fails. The previous replica counts and suspend flags are kept in annotations
+# (mailcow.email/restore-replicas, mailcow.email/restore-suspend) until they are put back, so a rerun
+# after an interrupted restore still finds them.
 set -euo pipefail
 
 NS="" REL="" DIR="" COMPONENTS="all" LIST="" RESYNC="" YES="" CONTEXT="" FULL="" CLAIM="" IMAGE="" DBIMAGE=""
 TIMEOUT="600s"
 ALL=(mysql redis crypt vmail rspamd postfix sogo)
+# fallback archiver image = the chart's backup.image default (check-tags.sh keeps them equal)
+DEFAULT_IMAGE="ghcr.io/mailcow/backup:latest@sha256:4ccba992011ef9a340e10587bbb7a0aaddfe3f91f3f61665c66bd4094e7475fb"
+ANN_REPLICAS="mailcow.email/restore-replicas"
+ANN_SUSPEND="mailcow.email/restore-suspend"
 
 die() { echo "error: $*" >&2; exit 1; }
 usage() { sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"; exit "${1:-0}"; }
@@ -79,18 +90,22 @@ if [ -z "${FULL}" ]; then
 fi
 SEL="app.kubernetes.io/instance=${REL}"
 CTX=${CONTEXT:-$("${KUBECTL}" config current-context 2>/dev/null || true)}
+[ -n "${CTX}" ] || die "no kubectl context: pass --context"
 SERVER=$("${KC[@]}" config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true)
-echo "kubectl context: ${CTX:-<none>} (${SERVER:-unknown server})"
+echo "kubectl context: ${CTX} (${SERVER:-unknown server})"
 echo "namespace:       ${NS}"
 echo "release:         ${REL} (objects ${FULL}-*)"
 
 # ---------- discovery (read-only) ----------
-# "<kind>/<name> <replicas>" of every Deployment/StatefulSet of a component, kind lower case
+# "<kind>/<name> <replicas> <saved replicas>" of every Deployment/StatefulSet of a component, kind lower
+# case; <saved replicas> = the restore-replicas annotation of an interrupted run (usually empty)
 workloads() {
-  local obj rep
+  local obj rep ann
   k get deploy,sts -l "${SEL},app.kubernetes.io/component=$1" \
-    -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.spec.replicas}{"\n"}{end}' 2>/dev/null \
-    | while read -r obj rep; do [ -n "${obj}" ] && echo "$(tr '[:upper:]' '[:lower:]' <<<"${obj%%/*}")/${obj#*/} ${rep}"; done || true
+    -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.spec.replicas} {.metadata.annotations.mailcow\.email/restore-replicas}{"\n"}{end}' 2>/dev/null \
+    | while read -r obj rep ann; do
+        [ -n "${obj}" ] && echo "$(tr '[:upper:]' '[:lower:]' <<<"${obj%%/*}")/${obj#*/} ${rep} ${ann}"
+      done || true
 }
 # first workload of a component: "<kind>/<name>"
 workload() { workloads "$1" | head -n 1 | cut -d' ' -f1; }
@@ -102,6 +117,12 @@ claim_of() {
 cronjob_jsonpath() {
   k get cronjob -l "${SEL},app.kubernetes.io/component=backup,mailcow.email/backup-group $1" -o jsonpath="$2" 2>/dev/null || true
 }
+# uname -m style architecture of a node from its kubernetes.io/arch label (empty if not readable)
+node_arch() {
+  local a
+  a=$("${KC[@]}" get node "$1" -o jsonpath='{.metadata.labels.kubernetes\.io/arch}' 2>/dev/null || true)
+  case "${a}" in amd64) echo x86_64 ;; arm64) echo aarch64 ;; *) echo "${a}" ;; esac
+}
 
 NAME_LABEL=$(k get sts -l "${SEL},app.kubernetes.io/component=dovecot" -o jsonpath='{.items[0].metadata.labels.app\.kubernetes\.io/name}' 2>/dev/null || true)
 [ -n "${NAME_LABEL}" ] || die "no dovecot StatefulSet with label ${SEL} in namespace ${NS}: wrong --namespace/--release/--context?"
@@ -109,17 +130,25 @@ NAME_LABEL=$(k get sts -l "${SEL},app.kubernetes.io/component=dovecot" -o jsonpa
 [ -n "${CLAIM}" ] || CLAIM="${FULL}-backup"
 k get pvc "${CLAIM}" >/dev/null || die "backup PVC ${CLAIM} not found (--backup-claim)"
 [ -n "${IMAGE}" ] || IMAGE=$(cronjob_jsonpath "notin (mysql)" '{.items[0].spec.jobTemplate.spec.template.spec.containers[0].image}')
-[ -n "${IMAGE}" ] || IMAGE="ghcr.io/mailcow/backup:latest"
+[ -n "${IMAGE}" ] || IMAGE=${DEFAULT_IMAGE}
 [ -n "${DBIMAGE}" ] || DBIMAGE=$(cronjob_jsonpath "in (mysql)" '{.items[0].spec.jobTemplate.spec.template.spec.containers[0].image}')
 if [ -z "${DBIMAGE}" ]; then
   DBIMAGE=$(k get sts -l "${SEL},app.kubernetes.io/component=mysql" -o jsonpath='{.items[0].spec.template.spec.containers[0].image}' 2>/dev/null || true)
 fi
 [ -n "${DBIMAGE}" ] || DBIMAGE="mariadb:10.11"
-SECRET=$(k get sts -l "${SEL},app.kubernetes.io/component=dovecot" \
-  -o jsonpath='{.items[0].spec.template.spec.containers[0].env[?(@.name=="DBPASS")].valueFrom.secretKeyRef.name}')
-DBNAME=$(k get sts -l "${SEL},app.kubernetes.io/component=dovecot" -o jsonpath='{.items[0].spec.template.spec.containers[0].env[?(@.name=="DBNAME")].value}')
-DBUSER=$(k get sts -l "${SEL},app.kubernetes.io/component=dovecot" -o jsonpath='{.items[0].spec.template.spec.containers[0].env[?(@.name=="DBUSER")].value}')
-DBPORT=$(k get sts -l "${SEL},app.kubernetes.io/component=dovecot" -o jsonpath='{.items[0].spec.template.spec.containers[0].env[?(@.name=="DBPORT")].value}')
+# retention of the backup runs (env of the group that prunes; empty without backup CronJobs)
+backup_env() {
+  cronjob_jsonpath "notin (x)" "{range .items[*].spec.jobTemplate.spec.template.spec.containers[*].env[?(@.name==\"$1\")]}{.value}{\"\\n\"}{end}" | head -n 1
+}
+RETENTION_DAYS=$(backup_env RETENTION_DAYS)
+KEEP=$(backup_env KEEP)
+dovecot_env() {
+  k get sts -l "${SEL},app.kubernetes.io/component=dovecot" -o jsonpath="{.items[0].spec.template.spec.containers[0].env[?(@.name==\"$1\")].$2}"
+}
+SECRET=$(dovecot_env DBPASS valueFrom.secretKeyRef.name)
+DBNAME=$(dovecot_env DBNAME value)
+DBUSER=$(dovecot_env DBUSER value)
+DBPORT=$(dovecot_env DBPORT value)
 # scheduling bits of the release's pods (podDefaults, imagePullSecrets), copied from dovecot (JSON = YAML flow)
 spec_of_dovecot() { k get sts -l "${SEL},app.kubernetes.io/component=dovecot" -o jsonpath="{.items[0].spec.template.spec.$1}"; }
 PULL_SECRETS=$(spec_of_dovecot imagePullSecrets)
@@ -159,6 +188,9 @@ spec:
       command: ["sleep", "infinity"]
       securityContext:
         runAsUser: 0
+      resources:
+        requests: {cpu: 50m, memory: 64Mi}
+        limits: {memory: 1Gi}
       volumeMounts:
         - {name: backup, mountPath: /backup, readOnly: true}
 EOF
@@ -171,6 +203,9 @@ EOF
     - name: db
       image: ${DBIMAGE}
       command: ["sleep", "infinity"]
+      resources:
+        requests: {cpu: 50m, memory: 128Mi}
+        limits: {memory: 2Gi}
       env:
         - {name: DBNAME, value: "${DBNAME}"}
         - {name: DBUSER, value: "${DBUSER}"}
@@ -211,9 +246,10 @@ INSPECT="${FULL}-restore-inspect"
 trap 'cleanup_pod "${INSPECT}"' EXIT
 echo "backup PVC:      ${CLAIM}"
 start_pod "${INSPECT}" ""
+RUNS=$(k exec "${INSPECT}" -c tools -- sh -c 'cd /backup && ls -1d mailcow-* 2>/dev/null | sort' || true)
 if [ -n "${LIST}" ]; then
   echo "backups in ${CLAIM}:"
-  k exec "${INSPECT}" -c tools -- sh -c 'cd /backup && ls -1d mailcow-* 2>/dev/null | sort' | sed 's/^/  /'
+  [ -z "${RUNS}" ] || while IFS= read -r r; do echo "  ${r}"; done <<<"${RUNS}"
   if [ -n "${DIR}" ]; then
     echo "${DIR}:"
     k exec "${INSPECT}" -c tools -- sh -c "cd '/backup/${DIR}' && ls -lAh" | sed 's/^/  /'
@@ -221,9 +257,6 @@ if [ -n "${LIST}" ]; then
   exit 0
 fi
 FILES=$(k exec "${INSPECT}" -c tools -- sh -c "cd '/backup/${DIR}' 2>/dev/null && ls -1A") || die "backup ${DIR} not found in ${CLAIM} (see --list)"
-NODE_ARCH=$(k exec "${INSPECT}" -c tools -- uname -m)
-cleanup_pod "${INSPECT}"
-trap - EXIT
 
 # archive of a component in DIR: prints "<file>|<decompressor>" (zst preferred, like the script)
 archive_of() {
@@ -255,92 +288,79 @@ else
   done
 fi
 has() { [[ " ${SELECTED[*]} " == *" $1 "* ]]; }
+drop() { local keep=() c; for c in "${SELECTED[@]}"; do [ "${c}" = "$1" ] || keep+=("${c}"); done; SELECTED=("${keep[@]}"); }
+# a component this release cannot take: skipped with --components all, an error when asked for by name
+cannot() { # component reason
+  if [ "${COMPONENTS}" = "all" ]; then echo "warning: skipping $1: $2"; drop "$1"; else die "$2 (leave $1 out of --components)"; fi
+}
 
 # component checks
 EXT_DB=$(k get svc mysql -o jsonpath='{.metadata.labels.mailcow\.email/external}' 2>/dev/null || true)
 EXT_REDIS=$(k get svc redis -o jsonpath='{.metadata.labels.mailcow\.email/external}' 2>/dev/null || true)
-PHYSICAL=""
+PHYSICAL="" CONF=""
 if has mysql && [[ "${ARCH[mysql]}" == *"|physical" ]]; then
   [ -z "${EXT_DB}" ] || die "${DIR} has a MariaDB physical backup (compose mariabackup); it cannot be restored into an external database"
   PHYSICAL=1
-fi
-if has redis && [ -n "${EXT_REDIS}" ]; then
-  die "externalRedis: restore ${DIR}/backup_redis.tar.zst (dump.rdb) with your Redis provider's import, then rerun without redis"
-fi
-if has rspamd; then
-  MARK=$(grep -E '^\.(x86_64|aarch64)' <<<"${FILES}" | head -n 1 | sed 's/^\.//' || true)
-  if [ -z "${MARK}" ]; then
-    echo "warning: no architecture marker in ${DIR}; if rspamd crashes after the restore, empty its PVC"
-  elif [ "${MARK}" != "${NODE_ARCH}" ]; then
-    echo "warning: rspamd data is from ${MARK}, this node is ${NODE_ARCH}: skipping rspamd (not portable)"
-    keep=(); for c in "${SELECTED[@]}"; do [ "${c}" = rspamd ] || keep+=("${c}"); done
-    SELECTED=("${keep[@]}")
-    [ ${#SELECTED[@]} -gt 0 ] || die "nothing left to restore"
+  # the restored data directory carries the compose install's database, users and passwords
+  CONF=$(k exec "${INSPECT}" -c tools -- sh -c "cat '/backup/${DIR}/mailcow.conf' 2>/dev/null" || true)
+  if [ -z "${CONF}" ]; then
+    echo "warning: no mailcow.conf in ${DIR}: DBNAME/DBUSER cannot be checked; afterwards set DBPASS and DBROOT in Secret ${SECRET} to the passwords of the restored database"
+  else
+    v=$(sed -n 's/^DBNAME=//p' <<<"${CONF}" | tail -n 1)
+    [ "${v}" = "${DBNAME}" ] || die "DBNAME of the backup (${v}) differs from the release's (${DBNAME}): set mailcow.dbName: ${v}, helm upgrade, then rerun"
+    v=$(sed -n 's/^DBUSER=//p' <<<"${CONF}" | tail -n 1)
+    [ "${v}" = "${DBUSER}" ] || die "DBUSER of the backup (${v}) differs from the release's (${DBUSER}): set mailcow.dbUser: ${v}, helm upgrade, then rerun"
+  fi
+  # the chart's own Secret keeps patched values on upgrade (lookup); anything else may be reverted
+  owner=$(k get secret "${SECRET}" -o jsonpath='{.metadata.ownerReferences[*].kind}' 2>/dev/null || true)
+  if [ "${SECRET}" != "${REL}-secrets" ] || [ -n "${owner}" ]; then
+    echo "warning: Secret ${SECRET} is ${owner:+owned by ${owner}, }not the one the chart generates (existingSecret?): if it is managed elsewhere (External Secrets, Sealed Secrets, GitOps), set DBPASS/DBROOT there too, or the restore's patch is reverted"
   fi
 fi
-if has postfix; then
-  [ -z "$(k get sts -l "${SEL},app.kubernetes.io/component=postfix" -o jsonpath='{.items[0].spec.volumeClaimTemplates}')" ] \
-    || die "postfix.spoolPerPod: one queue PVC per pod, restore the postfix archive by hand (README \"Backup and restore\")"
+if has redis && [ -n "${EXT_REDIS}" ]; then
+  cannot redis "externalRedis: restore ${DIR}/backup_redis.tar.zst (dump.rdb) with your Redis provider's import"
+fi
+if has postfix && [ -n "$(k get sts -l "${SEL},app.kubernetes.io/component=postfix" -o jsonpath='{.items[0].spec.volumeClaimTemplates}')" ]; then
+  cannot postfix "postfix.spoolPerPod: one queue PVC per pod, restore the postfix archive by hand (README \"Backup and restore\")"
+fi
+if has rspamd; then
+  MARK=$(grep -E '^\.(x86_64|aarch64)$' <<<"${FILES}" | head -n 1 | sed 's/^\.//' || true)
+  # rspamd's data must match the CPU of the node rspamd runs on, not the node of this pod
+  node=$(k get pod -l "${SEL},app.kubernetes.io/component=rspamd" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
+  arch="" where="node ${node} of the rspamd pod"
+  [ -z "${node}" ] || arch=$(node_arch "${node}")
+  if [ -z "${arch}" ]; then
+    arch=$(k exec "${INSPECT}" -c tools -- uname -m)
+    where="this pod's node (rspamd pod or its node not readable)"
+  fi
+  if [ -z "${MARK}" ]; then
+    echo "warning: no architecture marker in ${DIR}; if rspamd crashes after the restore, empty its PVC"
+  elif [ "${MARK}" != "${arch}" ]; then
+    echo "warning: rspamd data is from ${MARK}, ${where} is ${arch}: skipping rspamd (not portable)"
+    drop rspamd
+  fi
+fi
+[ ${#SELECTED[@]} -gt 0 ] || die "nothing left to restore"
+
+# would the next backup run (within a day with a daily schedule) prune DIR? Same rules as the
+# CronJobs' retention: age by the time in the name, and the number of newer directories
+if [[ "${DIR}" =~ ^mailcow-([0-9]{4}-[0-9]{2}-[0-9]{2})-([0-9]{2})-([0-9]{2})-([0-9]{2})$ ]]; then
+  why="" stamp="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}:${BASH_REMATCH[4]}"
+  if [[ "${RETENTION_DAYS}" =~ ^[1-9][0-9]*$ ]]; then
+    t=$(date -u -d "${stamp}" +%s 2>/dev/null || true)
+    if [ -n "${t}" ] && [ $(( $(date -u +%s) + 86400 - t )) -gt $(( RETENTION_DAYS * 86400 )) ]; then
+      why="older than backup.retentionDays (${RETENTION_DAYS}) by the next run"
+    fi
+  fi
+  if [[ "${KEEP}" =~ ^[1-9][0-9]*$ ]]; then
+    # the next run adds one directory, then keeps the newest KEEP
+    newer=$(awk -v d="${DIR}" '$0 > d' <<<"${RUNS}" | grep -c . || true)
+    [ $(( newer + 1 )) -lt "${KEEP}" ] || why="${why:+${why}, }${newer} newer backups + the next run >= backup.keep (${KEEP})"
+  fi
+  [ -z "${why}" ] || echo "warning: the next backup run deletes ${DIR} (${why}); the backup CronJobs are suspended during the restore, copy the directory elsewhere if you need it again"
 fi
 
-# writers stopped while their data is replaced
-declare -A STOP=([watchdog]=1)
-for c in "${SELECTED[@]}"; do
-  case "${c}" in
-    mysql) for w in php-fpm sogo dovecot postfix acme; do STOP[${w}]=1; done; [ -n "${PHYSICAL}" ] && STOP[mysql]=1 ;;
-    redis) STOP[redis]=1 ;;
-    crypt|vmail) STOP[dovecot]=1 ;;
-    rspamd) STOP[rspamd]=1 ;;
-    postfix) STOP[postfix]=1 ;;
-    sogo) STOP[sogo]=1 ;;
-  esac
-done
-
-echo "backup:          ${DIR} (${CLAIM})"
-for c in "${SELECTED[@]}"; do echo "  restore ${c} from ${ARCH[${c}]%%|*}"; done
-echo "scaled to 0 meanwhile: ${!STOP[*]}"
-has crypt || ! has vmail || echo "note: vmail without crypt: mail encrypted with other mail_crypt keys stays unreadable"
-[ -z "${PHYSICAL}" ] || echo "note: MariaDB physical backup: the data directory of the mysql PVC is replaced (its users and passwords come from the backup)"
-if [ -z "${YES}" ]; then
-  [ -t 0 ] || die "no terminal for the confirmation: pass --yes"
-  read -r -p "Data on these volumes is overwritten. Type the namespace (${NS}) to continue: " answer
-  [ "${answer}" = "${NS}" ] || die "aborted"
-fi
-
-# ---------- scale down ----------
-declare -A ORIG=()
-restore_scale() {
-  local obj
-  for obj in "${!ORIG[@]}"; do
-    echo "scale ${obj} back to ${ORIG[${obj}]}"
-    k scale "${obj}" --replicas="${ORIG[${obj}]}" >/dev/null || echo "warning: could not scale ${obj} back to ${ORIG[${obj}]}" >&2
-  done
-}
-finish() {
-  local rc=$?
-  cleanup_pod "${POD}"
-  restore_scale
-  [ "${rc}" -eq 0 ] || echo "restore FAILED (exit ${rc}): the volumes may be partially restored, workloads were scaled back" >&2
-}
-trap finish EXIT
-
-for w in "${!STOP[@]}"; do
-  while read -r obj rep; do
-    [ -n "${obj}" ] || continue
-    ORIG[${obj}]=${rep}
-    echo "scale ${obj} to 0 (was ${rep})"
-    k scale "${obj}" --replicas=0 >/dev/null
-  done < <(workloads "${w}")
-done
-echo "waiting for the pods to stop"
-stopsel="${SEL},app.kubernetes.io/component in ($(IFS=,; echo "${!STOP[*]}"))"
-deadline=$(( $(date +%s) + ${TIMEOUT%s} ))  # TIMEOUT validated as <n>s
-until [ -z "$(k get pod -l "${stopsel}" -o name)" ]; do
-  [ "$(date +%s)" -lt "${deadline}" ] || die "pods still running after ${TIMEOUT}: $(k get pod -l "${stopsel}" -o name | tr '\n' ' ')"
-  sleep 3
-done
-
-# ---------- restore pod ----------
+# target PVCs, resolved before anything is changed
 MOUNTS=()
 for c in "${SELECTED[@]}"; do
   case "${c}" in
@@ -356,17 +376,148 @@ done
 for m in "${MOUNTS[@]}"; do
   [[ "${m}" != *"||"* ]] || die "could not find the PVC for ${m%%|*} in the release's workloads"
 done
+cleanup_pod "${INSPECT}"
+trap - EXIT
+
+# writers stopped while their data is replaced
+declare -A STOP=([watchdog]=1)
+for c in "${SELECTED[@]}"; do
+  case "${c}" in
+    mysql) for w in php-fpm sogo dovecot postfix acme; do STOP[${w}]=1; done; [ -n "${PHYSICAL}" ] && STOP[mysql]=1 ;;
+    redis) STOP[redis]=1 ;;
+    crypt|vmail) STOP[dovecot]=1 ;;
+    rspamd) STOP[rspamd]=1 ;;
+    postfix) STOP[postfix]=1 ;;
+    sogo) STOP[sogo]=1 ;;
+  esac
+done
+# "<kind>/<name> <replicas> <saved replicas>" to scale to 0, plus workloads an interrupted restore
+# left scaled down (they are scaled back to their saved count at the end)
+PLAN=()
+for w in "${!STOP[@]}"; do
+  while read -r obj rep ann; do [ -n "${obj}" ] && PLAN+=("${obj} ${rep} ${ann}"); done < <(workloads "${w}")
+done
+while read -r obj ann; do
+  [ -n "${ann}" ] || continue
+  obj="$(tr '[:upper:]' '[:lower:]' <<<"${obj%%/*}")/${obj#*/}"
+  [[ " ${PLAN[*]} " == *" ${obj} "* ]] || PLAN+=("${obj} 0 ${ann}")
+done < <(k get deploy,sts -l "${SEL}" -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.metadata.annotations.mailcow\.email/restore-replicas}{"\n"}{end}' 2>/dev/null || true)
+# "<name> <suspend> <saved suspend>" of the backup CronJobs (the suspend of an interrupted run is saved)
+CRONJOBS=()
+while read -r name susp ann; do [ -n "${name}" ] && CRONJOBS+=("${name} ${susp:-false} ${ann}"); done < <(
+  k get cronjob -l "${SEL},app.kubernetes.io/component=backup" \
+    -o jsonpath='{range .items[*]}{.metadata.name} {.spec.suspend} {.metadata.annotations.mailcow\.email/restore-suspend}{"\n"}{end}' 2>/dev/null || true)
+
+echo "backup:          ${DIR} (${CLAIM})"
+for c in "${SELECTED[@]}"; do echo "  restore ${c} from ${ARCH[${c}]%%|*}"; done
+for p in "${PLAN[@]}"; do
+  read -r obj rep ann <<<"${p}"
+  echo "  scale ${obj} to 0 meanwhile (back to ${ann:-${rep}}${ann:+, saved by an interrupted restore})"
+done
+[ ${#CRONJOBS[@]} -eq 0 ] || echo "  suspend meanwhile: $(printf '%s\n' "${CRONJOBS[@]}" | cut -d' ' -f1 | tr '\n' ' ')"
+has crypt || ! has vmail || echo "note: vmail without crypt: mail encrypted with other mail_crypt keys stays unreadable"
+[ -z "${PHYSICAL}" ] || echo "note: MariaDB physical backup: the data directory of the mysql PVC is replaced (its users and passwords come from the backup)"
+if [ -z "${YES}" ]; then
+  [ -t 0 ] || die "no terminal for the confirmation: pass --yes"
+  read -r -p "Data on these volumes is overwritten. Type ${NS}@${CTX} to continue: " answer
+  [ "${answer}" = "${NS}@${CTX}" ] || die "aborted"
+fi
+
+# ---------- suspend backups, scale down ----------
+declare -A ORIG=() SUSP=()
+restore_scale() {
+  local obj
+  for obj in "${!ORIG[@]}"; do
+    echo "scale ${obj} back to ${ORIG[${obj}]}"
+    if k scale "${obj}" --replicas="${ORIG[${obj}]}" >/dev/null; then
+      k annotate "${obj}" "${ANN_REPLICAS}-" >/dev/null 2>&1 || true
+      unset "ORIG[${obj}]"
+    else
+      echo "warning: could not scale ${obj} back to ${ORIG[${obj}]} (kept in its ${ANN_REPLICAS} annotation)" >&2
+    fi
+  done
+}
+restore_suspend() {
+  local cj
+  for cj in "${!SUSP[@]}"; do
+    if k patch cronjob "${cj}" --type merge -p "{\"spec\":{\"suspend\":${SUSP[${cj}]}}}" >/dev/null; then
+      k annotate cronjob "${cj}" "${ANN_SUSPEND}-" >/dev/null 2>&1 || true
+      [ "${SUSP[${cj}]}" = true ] || echo "resumed cronjob/${cj}"
+      unset "SUSP[${cj}]"
+    else
+      echo "warning: could not set suspend=${SUSP[${cj}]} on cronjob/${cj} (kept in its ${ANN_SUSPEND} annotation)" >&2
+    fi
+  done
+}
+finish() {
+  local rc=$?
+  cleanup_pod "${POD}"
+  restore_scale
+  restore_suspend
+  [ "${rc}" -eq 0 ] || echo "restore FAILED (exit ${rc}): the volumes may be partially restored, workloads were scaled back" >&2
+}
+trap finish EXIT
+
+# no backup run may write into (or prune) the backup PVC meanwhile
+for p in "${CRONJOBS[@]}"; do
+  read -r name susp ann <<<"${p}"
+  SUSP[${name}]=${ann:-${susp}}
+  [ -n "${ann}" ] || k annotate cronjob "${name}" "${ANN_SUSPEND}=${susp}" --overwrite >/dev/null
+  k patch cronjob "${name}" --type merge -p '{"spec":{"suspend":true}}' >/dev/null
+  echo "suspended cronjob/${name}"
+done
+active=$(k get pod -l "${SEL},app.kubernetes.io/component=backup,mailcow.email/restore!=true" \
+  --field-selector=status.phase!=Succeeded,status.phase!=Failed -o name 2>/dev/null || true)
+[ -z "${active}" ] || die "a backup run is still active ($(tr '\n' ' ' <<<"${active}")): rerun when it has finished"
+
+for p in "${PLAN[@]}"; do
+  read -r obj rep ann <<<"${p}"
+  ORIG[${obj}]=${ann:-${rep}}
+  # saved first: a rerun after an interruption scales back to this, not to 0
+  [ -n "${ann}" ] || k annotate "${obj}" "${ANN_REPLICAS}=${rep}" --overwrite >/dev/null
+  echo "scale ${obj} to 0 (was ${ORIG[${obj}]})"
+  k scale "${obj}" --replicas=0 >/dev/null
+done
+echo "waiting for the pods to stop"
+stopsel="${SEL},app.kubernetes.io/component in ($(IFS=,; echo "${!STOP[*]}"))"
+deadline=$(( $(date +%s) + ${TIMEOUT%s} ))  # TIMEOUT validated as <n>s
+until [ -z "$(k get pod -l "${stopsel}" -o name)" ]; do
+  [ "$(date +%s)" -lt "${deadline}" ] || die "pods still running after ${TIMEOUT}: $(k get pod -l "${stopsel}" -o name | tr '\n' ' ')"
+  sleep 3
+done
+
+# ---------- restore pod ----------
 DB=""
 has mysql && [ -z "${PHYSICAL}" ] && DB=1
 echo "starting ${POD}"
 start_pod "${POD}" "${DB}" "${MOUNTS[@]}"
 
+# tar prints a progress line per ~100 MB read (also keeps the exec stream from idling out)
 extract() { # component
   local file=${ARCH[$1]%%|*} rest=${ARCH[$1]#*|}
   local prog=${rest%%|*}
   echo "restore $1: ${file}"
-  k exec "${POD}" -c tools -- tar --numeric-owner --use-compress-program="${prog}" -Pxpf "/backup/${DIR}/${file}"
+  k exec "${POD}" -c tools -- tar --numeric-owner --use-compress-program="${prog}" \
+    --checkpoint=10000 --checkpoint-action="echo=$1: %{r}T" -Pxpf "/backup/${DIR}/${file}"
 }
+
+# logical dump into the mysql Service; prints how much of the dump was read every 30 s (progress,
+# and keeps the exec stream from idling out during long imports)
+# shellcheck disable=SC2016  # the script runs in the db container
+IMPORT='set -o pipefail
+f=$1; dec=$2
+exec 3<"$f"
+size=$(stat -c %s "$f" 2>/dev/null || echo 0)
+(
+  while sleep 30 >/dev/null 2>&1; do
+    pos=0
+    while read -r key val; do [ "$key" = "pos:" ] && pos=$val; done < "/proc/$$/fdinfo/3"
+    echo "mysql: $(( size > 0 ? pos * 100 / size : 0 ))% of the dump read ($(( pos >> 20 )) of $(( size >> 20 )) MiB)"
+  done
+) &
+tick=$!
+trap "kill $tick 2>/dev/null" EXIT
+$dec <&3 | mariadb -h mysql -P "$DBPORT" -u "$DBUSER" --max-allowed-packet=1G "$DBNAME"'
 
 # order: keys before mail, database before the rest
 for c in mysql redis crypt vmail rspamd postfix sogo; do
@@ -381,45 +532,39 @@ for c in mysql redis crypt vmail rspamd postfix sogo; do
       else
         file=${ARCH[mysql]%%|*}; prog=${ARCH[mysql]#*|}
         echo "restore mysql: ${file} into ${DBNAME} as ${DBUSER} via Service mysql"
-        k exec "${POD}" -c db -- bash -c "set -o pipefail; ${prog} '/backup/${DIR}/${file}' \
-          | mariadb -h mysql -P \"\${DBPORT}\" -u \"\${DBUSER}\" --max-allowed-packet=1G \"\${DBNAME}\""
+        k exec "${POD}" -c db -- bash -c "${IMPORT}" import "/backup/${DIR}/${file}" "${prog}"
       fi
       ;;
     *) extract "${c}" ;;
   esac
 done
 
-if [ -n "${PHYSICAL}" ]; then
+if [ -n "${PHYSICAL}" ] && [ -n "${CONF}" ]; then
   # the restored data directory carries the compose install's users: the Secret must match them
-  conf=$(k exec "${POD}" -c tools -- sh -c "cat '/backup/${DIR}/mailcow.conf' 2>/dev/null" || true)
-  if [ -z "${conf}" ]; then
-    echo "warning: no mailcow.conf in ${DIR}: set DBPASS and DBROOT in Secret ${SECRET} to the passwords of the restored database"
-  else
-    v=$(sed -n 's/^DBNAME=//p' <<<"${conf}" | tail -n 1)
-    [ "${v}" = "${DBNAME}" ] || echo "warning: DBNAME of the backup (${v}) differs from the release's: set mailcow.dbName: ${v}"
-    v=$(sed -n 's/^DBUSER=//p' <<<"${conf}" | tail -n 1)
-    [ "${v}" = "${DBUSER}" ] || echo "warning: DBUSER of the backup (${v}) differs from the release's: set mailcow.dbUser: ${v}"
-    patch=""
-    for key in DBPASS DBROOT; do
-      v=$(sed -n "s/^${key}=//p" <<<"${conf}" | tail -n 1)
-      cur=$(k get secret "${SECRET}" -o jsonpath="{.data.${key}}" | base64 -d)
-      [ "${v}" = "${cur}" ] || patch+="\"${key}\":\"$(printf '%s' "${v}" | base64 -w0)\","
-    done
-    if [ -n "${patch}" ]; then
-      ans="y"
-      if [ -z "${YES}" ]; then read -r -p "DBPASS/DBROOT of the backup differ from Secret ${SECRET}. Update the Secret? [y/N] " ans; fi
-      if [[ "${ans,,}" =~ ^(y|yes)$ ]]; then
-        k patch secret "${SECRET}" --type merge -p "{\"data\":{${patch%,}}}" >/dev/null && echo "Secret ${SECRET} updated"
-      else
-        echo "warning: the pods cannot log in to the restored database until Secret ${SECRET} has its DBPASS/DBROOT"
-      fi
+  patch=""
+  for key in DBPASS DBROOT; do
+    v=$(sed -n "s/^${key}=//p" <<<"${CONF}" | tail -n 1)
+    cur=$(k get secret "${SECRET}" -o jsonpath="{.data.${key}}" | base64 -d)
+    [ "${v}" = "${cur}" ] || patch+="\"${key}\":\"$(printf '%s' "${v}" | base64 | tr -d '\n')\","
+  done
+  if [ -n "${patch}" ]; then
+    ans="y"
+    if [ -z "${YES}" ]; then read -r -p "DBPASS/DBROOT of the backup differ from Secret ${SECRET}. Update the Secret? [y/N] " ans; fi
+    if [[ "${ans,,}" =~ ^(y|yes)$ ]]; then
+      # the patch carries the passwords: on stdin, never on the command line
+      k patch secret "${SECRET}" --type merge --patch-file /dev/stdin >/dev/null <<<"{\"data\":{${patch%,}}}" \
+        && echo "Secret ${SECRET} updated"
+    else
+      echo "warning: the pods cannot log in to the restored database until Secret ${SECRET} has its DBPASS/DBROOT"
     fi
   fi
+  unset patch v cur CONF
 fi
 
 cleanup_pod "${POD}"
 restore_scale
-ORIG=()
+restore_suspend
+[ ${#ORIG[@]} -eq 0 ] && [ ${#SUSP[@]} -eq 0 ] || exit 1
 trap - EXIT
 
 if has vmail; then
@@ -428,7 +573,7 @@ if has vmail; then
   # resyncs, and one pass may re-add only part of them ("Expunged message reappeared")
   echo "Messages deleted after the backup stay hidden until dovecot resyncs. To do it later run (repeat"
   echo "until the message counts stop changing):"
-  echo "  kubectl -n ${NS} exec $(workload dovecot) -c dovecot-mailcow -- doveadm force-resync -A '*'"
+  echo "  kubectl --context ${CTX} -n ${NS} exec $(workload dovecot) -c dovecot-mailcow -- doveadm force-resync -A '*'"
   ans="n"
   if [ -n "${RESYNC}" ]; then ans="y"
   elif [ -z "${YES}" ] && [ -t 0 ]; then read -r -p "Force a resync now? [y/N] " ans; fi

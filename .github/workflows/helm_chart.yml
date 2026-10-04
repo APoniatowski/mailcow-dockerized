@@ -5,11 +5,15 @@ on:
     paths:
       - "helm/**"
       - "docker-compose.yml"
+      # check-tags.sh compares backup.image with its DEBIAN_DOCKER_IMAGE
+      - "helper-scripts/backup_and_restore.sh"
       - ".github/workflows/helm_chart.yml"
   push:
+    branches: [ "master", "staging" ]
     paths:
       - "helm/**"
       - "docker-compose.yml"
+      - "helper-scripts/backup_and_restore.sh"
       - ".github/workflows/helm_chart.yml"
 
 permissions:
@@ -21,8 +25,9 @@ env:
   HELM_SHA256: 86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb
   KUBECONFORM_VERSION: v0.8.0
   KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
-  # Kubernetes API version the rendered manifests are validated against
-  KUBERNETES_VERSION: 1.33.0
+  # Kubernetes API versions the rendered manifests are validated against: the chart's kubeVersion
+  # lower bound (Chart.yaml) and a current release
+  KUBERNETES_VERSIONS: 1.29.0 1.33.0
 
 defaults:
   run:
@@ -31,6 +36,7 @@ defaults:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -61,10 +67,14 @@ jobs:
           out="$RUNNER_TEMP/rendered"
           mkdir -p "$out"
           validate() {
-            kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
-              -schema-location default \
-              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
-              "$1"
+            local v
+            for v in $KUBERNETES_VERSIONS; do
+              echo "-- Kubernetes $v"
+              kubeconform -strict -summary -kubernetes-version "$v" \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+                "$1"
+            done
           }
           sets=("")
           for f in "$CHART"/ci/*-values.yaml; do
