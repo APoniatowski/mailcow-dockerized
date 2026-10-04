@@ -312,6 +312,17 @@ if has mysql && [[ "${ARCH[mysql]}" == *"|physical" ]]; then
     echo "warning: Secret ${SECRET} is ${owner:+owned by ${owner}, }not the one the chart generates (existingSecret?): if it is managed elsewhere (External Secrets, Sealed Secrets, GitOps), set DBPASS/DBROOT there too, or the restore's patch is reverted"
   fi
 fi
+# a compose vmail archive keeps mail under <domain>/<user>/${MAILDIR_SUB}: dovecot must look in the
+# same place, or every mailbox looks empty after the restore (generate_config.sh writes
+# MAILDIR_SUB=Maildir, older updated installs have it empty)
+if has vmail; then
+  [ -n "${CONF}" ] || CONF=$(k exec "${INSPECT}" -c tools -- sh -c "cat '/backup/${DIR}/mailcow.conf' 2>/dev/null" || true)
+  if [ -n "${CONF}" ]; then
+    v=$(sed -n 's/^MAILDIR_SUB=//p' <<<"${CONF}" | tail -n 1)
+    rel=$(dovecot_env MAILDIR_SUB value)
+    [ "${v}" = "${rel}" ] || die "MAILDIR_SUB of the backup (${v:-empty}) differs from the release's (${rel:-empty}): set mailcow.maildirSub: \"${v}\", helm upgrade, then rerun (otherwise the restored mail is not where dovecot looks)"
+  fi
+fi
 if has redis && [ -n "${EXT_REDIS}" ]; then
   cannot redis "externalRedis: restore ${DIR}/backup_redis.tar.zst (dump.rdb) with your Redis provider's import"
 fi

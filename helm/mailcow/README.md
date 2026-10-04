@@ -840,8 +840,10 @@ empties the mysql PVC, extracts it (`chown 999:999`) and, if the passwords in th
 `mailcow.conf` differ from the release Secret, offers to set `DBPASS`/`DBROOT` in the Secret (the
 restored data directory carries the compose users). With `existingSecret` or a Secret managed
 elsewhere (external-secrets, sealed-secrets, GitOps) that patch may be reverted: update the source
-instead. Set `mailcow.dbName`/`mailcow.dbUser` to the compose values first (a mismatch stops the
-script before any change), and keep the MariaDB major version (`mysql.image`) the same. It cannot go
+instead. Set `mailcow.dbName`/`mailcow.dbUser` and `mailcow.maildirSub` to the compose values (`DBNAME`,
+`DBUSER`, `MAILDIR_SUB` in its `mailcow.conf`; new compose installs have `MAILDIR_SUB=Maildir`, the
+chart's default, older updated ones an empty value) before installing (a mismatch stops the script
+before any change), and keep the MariaDB major version (`mysql.image`) the same. It cannot go
 into an external database (load a `mariadb-dump` there instead). After the migration set the rspamd
 UI password again in the admin UI: compose keeps it in `data/conf/rspamd/override.d`, which is not
 part of a compose backup.

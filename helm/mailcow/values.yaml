@@ -59,8 +59,12 @@ mailcow:
   aclAnyone: disallow
   # -- MAILDIR_GC_TIME (minutes)
   maildirGcTime: "7200"
-  # -- MAILDIR_SUB (compose default empty; generate_config.sh writes Maildir).
-  maildirSub: ""
+  # -- MAILDIR_SUB: subdirectory of a user's home that holds the maildir. Maildir = what
+  # generate_config.sh writes for new compose installs; older updated compose installs have it empty.
+  # When migrating from compose it must equal MAILDIR_SUB in that install's mailcow.conf (restore.sh
+  # checks), otherwise the restored mail is not where dovecot looks. Do not change it on a running
+  # install with mail in it.
+  maildirSub: Maildir
   # -- SOGO_EXPIRE_SESSION (minutes)
   sogoExpireSession: "480"
   # -- ALLOW_ADMIN_EMAIL_LOGIN y/n
